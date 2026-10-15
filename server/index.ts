@@ -1,3 +1,5 @@
+import { PiVisualService, visualResponse } from "./pi-visual/service.ts";
+import type { DesktopTunnel } from "./pi-visual/guacamole.ts";
 import { readHerdrProfiles, type HerdrMachineProfile } from "./herdr-profiles.ts";
 import { randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
@@ -335,6 +337,7 @@ async function agentLaunch(paneId: string, agent: AgentPayload): Promise<{ agent
 }
 
 interface SocketData {
+  desktop?: DesktopTunnel;
   deviceId?: string;
   readOnly?: boolean;
   revoked?: boolean;
@@ -504,6 +507,7 @@ export function createServer(
   } = {},
 ): ServerInstance {
   const attachments = new Map<string, PaneAttachment>();
+  const piVisual = new PiVisualService(options.stateDir ?? defaultStateDir());
   /** whether this bridge can `terminal attach`: herdr is asked once, and the PTY sidecar has to be runnable here (server/pty/sidecar.ts) */
   /** whether the sidecar can run, settled as the server starts so that attach, /api/health and /api/bridge tell one answer; a forced answer (tests) stands in for it */
   const sidecar = options.sidecar ?? (options.terminalAttach === undefined ? sidecarAvailable() : options.terminalAttach !== false);
@@ -1759,6 +1763,7 @@ export function createServer(
       push.resync(panes.map((pane) => ({ ...pane, agent_status: alertStatus(settled(pane), waits.waiting(pane.pane_id)) })), newer);
     },
     onPaneEnded: (paneId) => {
+      piVisual.ended(paneId);
       holdPendingPane(paneId, { code: "pane_not_found", message: "The pane ended; its pending messages were not sent" });
       pending.forget(paneId);
       waits.forget(paneId);
@@ -1858,6 +1863,7 @@ export function createServer(
       // method: file contents (those files include credentials) and a directory listing
       // (names and sizes are the shape of a repository the terminals never print), plus
       // every mutation except the two below.
+      const visualRead = /^\/api\/(?:machines\/[^/]+\/)?pane\/pi-visual\//.test(pathname);
       const fileRead = /^\/api\/(?:machines\/[^/]+\/)?fs\//.test(pathname);
       const directoryListing = /^\/api\/(?:machines\/[^/]+\/)?workspace\/directories$/.test(pathname);
       // Signing a device's own alerts in is a preference of that device, so `watch` keeps
@@ -1867,7 +1873,7 @@ export function createServer(
       const ownPreferences = pathname === "/api/auth" || pathname === "/api/push/subscribe";
       // a repository's changes are file contents too: the patch of a credential file is that file
       const repositoryDiff = /^\/api\/(?:machines\/[^/]+\/)?workspace\/diff\//.test(pathname);
-      if (readOnly && (fileRead || directoryListing || repositoryDiff || mutating && !ownPreferences)) {
+      if (readOnly && (visualRead || fileRead || directoryListing || repositoryDiff || mutating && !ownPreferences)) {
         return jsonResponse({ error: { code: "read_only", message: "this device can only watch" } }, 403);
       }
 
@@ -1895,9 +1901,21 @@ export function createServer(
       // Chat reads can chain several valid 10 s RPCs. Leave the 15/30 s client deadline
       // in charge rather than Bun's default 10 s idle cutoff. PC proxies have their own budget above.
       if (pathname === "/api/pane/read" || pathname === "/api/pane/conversation") bunServer.timeout(request, 60);
+      if (pathname.startsWith("/api/pane/pi-visual/")) return piVisual.handle(request, url, readOnly, access.level === "full" ? access.device?.id : undefined);
       if (pathname === "/ws") {
         if (!sameOrigin(request)) return new Response("invalid origin", { status: 403 });
         const deviceId = access.level === "full" ? access.device?.id : undefined;
+        if (url.searchParams.has("pi_desktop_ticket")) {
+          if (readOnly || (url.searchParams.get("machine_id") && url.searchParams.get("machine_id") !== "local")) return new Response("Private desktop requires this host and an interactive device", { status: 403 });
+          let desktop: DesktopTunnel | undefined;
+          try {
+            desktop = await piVisual.take(request, deviceId);
+            const upgraded = bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: { attached: new Map(), watches: new Map(), conversationInterests: new Set(), mode: "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly: false, desktop } });
+            if (upgraded) return undefined as unknown as Response;
+            piVisual.release(desktop);
+          } catch (error) { if (desktop) piVisual.release(desktop); return visualResponse(error); }
+          return new Response("websocket upgrade required", { status: 426 });
+        }
         const machineId = url.searchParams.get("machine_id");
         if (machineId && machineId !== "local") {
           if (access.level === "none") return unauthorizedJson(access.reason);
@@ -2829,6 +2847,7 @@ export function createServer(
         if (client.data.deviceId) {
           client.data.unwatchDevice = devices.onRevoke(client.data.deviceId, () => {
             client.data.revoked = true;
+            if (client.data.desktop) piVisual.release(client.data.desktop);
             client.data.closing = true;
             killWatches(client);
             clients.delete(client);
@@ -2842,6 +2861,7 @@ export function createServer(
           });
           if (client.data.revoked) return;
         }
+        if (client.data.desktop) { client.data.desktop.bind(client); return; }
         if (client.data.relay) { client.data.relay.bind(client as ServerWebSocket<unknown>); return; }
         clients.add(client);
         try {
@@ -2854,6 +2874,7 @@ export function createServer(
 
       async message(client, raw) {
         if (stopped || client.data.closing) return;
+        if (client.data.desktop) { client.data.desktop.message(String(raw)); return; }
         // read here for a relayed connection too: alerts for every PC go out from this server
         const presence = presenceOf(raw);
         if (presence === true) present.add(client);
@@ -3520,6 +3541,7 @@ export function createServer(
       },
 
       close(client) {
+        if (client.data.desktop) { client.data.unwatchDevice?.(); piVisual.release(client.data.desktop); return; }
         client.data.unwatchDevice?.();
         client.data.closing = true;
         present.delete(client);
@@ -3567,6 +3589,7 @@ export function createServer(
     stop: () => {
       stopped = true;
       settlePortalStartup({ ok: false, error: new Error("Server stopped before Portal startup cleanup completed") });
+      piVisual.close();
       conversations.stop();
       clearInterval(outputTimer);
       collector.stop();
