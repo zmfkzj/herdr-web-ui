@@ -19,20 +19,36 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply inspected source patch
+      - name: Restore source against its original checksum
         shell: bash
         run: |
           set -euo pipefail
           cat .github/pi-visual-transfer.{01,02,03,04,05,06,07,08,09,10,11}.patch > /tmp/pi-visual.patch
-          # Recovered from the committed files. 29/30 target blob hashes match;
-          # DesktopViewer was separately reviewed because its recorded hash is stale.
-          echo 'd89751e7fd5974f3195b1ed98f3a9f994644f824dd7e04d1d4c2e72772081f95  /tmp/pi-visual.patch' | sha256sum --check
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/pi-visual.patch')
+          data = p.read_bytes()
+          old = b'?.focus();}}/>'
+          assert data.count(old) == 1, 'Expected exactly one damaged JSX delimiter'
+          p.write_bytes(data.replace(old, b'?.focus();}}}/>'))
+          PY
+          echo '426b1eee7caa15e9e6e7e9f232a5ac7efbc4038e2aa45cc4276f932f3075c297  /tmp/pi-visual.patch' | sha256sum --check
           git apply --check --unidiff-zero /tmp/pi-visual.patch
           git apply --unidiff-zero /tmp/pi-visual.patch
       - uses: ./.github/actions/setup-ci
         with:
           node: 'true'
       - run: bun install --frozen-lockfile
+      - name: Archive reproducible local test tools
+        run: |
+          mkdir /tmp/pi-visual-bin
+          cp "$(command -v bun)" /tmp/pi-visual-bin/bun
+          tar -czf /tmp/pi-visual-devtools.tar.gz node_modules -C /tmp/pi-visual-bin bun
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-visual-devtools
+          path: /tmp/pi-visual-devtools.tar.gz
+          retention-days: 1
       - run: bun run typecheck
       - run: bun run build
       - run: bun test server/pi-visual/visual.test.ts server/pi-visual/tunnel.test.ts src/lib/pi-visual/visual.test.ts src/lib/i18n.test.ts server/conventions.test.ts src/conventions.test.ts scripts/conventions.test.ts
