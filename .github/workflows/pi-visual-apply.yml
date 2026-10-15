@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           cat .github/pi-visual-transfer.{01,02,03,04,05,06,07,08,09,10,11}.patch > /tmp/pi-visual.patch
-          echo 'a4a6c9f577105bd0b6beb0faf5671bde996b1664150bf5708353dc350ef1c401  /tmp/pi-visual.patch' | sha256sum --check
+          echo '426b1eee7caa15e9e6e7e9f232a5ac7efbc4038e2aa45cc4276f932f3075c297  /tmp/pi-visual.patch' | sha256sum --check
           git apply --check --unidiff-zero /tmp/pi-visual.patch
           git apply --unidiff-zero /tmp/pi-visual.patch
       - uses: ./.github/actions/setup-ci
