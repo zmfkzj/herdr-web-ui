@@ -1,0 +1,92 @@
+diff --git a/src/components/PaneTerminal.tsx b/src/components/PaneTerminal.tsx
+index 107e1f2..c62e210 100644
+--- a/src/components/PaneTerminal.tsx
++++ b/src/components/PaneTerminal.tsx
+@@ -1 +1,2 @@
++import { PiVisualTools } from "./pi-visual/PiVisualTools.tsx";
+ import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
+@@ -2761,2 +2762,3 @@ export function PaneTerminal({
+       )}
++      {paneId !== null && agent === "pi" && chatView && !observing && <PiVisualTools key={`${machineId}:${paneId}`} paneId={paneId} machineId={machineId} enabled={presented && connected && !ended} />}
+       <div className="terminal-surface">
+diff --git a/src/components/pi-visual/DesktopViewer.tsx b/src/components/pi-visual/DesktopViewer.tsx
+new file mode 100644
+index 0000000..2334816
+--- /dev/null
++++ b/src/components/pi-visual/DesktopViewer.tsx
+@@ -0,0 +1,75 @@
++import { useEffect, useRef, useState, type FormEvent } from "react";
++import { createPortal } from "react-dom";
++import { X } from "lucide-react";
++import type { PiDesktopTicket } from "../../../shared/pi-visual.ts";
++import { useT } from "../../lib/i18n.ts";
++import { useFocusTrap } from "../../lib/useFocusTrap.ts";
++import { usePhoneSheetBack } from "../../lib/sheetHistory.ts";
++import { visualUrl, visualRequest, checkSession } from "../../lib/pi-visual/api.ts";
++import "./PiVisual.css";
++
++export function DesktopViewer({paneId,machineId,session,onClose}:{paneId:string;machineId:string;session:string;onClose:()=>void}) {
++  const t=useT(); const surface=useFocusTrap<HTMLDivElement>(true); const display=useRef<HTMLDivElement>(null);
++  const password=useRef<HTMLInputElement>(null); const cleanup=useRef<()=>void>(()=>{}); const abort=useRef<AbortController|null>(null);
++  const [state,setState]=useState<"idle"|"connecting"|"connected">("idle"); const [error,setError]=useState("");
++  const alive=useRef(true); const keyboardCleanup=useRef<()=>void>(()=>{});
++  usePhoneSheetBack(onClose,true);
++  useEffect(()=>{
++    alive.current=true;
++    const leave=()=>{if(password.current) password.current.value="";abort.current?.abort();cleanup.current();if(alive.current)setState("idle");};
++    const hidden=()=>{if(document.hidden)leave();};
++    document.addEventListener("visibilitychange",hidden);window.addEventListener("pagehide",leave);
++    return ()=>{alive.current=false;leave();document.removeEventListener("visibilitychange",hidden);window.removeEventListener("pagehide",leave);};
++  },[]);
++  const disconnect=()=>{abort.current?.abort();cleanup.current();setState("idle");if(password.current)password.current.value="";};
++  const start=async(event:FormEvent<HTMLFormElement>)=>{
++    event.preventDefault(); if(state!=="idle")return; setError("");setState("connecting");
++    const form=event.currentTarget;const fields=form.elements;
++    const port=Number((fields.namedItem("port") as HTMLInputElement).value), fingerprint=(fields.namedItem("fingerprint") as HTMLInputElement).value;
++    const readOnly=(fields.namedItem("observe") as HTMLInputElement).checked;
++    const controller=new AbortController(); abort.current=controller;
++    try {
++      await checkSession(machineId,paneId,session);
++      if(controller.signal.aborted)return;
++      // Secret is read from the uncontrolled DOM input only at the explicit connect click.
++      const connection={session,port,password:password.current?.value??"",fingerprint,readOnly,width:Math.max(200,Math.min(4096,Math.round(display.current?.clientWidth??1024))),height:768};
++      const pending=visualRequest<PiDesktopTicket>(visualUrl(machineId,paneId,"desktop"),"POST",connection,controller.signal);
++      connection.password=""; if(password.current)password.current.value="";
++      const ticket=await pending; const {default:Guacamole}=await import("guacamole-common-js");
++      if(!alive.current||controller.signal.aborted)return;
++      const url=new URL("/ws",window.location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
++      const tunnel=new Guacamole.WebSocketTunnel(url.toString());const client=new Guacamole.Client(tunnel);const view=client.getDisplay();
++      const host=display.current!;host.replaceChildren(view.getElement());
++      const resize=()=>{const w=view.getWidth();if(w>0)view.scale(Math.min(1,host.clientWidth/w));};
++      const observer=new ResizeObserver(resize);observer.observe(host);view.onresize=resize;
++      const keyboard=new Guacamole.Keyboard(host);const mouse=new Guacamole.Mouse(view.getElement());
++      if(!readOnly){
++        keyboard.onkeydown=key=>{client.sendKeyEvent(1,key);return false;};keyboard.onkeyup=key=>client.sendKeyEvent(0,key);
++        mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=mouseState=>client.sendMouseState(mouseState,true);
++      }
++      const blur=()=>keyboard.reset();host.addEventListener("blur",blur);
++      keyboardCleanup.current=blur;
++      cleanup.current=()=>{observer.disconnect();host.removeEventListener("blur",blur);keyboard.reset();keyboard.onkeydown=null;keyboard.onkeyup=null;mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=null;client.onerror=null;client.onstatechange=null;tunnel.onerror=null;client.disconnect();host.replaceChildren();cleanup.current=()=>{};};
++      const failed=(status:{message:string})=>{if(alive.current){setError(status.message||t("Desktop disconnected"));setState("idle");}cleanup.current();};
++      client.onerror=tunnel.onerror=failed;
++      client.onstatechange=value=>{if(alive.current){if(value===3){setState("connected");host.focus();}else if(value===5){cleanup.current();setState("idle");}}};
++      client.connect(new URLSearchParams({pi_desktop_ticket:ticket.ticket}).toString());
++    } catch(err){if(alive.current&&!controller.signal.aborted){setError(err instanceof Error?err.message:t("Desktop disconnected"));setState("idle");}cleanup.current();}
++    finally{if(password.current)password.current.value="";}
++  };
++  return createPortal(<div className="modal-scrim pi-visual-scrim"><div className="pi-visual-modal" ref={surface} role="dialog" aria-modal="true" aria-label={t("Private desktop")} tabIndex={-1}>
++    <header><h2>{t("Private desktop")}</h2><button type="button" className="icon-button" onClick={onClose} aria-label={t("Close")}><X aria-hidden="true"/></button></header>
++    <p>{t("Run /gui view W1 or /gui view main in Pi, then enter its connection fields. Pause the worker before taking control.")}</p>
++    <form onSubmit={event=>void start(event)} className="pi-desktop-form" autoComplete="off">
++      <label>{t("RDP port")}<input className="input" name="port" type="number" min={1024} max={65535} required disabled={state!=="idle"}/></label>
++      <label>{t("One-time viewer password")}<input className="input" ref={password} type="password" maxLength={256} autoComplete="off" required disabled={state!=="idle"}/></label>
++      <label className="pi-fingerprint">{t("Certificate SHA-256")}<input className="input" name="fingerprint" maxLength={200} required disabled={state!=="idle"}/></label>
++      <label><input name="observe" type="checkbox" defaultChecked disabled={state!=="idle"}/>{t("Observe only")}</label>
++      <button type="submit" className="btn" disabled={state!=="idle"}>{state==="connecting"?t("Connecting…"):t("Connect")}</button>
++      <button type="button" className="btn" disabled={state==="idle"} onClick={disconnect}>{t("Disconnect")}</button>
++    </form>
++    {error&&<p role="alert">{error}</p>}
++    <div className="pi-desktop-display" ref={display} tabIndex={0} role="application" aria-label={t("Private desktop screen")} onKeyDown={event=>{if(event.key==="Escape"&&event.shiftKey){event.stopPropagation();event.preventDefault();keyboardCleanup.current();(surface.current?.querySelector("button") as HTMLButtonElement)?.focus();}}/>
++    <p className="pi-visual-muted">{t("Shift+Escape leaves screen focus. Closing this viewer keeps Pi and its desktop running. Reconnect requires the password again.")}</p>
++  </div></div>,document.body);
++}
