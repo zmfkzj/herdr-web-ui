@@ -1,0 +1,232 @@
+diff --git a/scripts/pi-visual-browser-qa.ts b/scripts/pi-visual-browser-qa.ts
+index c91a7fa..09416ad 100644
+--- a/scripts/pi-visual-browser-qa.ts
++++ b/scripts/pi-visual-browser-qa.ts
+@@ -47,5 +47,6 @@ try {
+     if(url.pathname.startsWith("/api/pane/pi-visual/"))return service!.handle(request,url,false);
++    if(url.pathname==="/fixture/keys")return new Response(JSON.stringify(received.filter(p=>p[0]==="key")),{headers:{"content-type":"application/json"}});
+     if(url.pathname==="/api/pane/image") {uploads++;return new Response(JSON.stringify({path:"/fixture/review.png"}),{headers:{"content-type":"application/json"}});}
+     if(url.pathname==="/")return new Response('<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/pi-visual.css"></head><body><div id="root"></div><script type="module" src="/pi-visual.js"></script></body></html>',{headers:{"content-type":"text/html"}});
+-    return new Response(Bun.file(join(root,url.pathname.slice(1))));
++    const asset=Bun.file(join(root,url.pathname.slice(1)));return await asset.exists()?new Response(asset):new Response("Not found",{status:404});
+   },websocket:{open(ws){ws.data.desktop.bind(ws);},message(ws,raw){ws.data.desktop.message(String(raw));},close(ws){service!.release(ws.data.desktop);}}});
+@@ -58,3 +59,5 @@ try {
+     await page.waitForFunction(()=>{const image=document.querySelector(".pi-review-image img") as HTMLImageElement|null;return image?.complete&&image.naturalWidth;});
+-    if(name==="desktop")await page.getByRole("button",{name:"Add center comment"}).click();await page.getByLabel("Comment 1",{exact:true}).fill(`Move the marked part to the left (${name}).`);
++    if(name==="desktop")await page.getByRole("button",{name:"Add center comment"}).click();
++    else assert.equal(await page.getByLabel("Comment 1",{exact:true}).inputValue(),"Move the marked part to the left (desktop).");
++    await page.getByLabel("Comment 1",{exact:true}).fill(`Move the marked part to the left (${name}).`);
+     await page.getByRole("button",{name:"Save",exact:true}).click();await page.getByText("Saved",{exact:true}).waitFor();
+@@ -72,2 +75,17 @@ try {
+       assert.ok(!received.some(p=>p[0]==="mouse"||p[0]==="key"));
++      // Reconnect on a fresh DOM input target; keyboard events must be sent once.
++      await page.getByLabel("Observe only",{exact:true}).uncheck();
++      await page.getByLabel("One-time viewer password",{exact:true}).fill("fixture-control");
++      await page.getByRole("button",{name:"Connect",exact:true}).click();
++      await page.getByRole("application",{name:"Private desktop screen"}).waitFor();
++      await page.waitForFunction(()=>Array.from(document.querySelectorAll(".pi-desktop-display canvas")).some(c=>(c as HTMLCanvasElement).width===640));
++      await page.getByRole("application",{name:"Private desktop screen"}).focus();
++      await page.keyboard.press("a");
++      await page.waitForFunction(async()=>{const rows=await (await fetch("/fixture/keys")).json() as string[][];return rows.some(p=>p[0]==="key"&&p[1]==="97"&&p[2]==="0");});
++      assert.equal(received.filter(p=>p[0]==="key"&&p[1]==="97"&&p[2]==="1").length,1);
++      await page.keyboard.press("Shift+Escape");
++      assert.equal(await page.getByRole("button",{name:"Close",exact:true}).evaluate(el=>el===document.activeElement),true);
++      await page.getByRole("button",{name:"Disconnect",exact:true}).click();
++      assert.ok(!received.some(p=>p[0]==="key"&&p[1]==="65307"));
++      assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes("fixture-control"));
+     }
+diff --git a/server/pi-visual/visual.test.ts b/server/pi-visual/visual.test.ts
+index 7339d4e..9269870 100644
+--- a/server/pi-visual/visual.test.ts
++++ b/server/pi-visual/visual.test.ts
+@@ -20,2 +20,24 @@ function row(id:string,parentId:string|null,data:Record<string,unknown>){return
+ describe("original Pi orche records",()=>{
++  it("keeps newest job facts when older custom entries exhaust the byte budget",()=>{
++    const path=join(temp(),"pi.jsonl");
++    const records:unknown[]=[{type:"session",id:"s-budget"}];
++    let parent:string|null=null;
++    for(let n=0;n<24;n++){
++      const id=`large-${n}`;
++      records.push({...row(id,parent,{}),customType:"unrelated-state",data:{text:"x".repeat(450000)}});parent=id;
++    }
++    records.push(row("latest-start",parent,{event:"start",job:"J9",worker:"W9",at:1}));
++    records.push(row("latest-end","latest-start",{event:"end",job:"J9",status:"done",at:2}));
++    writeFileSync(path,records.map(r=>JSON.stringify(r)).join("\n")+"\n");
++    const found=jobEntries(path);expect(found.truncated).toBe(true);
++    expect(foldJobs(found.entries).map(job=>[job.job,job.state])).toEqual([["J9","done"]]);
++  });
++  it("does not borrow a reused worker's later tools for an ended assignment",()=>{
++    const dir=temp(),root=join(dir,"records"),group=join(root,identity.sessionId),record=join(group,"run1"),path=join(dir,"pi.jsonl");
++    mkdirSync(record,{recursive:true});const workerFile=join(group,"worker.jsonl");
++    writeFileSync(path,JSON.stringify({type:"session",id:identity.sessionId})+"\n"+JSON.stringify(row("a",null,{event:"start",job:"J1",worker:"W1",at:1,record}))+"\n");
++    writeFileSync(workerFile,JSON.stringify({type:"message",message:{role:"toolResult",toolName:"later_assignment_tool"}})+"\n");
++    writeFileSync(join(record,"run.json"),JSON.stringify({version:1,parentSession:{id:identity.sessionId,file:path},worker:{id:"W1",sessionFile:workerFile},status:"done",agents:[]}));
++    const job=readWorkers({...identity,path},root).workers[0];expect(job?.state).toBe("done");expect(job?.lastTool).toBeUndefined();
++  });
+   it("folds original orche jobs, not OMP task records",()=>{
+diff --git a/server/pi-visual/workers.ts b/server/pi-visual/workers.ts
+index 826c43d..9a60118 100644
+--- a/server/pi-visual/workers.ts
++++ b/server/pi-visual/workers.ts
+@@ -28,3 +28,5 @@ export function jobEntries(path: string): { entries: Record<string, unknown>[];
+   const entries: Record<string, unknown>[] = [];
+-  for (const entry of custom.slice(-2000)) {
++  // Spend the read budget on newest facts first; older unrelated custom entries
++  // must not hide the latest end event and leave a finished job showing running.
++  for (const entry of custom.slice(-2000).reverse()) {
+     if (entry.end - entry.start > 512 * 1024 || (budget -= entry.end - entry.start) < 0) { truncated = true; continue; }
+@@ -33,3 +35,3 @@ export function jobEntries(path: string): { entries: Record<string, unknown>[];
+   }
+-  return { entries, truncated };
++  return { entries: entries.reverse(), truncated };
+ }
+@@ -65,3 +67,5 @@ function enrich(job: PiVisualWorker, record: string, pane: PiPane, root: string)
+   const transcript = typeof manifest.worker.sessionFile === "string" ? contained(manifest.worker.sessionFile, join(root,pane.sessionId)) : null;
+-  if (transcript) {
++  // Persistent workers reuse this file across assignments. Do not attribute a
++  // later assignment's latest tool to an already finished job.
++  if (transcript && job.state === "running") {
+     const stat = statSync(transcript); job.updated = stat.mtimeMs;
+diff --git a/src/components/pi-visual/DesktopViewer.tsx b/src/components/pi-visual/DesktopViewer.tsx
+index 2334816..b3343e5 100644
+--- a/src/components/pi-visual/DesktopViewer.tsx
++++ b/src/components/pi-visual/DesktopViewer.tsx
+@@ -16,13 +16,18 @@ export function DesktopViewer({paneId,machineId,session,onClose}:{paneId:string;
+   usePhoneSheetBack(onClose,true);
++  const disconnect=()=>{
++    const controller=abort.current; abort.current=null;
++    controller?.abort(); cleanup.current(); cleanup.current=()=>{}; keyboardCleanup.current=()=>{};
++    if(password.current) password.current.value="";
++    if(alive.current) setState("idle");
++  };
+   useEffect(()=>{
+     alive.current=true;
+-    const leave=()=>{if(password.current) password.current.value="";abort.current?.abort();cleanup.current();if(alive.current)setState("idle");};
+-    const hidden=()=>{if(document.hidden)leave();};
+-    document.addEventListener("visibilitychange",hidden);window.addEventListener("pagehide",leave);
+-    return ()=>{alive.current=false;leave();document.removeEventListener("visibilitychange",hidden);window.removeEventListener("pagehide",leave);};
++    const hidden=()=>{if(document.hidden)disconnect();};
++    document.addEventListener("visibilitychange",hidden);window.addEventListener("pagehide",disconnect);
++    return ()=>{alive.current=false;disconnect();document.removeEventListener("visibilitychange",hidden);window.removeEventListener("pagehide",disconnect);};
+   },[]);
+-  const disconnect=()=>{abort.current?.abort();cleanup.current();setState("idle");if(password.current)password.current.value="";};
+   const start=async(event:FormEvent<HTMLFormElement>)=>{
+-    event.preventDefault(); if(state!=="idle")return; setError("");setState("connecting");
+-    const form=event.currentTarget;const fields=form.elements;
++    event.preventDefault(); if(state!=="idle"||abort.current)return;
++    setError("");setState("connecting");
++    const fields=event.currentTarget.elements;
+     const port=Number((fields.namedItem("port") as HTMLInputElement).value), fingerprint=(fields.namedItem("fingerprint") as HTMLInputElement).value;
+@@ -30,6 +35,16 @@ export function DesktopViewer({paneId,machineId,session,onClose}:{paneId:string;
+     const controller=new AbortController(); abort.current=controller;
++    const ownsAttempt=()=>alive.current&&abort.current===controller&&!controller.signal.aborted;
++    let disposeAttempt:()=>void=()=>{};
++    const failed=(message:string)=>{
++      // A late response from an aborted attempt must not close a newer connection
++      // or erase the password the user has entered for that newer attempt.
++      if(!ownsAttempt())return;
++      disposeAttempt(); abort.current=null; controller.abort();
++      if(password.current)password.current.value="";
++      setError(message);setState("idle");
++    };
+     try {
+-      await checkSession(machineId,paneId,session);
+-      if(controller.signal.aborted)return;
+-      // Secret is read from the uncontrolled DOM input only at the explicit connect click.
++      await checkSession(machineId,paneId,session,controller.signal);
++      if(!ownsAttempt())return;
++      // Read the secret only for this explicit connect action; never retain it in React state.
+       const connection={session,port,password:password.current?.value??"",fingerprint,readOnly,width:Math.max(200,Math.min(4096,Math.round(display.current?.clientWidth??1024))),height:768};
+@@ -37,23 +52,45 @@ export function DesktopViewer({paneId,machineId,session,onClose}:{paneId:string;
+       connection.password=""; if(password.current)password.current.value="";
+-      const ticket=await pending; const {default:Guacamole}=await import("guacamole-common-js");
+-      if(!alive.current||controller.signal.aborted)return;
++      const ticket=await pending;
++      if(!ownsAttempt())return;
++      const {default:Guacamole}=await import("guacamole-common-js");
++      if(!ownsAttempt())return;
+       const url=new URL("/ws",window.location.href);url.protocol=url.protocol==="https:"?"wss:":"ws:";
+       const tunnel=new Guacamole.WebSocketTunnel(url.toString());const client=new Guacamole.Client(tunnel);const view=client.getDisplay();
+-      const host=display.current!;host.replaceChildren(view.getElement());
++      const host=display.current!;
++      // Each connection owns a fresh keyboard target. Removing it also removes the
++      // Guacamole DOM listeners, rather than accumulating listeners on the React host.
++      const inputHost=document.createElement("div");inputHost.tabIndex=0;
++      inputHost.setAttribute("role","application");inputHost.setAttribute("aria-label",t("Private desktop screen"));
++      inputHost.appendChild(view.getElement());host.replaceChildren(inputHost);
+       const resize=()=>{const w=view.getWidth();if(w>0)view.scale(Math.min(1,host.clientWidth/w));};
+       const observer=new ResizeObserver(resize);observer.observe(host);view.onresize=resize;
+-      const keyboard=new Guacamole.Keyboard(host);const mouse=new Guacamole.Mouse(view.getElement());
++      const keyboard=new Guacamole.Keyboard(inputHost);const mouse=new Guacamole.Mouse(view.getElement());
+       if(!readOnly){
+-        keyboard.onkeydown=key=>{client.sendKeyEvent(1,key);return false;};keyboard.onkeyup=key=>client.sendKeyEvent(0,key);
+-        mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=mouseState=>client.sendMouseState(mouseState,true);
++        keyboard.onkeydown=key=>{if(ownsAttempt())client.sendKeyEvent(1,key);return false;};
++        keyboard.onkeyup=key=>client.sendKeyEvent(0,key);
++        mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=mouseState=>{if(ownsAttempt())client.sendMouseState(mouseState,true);};
+       }
+-      const blur=()=>keyboard.reset();host.addEventListener("blur",blur);
++      const blur=()=>keyboard.reset(), focus=()=>inputHost.focus();
++      inputHost.addEventListener("blur",blur);inputHost.addEventListener("pointerdown",focus);
+       keyboardCleanup.current=blur;
+-      cleanup.current=()=>{observer.disconnect();host.removeEventListener("blur",blur);keyboard.reset();keyboard.onkeydown=null;keyboard.onkeyup=null;mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=null;client.onerror=null;client.onstatechange=null;tunnel.onerror=null;client.disconnect();host.replaceChildren();cleanup.current=()=>{};};
+-      const failed=(status:{message:string})=>{if(alive.current){setError(status.message||t("Desktop disconnected"));setState("idle");}cleanup.current();};
+-      client.onerror=tunnel.onerror=failed;
+-      client.onstatechange=value=>{if(alive.current){if(value===3){setState("connected");host.focus();}else if(value===5){cleanup.current();setState("idle");}}};
++      let disposed=false;
++      disposeAttempt=()=>{
++        if(disposed)return;disposed=true;
++        observer.disconnect();view.onresize=null;
++        inputHost.removeEventListener("blur",blur);inputHost.removeEventListener("pointerdown",focus);
++        keyboard.reset();keyboard.onkeydown=null;keyboard.onkeyup=null;
++        mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=null;
++        client.onerror=null;client.onstatechange=null;tunnel.onerror=null;
++        client.disconnect();inputHost.remove();
++        if(cleanup.current===disposeAttempt){cleanup.current=()=>{};keyboardCleanup.current=()=>{};}
++      };
++      cleanup.current=disposeAttempt;
++      client.onerror=tunnel.onerror=status=>failed(status.message||t("Desktop disconnected"));
++      client.onstatechange=value=>{
++        if(!ownsAttempt())return;
++        if(value===3){setState("connected");inputHost.focus();}
++        else if(value===5){disposeAttempt();abort.current=null;controller.abort();setState("idle");}
++      };
+       client.connect(new URLSearchParams({pi_desktop_ticket:ticket.ticket}).toString());
+-    } catch(err){if(alive.current&&!controller.signal.aborted){setError(err instanceof Error?err.message:t("Desktop disconnected"));setState("idle");}cleanup.current();}
+-    finally{if(password.current)password.current.value="";}
++    } catch(err){failed(err instanceof Error?err.message:t("Desktop disconnected"));}
+   };
+@@ -71,3 +108,3 @@ export function DesktopViewer({paneId,machineId,session,onClose}:{paneId:string;
+     {error&&<p role="alert">{error}</p>}
+-    <div className="pi-desktop-display" ref={display} tabIndex={0} role="application" aria-label={t("Private desktop screen")} onKeyDown={event=>{if(event.key==="Escape"&&event.shiftKey){event.stopPropagation();event.preventDefault();keyboardCleanup.current();(surface.current?.querySelector("button") as HTMLButtonElement)?.focus();}}}/>
++    <div className="pi-desktop-display" ref={display} onKeyDownCapture={event=>{if(event.key==="Escape"&&event.shiftKey){event.stopPropagation();event.preventDefault();keyboardCleanup.current();(surface.current?.querySelector("button") as HTMLButtonElement)?.focus();}}}/>
+     <p className="pi-visual-muted">{t("Shift+Escape leaves screen focus. Closing this viewer keeps Pi and its desktop running. Reconnect requires the password again.")}</p>
+diff --git a/src/components/pi-visual/ImageReview.tsx b/src/components/pi-visual/ImageReview.tsx
+index d9b6395..7ae2b38 100644
+--- a/src/components/pi-visual/ImageReview.tsx
++++ b/src/components/pi-visual/ImageReview.tsx
+@@ -1,2 +1,2 @@
+-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
++import { useEffect, useId, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+ import { createPortal } from "react-dom";
+@@ -13,3 +13,3 @@ import "./PiVisual.css";
+ export function ImageReview({paneId,machineId,image,onClose}:{paneId:string;machineId:string;image:GalleryImage;onClose:()=>void}) {
+-  const t=useT();const surface=useFocusTrap<HTMLDivElement>(true);const picture=useRef<HTMLImageElement>(null);
++  const commentId=useId();const t=useT();const surface=useFocusTrap<HTMLDivElement>(true);const picture=useRef<HTMLImageElement>(null);
+   const [doc,setDoc]=useState<ImageReviewDocument|null>(null),[notes,setNotes]=useState<ImageAnnotation[]>([]);
+@@ -114,3 +114,3 @@ export function ImageReview({paneId,machineId,image,onClose}:{paneId:string;mach
+     </div></div><div className="pi-review-comments">{notes.map((note,index)=><article key={note.id} className={selected===note.id?"is-selected":undefined}>
+-      <label>{t("Comment {n}",{n:index+1})}<textarea className="input" value={note.text} maxLength={4000} disabled={busy} onFocus={()=>setSelected(note.id)} onChange={e=>patch(note.id,{text:e.target.value})}/></label>
++      <label htmlFor={`${commentId}-${note.id}`}>{t("Comment {n}",{n:index+1})}</label><textarea id={`${commentId}-${note.id}`} className="input" value={note.text} maxLength={4000} disabled={busy} onFocus={()=>setSelected(note.id)} onChange={e=>patch(note.id,{text:e.target.value})}/>
+       <label><input type="checkbox" checked={note.resolved} disabled={busy} onChange={e=>patch(note.id,{resolved:e.target.checked})}/>{t("Resolved")}</label>
+diff --git a/src/lib/pi-visual/api.ts b/src/lib/pi-visual/api.ts
+index 13beba8..f993f93 100644
+--- a/src/lib/pi-visual/api.ts
++++ b/src/lib/pi-visual/api.ts
+@@ -22,4 +22,4 @@ export function sourceFromImage(src: string,machine: string,pane: string,origin:
+ }
+-export async function checkSession(machine: string,pane: string,session: string): Promise<void> {
+-  const result=await visualRequest<PiVisualWorkers>(visualUrl(machine,pane,"workers",{session}));
++export async function checkSession(machine: string,pane: string,session: string,signal?: AbortSignal): Promise<void> {
++  const result=await visualRequest<PiVisualWorkers>(visualUrl(machine,pane,"workers",{session}),"GET",undefined,signal);
+   if(result.session!==session) throw new Error("Pi session changed; reopen visual tools");
