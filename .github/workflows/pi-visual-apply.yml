@@ -35,20 +35,13 @@ jobs:
           echo '426b1eee7caa15e9e6e7e9f232a5ac7efbc4038e2aa45cc4276f932f3075c297  /tmp/pi-visual.patch' | sha256sum --check
           git apply --check --unidiff-zero /tmp/pi-visual.patch
           git apply --unidiff-zero /tmp/pi-visual.patch
+          echo '48e033ed156588fc2029239a95c2daae1a28f19e08ffbdc8ad4a4023abd495dc  .github/pi-visual-recovery-fixes.patch' | sha256sum --check
+          git apply --check .github/pi-visual-recovery-fixes.patch
+          git apply .github/pi-visual-recovery-fixes.patch
       - uses: ./.github/actions/setup-ci
         with:
           node: 'true'
       - run: bun install --frozen-lockfile
-      - name: Archive reproducible local test tools
-        run: |
-          mkdir /tmp/pi-visual-bin
-          cp "$(command -v bun)" /tmp/pi-visual-bin/bun
-          tar -czf /tmp/pi-visual-devtools.tar.gz node_modules -C /tmp/pi-visual-bin bun
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pi-visual-devtools
-          path: /tmp/pi-visual-devtools.tar.gz
-          retention-days: 1
       - run: bun run typecheck
       - run: bun run build
       - run: bun test server/pi-visual/visual.test.ts server/pi-visual/tunnel.test.ts src/lib/pi-visual/visual.test.ts src/lib/i18n.test.ts server/conventions.test.ts src/conventions.test.ts scripts/conventions.test.ts
@@ -57,7 +50,7 @@ jobs:
       - run: bun run test:unit
       - name: Commit validated source and remove temporary transfer machinery
         run: |
-          git rm --ignore-unmatch .github/pi-visual-transfer.* .github/workflows/pi-visual-apply.yml .github/workflows/pi-visual-dependency.yml .github/workflows/pi-visual-recovery.yml
+          git rm --ignore-unmatch .github/pi-visual-transfer.* .github/pi-visual-recovery-fixes.patch .github/workflows/pi-visual-apply.yml .github/workflows/pi-visual-dependency.yml .github/workflows/pi-visual-recovery.yml
           git add -A
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(pi-visual): add original Pi workers, private desktops and image comments'
           git push origin HEAD:refs/heads/feat/pi-visual-tools
