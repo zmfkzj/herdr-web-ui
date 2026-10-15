@@ -1,0 +1,30 @@
+name: Inspect Pi visual recovery
+on:
+  push:
+    branches: [feat/pi-visual-tools]
+    paths: [.github/workflows/pi-visual-recovery.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.repository == 'zmfkzj/herdr-web-ui'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive current source and report transfer integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz HEAD > /tmp/pi-visual-recovery.tar.gz
+          cat .github/pi-visual-transfer.{01,02,03,04,05,06,07,08,09,10,11}.patch > /tmp/pi-visual.patch
+          sha256sum /tmp/pi-visual.patch
+          git apply --check --unidiff-zero /tmp/pi-visual.patch || true
+          git apply --check --recount --unidiff-zero /tmp/pi-visual.patch || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-visual-recovery-source
+          path: /tmp/pi-visual-recovery.tar.gz
+          retention-days: 2
