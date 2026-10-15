@@ -2,6 +2,9 @@ name: Pi visual tools
 on:
   push:
     branches: [feat/pi-visual-tools]
+    paths-ignore:
+      - '.github/pi-visual-transfer.*'
+      - '.github/workflows/pi-visual-apply.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,61 +14,20 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Archive the exact source under test
-        run: git archive --format=tar.gz HEAD > /tmp/pi-visual-source.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pi-visual-source
-          path: /tmp/pi-visual-source.tar.gz
-          retention-days: 1
-      - uses: actions/checkout@v4
-        with:
-          repository: zmfkzj/oh-my-pi-extensions
-          ref: c3e07be24c0c22878bb12766a9fd5ad353d8b262
-          path: .compat/bundle
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: zmfkzj/pi-orche
-          ref: f88d208a63517b9d0bfc2f47d31129d65eb6c27e
-          path: .compat/orche
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: zmfkzj/pi-gui
-          ref: ee3bc983f5ffec0a6b19b03c4202416d805f5e48
-          path: .compat/pi-gui
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: zmfkzj/pi-images
-          ref: f915d4cbde830b8cdcfedb69d4f999da2e7bf027
-          path: .compat/images
-          persist-credentials: false
-      - name: Archive pinned compatibility sources
-        run: |
-          tar --exclude=.git --exclude=.codegraph --exclude=experiments -czf /tmp/pi-compat.tar.gz .compat
-          rm -rf .compat
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pi-original-compatibility
-          path: /tmp/pi-compat.tar.gz
-          retention-days: 1
       - uses: ./.github/actions/setup-ci
         with:
           node: 'true'
       - run: bun install --frozen-lockfile
-      - name: Archive isolated verification runtime
-        run: |
-          mkdir -p /tmp/pi-visual-runtime/bin
-          cp "$(command -v bun)" /tmp/pi-visual-runtime/bin/bun
-          tar -czf /tmp/pi-visual-runtime/dependencies.tar.gz node_modules
-          tar -czf /tmp/pi-visual-runtime.tar.gz -C /tmp/pi-visual-runtime .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pi-visual-verification-runtime
-          path: /tmp/pi-visual-runtime.tar.gz
-          retention-days: 1
       - run: bun run typecheck
       - run: bun run build
+      - name: Visual feature browser checks
+        if: hashFiles('scripts/pi-visual-browser-qa.ts') != ''
+        run: CHROME_PATH="$(command -v google-chrome)" bun scripts/pi-visual-browser-qa.ts
       - run: bun run test:unit
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pi-visual-browser-evidence
+          path: evidence/pi-visual
+          retention-days: 7
+          if-no-files-found: ignore
