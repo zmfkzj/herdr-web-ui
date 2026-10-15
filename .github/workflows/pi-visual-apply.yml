@@ -2,7 +2,7 @@ name: Apply Pi visual source
 on:
   push:
     branches: [feat/pi-visual-tools]
-    paths: [.github/pi-visual-transfer.06]
+    paths: [.github/pi-visual-transfer.11.patch]
 permissions:
   contents: read
 jobs:
@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .github/pi-visual-transfer.0{1,2,3,4,5,6} | base64 --decode | gzip --decompress > /tmp/pi-visual.patch
+          cat .github/pi-visual-transfer.{01,02,03,04,05,06,07,08,09,10,11}.patch > /tmp/pi-visual.patch
           echo 'a4a6c9f577105bd0b6beb0faf5671bde996b1664150bf5708353dc350ef1c401  /tmp/pi-visual.patch' | sha256sum --check
           git apply --check --unidiff-zero /tmp/pi-visual.patch
           git apply --unidiff-zero /tmp/pi-visual.patch
@@ -33,7 +33,7 @@ jobs:
       - run: bun test server/pi-visual/visual.test.ts server/pi-visual/tunnel.test.ts src/lib/pi-visual/visual.test.ts src/lib/i18n.test.ts server/conventions.test.ts src/conventions.test.ts scripts/conventions.test.ts
       - name: Commit normal source changes and remove transfer files
         run: |
-          git rm --ignore-unmatch .github/pi-visual-transfer.0{1,2,3,4,5,6}
+          git rm --ignore-unmatch .github/pi-visual-transfer.*
           git add -A
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'feat(pi-visual): add original Pi workers, private desktops and image comments'
           git push origin HEAD:refs/heads/feat/pi-visual-tools
