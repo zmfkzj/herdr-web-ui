@@ -1,0 +1,27 @@
+name: Pi visual tools
+on:
+  push:
+    branches: [feat/pi-visual-tools]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive the exact source under test
+        run: git archive --format=tar.gz HEAD > /tmp/pi-visual-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pi-visual-source
+          path: /tmp/pi-visual-source.tar.gz
+          retention-days: 1
+      - uses: ./.github/actions/setup-ci
+        with:
+          node: 'true'
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+      - run: bun run test:unit
