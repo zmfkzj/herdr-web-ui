@@ -1,0 +1,26 @@
+name: Prepare Pi desktop client
+on:
+  push:
+    branches: [feat/pi-visual-tools]
+    paths: [.github/workflows/pi-visual-dependency.yml]
+permissions:
+  contents: read
+jobs:
+  package:
+    if: github.repository == 'zmfkzj/herdr-web-ui'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ci
+        with:
+          node: 'true'
+      - run: bun add --exact guacamole-common-js@1.5.0
+      - run: |
+          mkdir /tmp/desktop-client
+          cp package.json bun.lock /tmp/desktop-client/
+          tar -czf /tmp/desktop-client/client.tar.gz node_modules/guacamole-common-js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-client
+          path: /tmp/desktop-client
+          retention-days: 1
