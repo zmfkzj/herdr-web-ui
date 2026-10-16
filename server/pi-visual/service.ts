@@ -192,12 +192,13 @@ export class PiVisualService {
       return jsonResponse({error:{code:"not_found",message:"Unknown Pi visual endpoint or method"}},404);
     } catch(error) { return visualResponse(error); }
   }
-  async take(request: Request,deviceId?: string): Promise<DesktopTunnel> {
+  /** `mayInteract`: whether the browser's device may still give input (DesktopTunnel), its role now. */
+  async take(request: Request,deviceId?: string,mayInteract?: () => boolean): Promise<DesktopTunnel> {
     if(this.tunnels.size>=8) throw new VisualError("desktop_busy","Too many desktop connections",429);
     const ticket=this.tickets.take(new URL(request.url).searchParams.get("pi_desktop_ticket")??"",desktopBinding(request,deviceId));
     try {
       await this.deps.identity(ticket.pane.paneId,ticket.pane.session);
-      const tunnel=new DesktopTunnel(ticket,() => this.deps.identity(ticket.pane.paneId,ticket.pane.session),this.deps.guacdPort); this.tunnels.add(tunnel); return tunnel;
+      const tunnel=new DesktopTunnel(ticket,() => this.deps.identity(ticket.pane.paneId,ticket.pane.session),this.deps.guacdPort,mayInteract); this.tunnels.add(tunnel); return tunnel;
     } catch(error) {ticket.request.password=""; throw error;}
   }
   release(tunnel: DesktopTunnel): void {this.tunnels.delete(tunnel); tunnel.close();}

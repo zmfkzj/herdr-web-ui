@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { PI_VISUAL_PROTOCOL, type PiDesktopAvailability, type PiDesktopCommand, type PiDesktopTicket, type PiGuiViewers, type PiVisualBridge } from "../../shared/pi-visual.ts";
+import { PI_INPUT_OPCODE, PI_VISUAL_PROTOCOL, type PiDesktopAvailability, type PiDesktopCommand, type PiDesktopTicket, type PiGuiViewers, type PiVisualBridge } from "../../shared/pi-visual.ts";
 import { jsonResponse } from "../http.ts";
 import { canSendSecret } from "../machine-security.ts";
-import { desktopBinding, instruction, type DesktopWebSocket } from "./guacamole.ts";
+import { desktopBinding, instruction, InstructionParser, type DesktopWebSocket } from "./guacamole.ts";
 import type { Grant, GuiViewGrants } from "./grants.ts";
 import { PRIVATE_DESKTOP_TRANSPORT, VisualError } from "./identity.ts";
 
@@ -150,11 +150,14 @@ export class RemoteDesktops {
     if (ticket.binding !== binding) throw new VisualError("desktop_ticket_expired", "Desktop ticket expired; reconnect", 403);
     return ticket;
   }
-  /** Opens the PC's desktop socket with the bridge's ticket, on the connection the ticket came from. */
-  async open(ticket: RemoteTicket): Promise<DesktopRelay> {
+  /**
+   * Opens the PC's desktop socket with the bridge's ticket, on the connection the ticket came from.
+   * `mayInteract`: whether the browser's device may still give input, its role now (DesktopRelay).
+   */
+  async open(ticket: RemoteTicket, mayInteract: () => boolean = () => true): Promise<DesktopRelay> {
     if (this.relays.size >= MAX_RELAYS) throw new VisualError("desktop_busy", "Too many desktop connections", 429);
     if (this.machines.endpoint(ticket.machine) !== ticket.endpoint) throw new VisualError("machine_offline", "The PC reconnected; open the desktop again", 503);
-    const relay = new DesktopRelay(ticket.machine, ticket.paneId, ticket.endpoint, ticket.remote, (closed) => { this.relays.delete(closed); });
+    const relay = new DesktopRelay(ticket.machine, ticket.paneId, ticket.endpoint, ticket.remote, (closed) => { this.relays.delete(closed); }, mayInteract);
     ticket.remote = "";
     this.relays.add(relay);
     relay.untrack = this.machines.trackTerminal(ticket.machine, () => relay.close("The PC disconnected"));
@@ -172,7 +175,12 @@ export class RemoteDesktops {
   close(): void { clearInterval(this.timer); this.tickets.clear(); for (const relay of [...this.relays]) relay.close("The web server is stopping"); }
 }
 
-/** One browser desktop socket <-> one bridge desktop socket. Guacamole text frames pass unchanged. */
+/**
+ * One browser desktop socket <-> one bridge desktop socket. Guacamole text frames pass unchanged;
+ * the PC's DesktopTunnel filters input and answers input switches (PI_INPUT_OPCODE). This server
+ * adds its own device check: a switch to input from a device that may no longer give it never
+ * reaches the PC, and such a device loses the desktop at the next check.
+ */
 export class DesktopRelay {
   readonly ready: Promise<void>;
   untrack: () => void = () => {};
@@ -181,7 +189,10 @@ export class DesktopRelay {
   private waiting: string[] = [];
   private waitingBytes = 0;
   private closed = false;
-  constructor(readonly machine: string, readonly paneId: string, endpoint: Endpoint, remoteTicket: string, private readonly onClosed: (relay: DesktopRelay) => void) {
+  private checkTimer: ReturnType<typeof setInterval>;
+  constructor(readonly machine: string, readonly paneId: string, endpoint: Endpoint, remoteTicket: string, private readonly onClosed: (relay: DesktopRelay) => void, private readonly mayInteract: () => boolean = () => true) {
+    this.checkTimer = setInterval(() => { if (!this.mayInteract()) this.close("This device may no longer use private desktops"); }, 3000);
+    this.checkTimer.unref?.();
     // Bun's client takes headers and the subprotocol the bridge answers with (guacamole)
     const RuntimeSocket = WebSocket as unknown as new (url: string, options: { headers: Record<string, string>; protocols: string[] }) => WebSocket;
     this.upstream = new RuntimeSocket(`${endpoint.url.replace("http:", "ws:")}/ws?${new URLSearchParams({ pi_desktop_ticket: remoteTicket })}`, { headers: { authorization: `Bearer ${endpoint.token}` }, protocols: ["guacamole"] });
@@ -215,6 +226,12 @@ export class DesktopRelay {
     if (this.closed) return;
     if (this.upstream.readyState !== WebSocket.OPEN) { this.close("Desktop disconnected"); return; }
     if (this.upstream.bufferedAmount + Buffer.byteLength(raw) > INPUT_LIMIT) { this.close("Desktop input stalled"); return; }
+    if (raw.includes(PI_INPUT_OPCODE) && !this.mayInteract()) {
+      // the browser's device may only watch now: its switch to input is answered here, refused
+      const refused: string[] = [];
+      try { new InstructionParser((parts) => { if (parts[0] === PI_INPUT_OPCODE && parts[1] === "interact" && /^\d{1,10}$/.test(parts[2] ?? "")) refused.push(parts[2]!); }).write(raw); } catch { this.close("Invalid desktop input"); return; }
+      if (refused.length) { for (const id of refused) this.send(instruction(PI_INPUT_OPCODE, "observe", id, "This device may only watch")); return; }
+    }
     this.upstream.send(raw);
   }
   private send(frame: string): void {
@@ -225,7 +242,7 @@ export class DesktopRelay {
   /** Ends both sockets once. `error` is said to the browser first, the way DesktopTunnel does. */
   close(error?: string): void {
     if (this.closed) return;
-    this.closed = true; this.waiting = []; this.waitingBytes = 0;
+    this.closed = true; this.waiting = []; this.waitingBytes = 0; clearInterval(this.checkTimer);
     this.untrack();
     try { this.upstream.close(1000, "Desktop disconnected"); } catch { /* not open yet */ }
     try { if (error) this.web?.send(instruction("error", error, "512")); } catch { /* the socket is going anyway */ }

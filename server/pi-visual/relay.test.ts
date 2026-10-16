@@ -26,14 +26,16 @@ const until = async (done: () => boolean, what: string, ms = 5000) => {
   while (!done()) { if (Date.now() > deadline) throw new Error(`timed out: ${what}`); await Bun.sleep(10); }
 };
 
-interface Pc { id: string; guacd: Server; sockets: Set<Socket>; connects: string[][]; bridge: ReturnType<typeof Bun.serve>; service: PiVisualService; token: string; tickets: string[]; endpoint: { url: string; token: string } }
+interface Pc { id: string; guacd: Server; sockets: Set<Socket>; connects: string[][]; received: string[][]; bridge: ReturnType<typeof Bun.serve>; service: PiVisualService; token: string; tickets: string[]; endpoint: { url: string; token: string } }
 async function pc(id: string, port: number): Promise<Pc> {
-  const sockets = new Set<Socket>(); const connects: string[][] = [];
+  const sockets = new Set<Socket>(); const connects: string[][] = []; const received: string[][] = [];
   const guacd = netServer((socket) => {
     sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.setEncoding("utf8");
+    let connected = false;
     const parser = new InstructionParser((parts) => {
+      if (connected) received.push(parts);
       if (parts[0] === "select") socket.write(instruction("args", "VERSION_1_6_0", "hostname", "port", "username", "password", "security", "cert-fingerprints", "read-only"));
-      if (parts[0] === "connect") { connects.push(parts); socket.write(instruction("ready", `desktop-${id}`) + instruction("name", id)); }
+      if (parts[0] === "connect") { connected = true; connects.push(parts); socket.write(instruction("ready", `desktop-${id}`) + instruction("name", id)); }
     });
     socket.on("data", (data) => { try { parser.write(String(data)); } catch { socket.destroy(); } });
   });
@@ -68,7 +70,7 @@ async function pc(id: string, port: number): Promise<Pc> {
     },
     websocket: { open(ws) { ws.data.desktop.bind(ws); }, message(ws, raw) { ws.data.desktop.message(String(raw)); }, close(ws) { service.release(ws.data.desktop); } },
   });
-  return { id, guacd, sockets, connects, bridge, service, token, tickets, endpoint: { url: `http://127.0.0.1:${bridge.port}`, token } };
+  return { id, guacd, sockets, connects, received, bridge, service, token, tickets, endpoint: { url: `http://127.0.0.1:${bridge.port}`, token } };
 }
 
 let a: Pc, b: Pc, upstream: ReturnType<typeof Bun.serve>;
@@ -88,6 +90,8 @@ const manager = {
 const reconnect = (id: string) => { for (const close of [...closers.get(id) ?? []]) close(); closers.delete(id); endpoints.set(id, { ...endpoints.get(id)! }); };
 const grants = new GuiViewGrants();
 const desktops = new RemoteDesktops(manager, grants);
+/** whether the browser's device may still give input (index.ts: its role is "drive") */
+let drive = true;
 const COOKIE = "herdr_web_device=browser-a";
 /** `/gui view W1` run by this browser in p1 of a PC, through that PC's current bridge connection */
 const ran = (machine: string, text = "/gui view W1", cookie = COOKIE) => grants.observe({ binding: desktopBinding(new Request("http://x", { headers: { cookie } })), machine, connection: endpoints.get(machine)! }, "p1", text);
@@ -108,7 +112,7 @@ beforeAll(async () => {
         try {
           const ticket = desktops.take(url.searchParams.get("pi_desktop_ticket") ?? "", desktopBinding(request));
           if (!ticket) return new Response("not a relayed ticket", { status: 404 });
-          const relay = await desktops.open(ticket);
+          const relay = await desktops.open(ticket, () => drive);
           if (server.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: { relay } })) return;
           relay.close(); return new Response("upgrade", { status: 426 });
         } catch (error) { return new Response(error instanceof Error ? error.message : "refused", { status: 403 }); }
@@ -275,6 +279,46 @@ describe("private desktops of other PCs", () => {
     expect(await screen.json()).toEqual({ text: "screen of pc-b" });
     const offline = await fetch(`http://127.0.0.1:${local.port}/api/machines/pc-gone/pane/pi-visual/workers?pane_id=p1`);
     expect(offline.status).toBe(503);
+  });
+
+  it("switches a relayed desktop to input and back on its socket, the PC's tunnel deciding; a device that may only watch is refused here", async () => {
+    ran("pc-a");
+    const response = await post("pc-a", AUTO);
+    expect(response.status).toBe(200);
+    const desktop = browser((await response.json() as { ticket: string }).ticket);
+    const rows = () => desktop.frames.flatMap((frame) => { const out: string[][] = []; new InstructionParser((parts) => out.push(parts)).write(frame); return out; });
+    const answers = () => rows().filter((row) => row[0] === "pi-input");
+    const synced = (n: number) => until(() => a.received.some((row) => row[0] === "sync" && row[1] === String(n)), `sync ${n}`);
+    const input = () => a.received.filter((row) => row[0] === "key" || row[0] === "mouse" || row[0] === "pi-input");
+    await until(() => desktop.state.open && desktop.frames.length > 0, "the desktop opens");
+    const start = a.received.length;
+    desktop.ws.send(instruction("key", "97", "1")); desktop.ws.send(instruction("sync", "1")); await synced(1);
+    // view-only, as /gui view opens it: the key never reaches guacd
+    expect(a.received.slice(start).some((row) => row[0] === "key")).toBe(false);
+    // no new ticket, no password: the same socket asks, the PC's tunnel answers
+    const tickets = a.tickets.length;
+    desktop.ws.send(instruction("pi-input", "interact", "1"));
+    await until(() => answers().length === 1, "the PC answers");
+    expect(answers()).toEqual([["pi-input", "interact", "1"]]);
+    desktop.ws.send(instruction("key", "98", "1")); desktop.ws.send(instruction("key", "98", "0")); desktop.ws.send(instruction("sync", "2")); await synced(2);
+    expect(input().slice(-2)).toEqual([["key", "98", "1"], ["key", "98", "0"]]);
+    desktop.ws.send(instruction("pi-input", "observe", "2"));
+    await until(() => answers().length === 2, "back to view-only");
+    expect(answers()[1]).toEqual(["pi-input", "observe", "2"]);
+    desktop.ws.send(instruction("key", "99", "1")); desktop.ws.send(instruction("sync", "3")); await synced(3);
+    expect(input().some((row) => row[1] === "99")).toBe(false);
+    expect(a.tickets.length).toBe(tickets);
+    // the device may only watch now: its switch to input never reaches the PC, and the desktop ends
+    drive = false;
+    try {
+      desktop.ws.send(instruction("pi-input", "interact", "3"));
+      await until(() => answers().length === 3, "refused here");
+      expect(answers()[2]).toEqual(["pi-input", "observe", "3", "This device may only watch"]);
+      await until(() => desktop.state.closed, "the desktop ends at the next check");
+      expect(desktop.frames.join("")).toContain("may no longer use private desktops");
+      expect(a.received.some((row) => row[0] === "pi-input")).toBe(false);
+    } finally { drive = true; }
+    await until(() => desktops.openCount() === 0, "nothing left open");
   });
 
   it("keeps a review image's sandbox and nosniff through the PC proxy", async () => {

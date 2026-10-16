@@ -20,6 +20,8 @@
 .pi-desktop-form .input { max-width: 170px; }
 .pi-desktop-form .pi-fingerprint { flex: 1 1 100%; }
 .pi-desktop-form .pi-fingerprint input { flex: 1; max-width: none; }
+.pi-desktop-mode { font-size: 0.85rem; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-dim); }
+.pi-desktop-mode.is-input { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 .pi-desktop-display { background: var(--bg); min-height: 200px; max-height: 65dvh; overflow: auto; }
 .pi-review { height: min(850px, 94dvh); }
 .pi-review-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(220px,28%); gap: 12px; flex: 1; min-height: 160px; overflow: hidden; }

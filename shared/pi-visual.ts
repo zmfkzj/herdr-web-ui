@@ -40,6 +40,15 @@ export const PI_VISUAL_PROTOCOL = 1;
 /** The bundle feature a bridge built from this branch carries (manifest, bundle.json, /api/bridge). */
 export const PI_VISUAL_BUNDLE_FEATURE = "pi-visual";
 /**
+ * Switches an open desktop between view-only and input, in band on its Guacamole socket, without
+ * a new ticket or password. The browser sends `pi-input,<observe|interact>,<request id>`; the
+ * PC's DesktopTunnel never passes it to guacd and answers with the same opcode, the mode now in
+ * force, the request id, and a reason when it refused. Input goes only once the answer said
+ * `interact`. A bridge built before this opcode ignores it: no answer.
+ */
+export const PI_INPUT_OPCODE = "pi-input";
+export type PiInputMode = "observe" | "interact";
+/**
  * What /api/bridge says about the pi-visual routes. Upstream and older bridges leave it out.
  * `desktop`: the bridge was started with desktop viewing on (HERDR_PI_GUACD_ENABLED=1), which a
  * connection server does only for a PC whose desktop viewing its user turned on.

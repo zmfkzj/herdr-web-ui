@@ -150,9 +150,15 @@ describe("DeviceStore", () => {
     store.match(b.token);
     expect(store.list(a.device.id).map((d) => [d.label, d.current])).toEqual([["A", true], ["B", false]]);
     expect(store.update(b.device.id, { label: "Bee" })?.label).toBe("Bee");
+    // an open desktop rechecks the role it has now (index.ts mayInteract)
+    expect(store.roleOf(b.device.id)).toBe("drive");
+    store.update(b.device.id, { role: "watch" });
+    expect(store.roleOf(b.device.id)).toBe("watch");
+    store.update(b.device.id, { role: "drive" });
     expect(store.revoke(a.device.id)).toBe(true);
     expect(store.revoke(a.device.id)).toBe(false);
     expect(store.match(a.token)).toBeNull();
+    expect(store.roleOf(a.device.id)).toBeNull();
     expect(store.match(b.token)?.label).toBe("Bee");
     // revoking the last device does not reopen the gate, not even after a restart
     expect(store.revoke(b.device.id)).toBe(true);

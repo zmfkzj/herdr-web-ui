@@ -170,10 +170,34 @@ viewer this browser did not start: enter the port, one-time password and fingerp
 terminal printed. The destination is fixed to loopback and user `pi`. No arbitrary host or
 guacd/RDP option can be supplied by the browser.
 
-**Observe only is the default.** To type or click, stop assigning work to that
-worker, uncheck Observe only, and explicitly connect. This is not a mutual
-exclusion lock: do not let the worker and yourself operate simultaneously.
+**Observe only is the default.** Every connection starts view-only unless Observe only was
+unchecked before connecting, and a `/gui view` desktop always opens view-only. To type or click,
+stop assigning work to that worker, then press **Switch input** (입력 전환) in the open viewer: the
+badge beside it changes from "View only: input is blocked" to "Input on: mouse and keyboard reach
+the desktop" once the PC confirms it. Press it again to hand control back. The switch keeps the
+same connection, so it needs no password and no reconnect. This is not a mutual exclusion lock:
+do not let the worker and yourself operate simultaneously.
 Shift+Escape moves keyboard focus from the remote screen back to the controls.
+
+- **How the switch works.** The browser sends `pi-input,<observe|interact>,<id>` on its own
+  desktop socket (`shared/pi-visual.ts` `PI_INPUT_OPCODE`). The PC's `DesktopTunnel`
+  (`server/pi-visual/guacamole.ts`) answers with the mode now in force and never passes it to
+  guacd; the browser passes keys and pointer only after an `interact` answer. guacd's RDP
+  connection is opened with `read-only` false, so the tunnel's filter is what enforces view-only:
+  in view-only only `sync`, `nop`, `ack` and pings pass, never key, mouse, size, clipboard,
+  files or streams.
+- **Back to view-only** first lets go of what this viewer holds: the browser releases its keys and
+  buttons, and the tunnel sends a key-up for every key and a button-up for the pointer it passed
+  on, before it answers. The same release runs when the viewer blurs, closes or disconnects.
+- **Who may switch.** Only the open connection itself, for its own desktop; other viewers of the
+  same desktop keep their own mode. A device whose role is now watch-only is refused input
+  (`This device may only watch`) and loses the desktop at the next 3 s recheck, on this PC and
+  through a connection server's relay alike. Device revocation still closes it at once.
+- **Lost answers.** A switch to input that is not confirmed within 5 s leaves the viewer view-only
+  with a message (a remote PC whose bridge predates the switch ignores it: install this server's
+  Pi visual bridge there). A switch to view-only that is not confirmed ends that viewer, so input
+  stops in any case.
+
 Touch keyboard/IME forwarding is not implemented; keyboard/mouse control is
 intended for a desktop browser. Mobile viewing remains possible.
 
@@ -181,9 +205,9 @@ The password is entered into an uncontrolled DOM input, transmitted on the
 explicit connect action over HTTPS, localhost or a direct Tailscale link (below), and cleared. It is not put in
 chat, localStorage, a URL, a retry queue, or application logs. The backend uses a
 30-second, one-use, cookie/device-bound ticket; reconnects require the password
-again. RDP uses TLS and the **explicit certificate fingerprint**, not blanket
+again (Switch input avoids them). RDP uses TLS and the **explicit certificate fingerprint**, not blanket
 certificate ignoring. File, clipboard, printer and audio redirection are disabled.
-Read-only mouse/key filtering is also enforced by the backend.
+View-only mouse/key filtering is enforced by the backend (above).
 
 Closing the browser viewer closes only its guacd connection; Pi, krdp and the
 private desktop stay under `pi-gui` ownership. Device revocation, a ended pane,

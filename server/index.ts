@@ -2008,12 +2008,14 @@ export function createServer(
           const ticketId = url.searchParams.get("pi_desktop_ticket") ?? "";
           const claimed = url.searchParams.get("machine_id");
           const data = (desktop: { bind(web: DesktopWebSocket): void; message(raw: string): void }, desktopRelease: () => void): SocketData => ({ attached: new Map(), watches: new Map(), conversationInterests: new Set(), mode: "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly: false, desktop, desktopRelease });
+          // a desktop switches to input on its own socket (PI_INPUT_OPCODE): only while its device may still give input
+          const mayInteract = () => deviceId === undefined || devices.roleOf(deviceId) === "drive";
           try {
             // another PC's desktop: this server's own ticket, relayed through that PC's bridge
             const relayed = remoteDesktops?.take(ticketId, desktopBinding(request, deviceId));
             if (relayed) {
               if (claimed && claimed !== relayed.machine) throw new VisualError("desktop_ticket_expired", "Desktop ticket expired; reconnect", 403);
-              const relay = await remoteDesktops!.open(relayed);
+              const relay = await remoteDesktops!.open(relayed, mayInteract);
               if (bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: data(relay, () => relay.close()) })) return undefined as unknown as Response;
               relay.close();
               return new Response("websocket upgrade required", { status: 426 });
@@ -2022,7 +2024,7 @@ export function createServer(
           } catch (error) { return visualResponse(error); }
           let desktop: DesktopTunnel | undefined;
           try {
-            desktop = await piVisual.take(request, deviceId);
+            desktop = await piVisual.take(request, deviceId, mayInteract);
             const tunnel = desktop;
             const upgraded = bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: data(tunnel, () => piVisual.release(tunnel)) });
             if (upgraded) return undefined as unknown as Response;

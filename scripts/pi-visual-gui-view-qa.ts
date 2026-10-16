@@ -38,14 +38,15 @@ const SESSION = "e".repeat(64);
 const started = Date.now();
 const COLORS = { local: [200, 40, 40], localW2: [40, 170, 60], remote: [40, 80, 220] } as const;
 
-interface Guacd { server: Server; port: number; connects: string[][]; sockets: Set<Socket> }
+interface Guacd { server: Server; port: number; connects: string[][]; inputs: string[][]; sockets: Set<Socket> }
 /** A guacd stand-in: answers the RDP handshake and paints the whole desktop one colour per RDP port. */
 async function guacd(colourOf: (rdpPort: string) => readonly number[]): Promise<Guacd> {
-  const connects: string[][] = []; const sockets = new Set<Socket>();
+  const connects: string[][] = []; const inputs: string[][] = []; const sockets = new Set<Socket>();
   const server = tcpServer((socket) => {
     sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.setEncoding("utf8");
     let args: string[] = [];
     const parser = new InstructionParser((parts) => {
+      if (parts[0] === "key" || parts[0] === "mouse" || parts[0] === "pi-input") inputs.push(parts);
       if (parts[0] === "select") { args = ["VERSION_1_6_0", "hostname", "port", "username", "password", "security", "cert-fingerprints", "read-only"]; socket.write(instruction("args", ...args)); }
       if (parts[0] === "connect") {
         connects.push(parts);
@@ -57,7 +58,7 @@ async function guacd(colourOf: (rdpPort: string) => readonly number[]): Promise<
     socket.on("error", () => socket.destroy());
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { server, port: (server.address() as { port: number }).port, connects, sockets };
+  return { server, port: (server.address() as { port: number }).port, connects, inputs, sockets };
 }
 const viewer = (worker: string, port: number, pid: number, password: string): ViewerSecret =>
   ({ worker, port, display: `wayland-virtual-${pid}`, pid, startedAt: started - 30_000, fingerprint: "ab".repeat(32), password, piStartedAt: started - 60_000 });
@@ -177,6 +178,33 @@ try {
     await page.locator(".terminal-surface .xterm").first().click();
     await page.keyboard.type(text, { delay: 15 });
   };
+  /**
+   * Switch input on the view-only desktop /gui view opened: input on with no password and no new
+   * connection, a key reaches guacd, then view-only again and the next key does not.
+   */
+  const switchInput = async (g: Guacd, shot: string) => {
+    const toggle = dialog.getByRole("button", { name: "Switch input", exact: true });
+    const screen = dialog.getByRole("application", { name: "Private desktop screen" });
+    const connects = g.connects.length; const keys = () => g.inputs.filter((row) => row[0] === "key");
+    await dialog.getByText("View only: input is blocked").waitFor();
+    await screen.focus(); await page.keyboard.press("x");
+    await toggle.click();
+    await dialog.getByText("Input on: mouse and keyboard reach the desktop").waitFor();
+    assert.equal(await dialog.getByLabel("One-time viewer password").count(), 0, "switching asked for no password");
+    await screen.focus(); await page.keyboard.press("y");
+    await until(() => keys().some((row) => row[1] === "121" && row[2] === "0"), "the key reaches the desktop");
+    assert.ok(!keys().some((row) => row[1] === "120"), "the key pressed while view-only never reached guacd");
+    await page.screenshot({ path: join(shots, shot) });
+    await toggle.click();
+    await dialog.getByText("View only: input is blocked").waitFor();
+    const before = g.inputs.length;
+    await screen.focus(); await page.keyboard.press("z");
+    // fixed wait: proving that nothing arrives after switching back to view-only
+    await Bun.sleep(300);
+    assert.equal(g.inputs.length, before, "view-only again passes no input");
+    assert.equal(g.connects.length, connects, "the same connection throughout");
+    assert.ok(!g.inputs.some((row) => row[0] === "pi-input"), "the switch never reaches guacd");
+  };
   const openPane = async (machine: string | null) => {
     await page.goto(`${base}/?${machine ? `machine=${encodeURIComponent(machine)}&` : ""}pane=${encodeURIComponent(paneId)}&view=terminal`);
     await page.locator(".conn-live").first().waitFor();
@@ -195,6 +223,7 @@ try {
   assert.deepEqual(localGuacd.connects.map((row) => row.slice(2, 6)), [["127.0.0.1", "3392", "pi", "local-secret-w2"]], "this PC's guacd connected W2's viewer with its own password");
   assert.equal(remoteGuacd.connects.length, 0, "the remote PC was not asked");
   assert.equal(await dialog.getByLabel("One-time viewer password").count(), 0, "no password was asked for");
+  await switchInput(localGuacd, "1a-local-w2-input-on.png");
   await dialog.getByRole("button", { name: "Close" }).click();
   await until(() => localGuacd.sockets.size === 0, "closing ends that guacd connection");
 
@@ -243,6 +272,7 @@ try {
   await dialog.getByText("Connected. Pause the worker before taking control.").waitFor();
   await until(async () => near(await desktopColour(page), COLORS.remote), "the remote PC's desktop is painted");
   await page.screenshot({ path: join(shots, "4-remote-w1.png") });
+  await switchInput(remoteGuacd, "4a-remote-w1-input-on.png");
   assert.deepEqual(remoteGuacd.connects.map((row) => row.slice(2, 6)), [["127.0.0.1", "3391", "pi", "remote-secret"]], "the remote PC's guacd connected its W1 with its password");
   assert.equal(localGuacd.connects.length, 2, "this PC's W1 was not opened for the remote W1");
   const machines = ((await (await api("/api/machines")).json()) as { machines: Machine[] }).machines;

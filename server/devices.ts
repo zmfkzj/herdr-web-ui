@@ -206,6 +206,11 @@ export class DeviceStore {
     return null;
   }
 
+  /** A paired device's role now (an open connection rechecks it); null once it is gone. */
+  roleOf(id: string): DeviceRole | null {
+    return this.devices.find((d) => d.id === id)?.role ?? null;
+  }
+
   update(id: string, patch: { label?: string; role?: DeviceRole }): PairedDevice | null {
     this.assertWritable();
     const device = this.devices.find((d) => d.id === id);

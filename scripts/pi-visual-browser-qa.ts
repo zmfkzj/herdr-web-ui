@@ -40,16 +40,17 @@ try {
   const png=Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]),chunk("IHDR",header),chunk("IDAT",deflateSync(rows)),chunk("IEND",Buffer.alloc(0))]);
   service=new PiVisualService(root,{guacdPort:port,identity:async(_pane,expected)=>{assert.ok(!expected||expected===pane.session);return pane;},workers:()=>({...pane,observedAt:Date.now(),truncated:false,source:"original-pi-orche-records",workers:[{job:"J1",worker:"W1",role:"implement",state:"running",request:"Review the visual interface",summary:"",started:Date.now(),model:"fixture/model",children:[]}]}),image:async()=>({mediaType:"image/png",bytes:png})});
   const build=await Bun.build({entrypoints:["scripts/fixtures/pi-visual.tsx"],outdir:root,target:"browser",define:{"process.env.NODE_ENV":'"development"'}});assert.ok(build.success,String(build.logs));
-  let uploads=0;
+  let uploads=0,desktopTickets=0,dropSwitch=false;
   server=Bun.serve<{desktop:DesktopTunnel}>({port:0,hostname:"127.0.0.1",async fetch(request,srv){
     const url=new URL(request.url);
     if(url.pathname==="/ws") {const desktop=await service!.take(request);if(srv.upgrade(request,{headers:{"sec-websocket-protocol":"guacamole"},data:{desktop}}))return;service!.release(desktop);return new Response("upgrade required",{status:426});}
+    if(url.pathname==="/api/pane/pi-visual/desktop")desktopTickets++;
     if(url.pathname.startsWith("/api/pane/pi-visual/"))return service!.handle(request,url,false);
     if(url.pathname==="/fixture/keys")return new Response(JSON.stringify(received.filter(p=>p[0]==="key")),{headers:{"content-type":"application/json"}});
     if(url.pathname==="/api/pane/image") {uploads++;return new Response(JSON.stringify({path:"/fixture/review.png"}),{headers:{"content-type":"application/json"}});}
     if(url.pathname==="/")return new Response('<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/pi-visual.css"></head><body><div id="root"></div><script type="module" src="/pi-visual.js"></script></body></html>',{headers:{"content-type":"text/html"}});
     const asset=Bun.file(join(root,url.pathname.slice(1)));return await asset.exists()?new Response(asset):new Response("Not found",{status:404});
-  },websocket:{open(ws){ws.data.desktop.bind(ws);},message(ws,raw){ws.data.desktop.message(String(raw));},close(ws){service!.release(ws.data.desktop);}}});
+  },websocket:{open(ws){ws.data.desktop.bind(ws);},message(ws,raw){if(dropSwitch&&String(raw).includes("pi-input"))return;ws.data.desktop.message(String(raw));},close(ws){service!.release(ws.data.desktop);}}});
   process.env["HERDR_PI_GUACD_ENABLED"]="1";
   browser=await chromium.launch({executablePath:chromePath(),headless:true,args:["--no-sandbox"]});
   for(const [name,width,height] of [["desktop",1440,1000],["mobile",390,844]] as const){
@@ -70,9 +71,53 @@ try {
       await page.waitForFunction(()=>Array.from(document.querySelectorAll(".pi-desktop-display canvas")).some(c=>(c as HTMLCanvasElement).width===640));
       assert.equal(await page.getByLabel("One-time viewer password",{exact:true}).inputValue(),"");
       assert.ok(!(await page.evaluate(()=>JSON.stringify(localStorage))).includes("fixture-secret"));
-      await page.screenshot({path:join(outputs,"desktop-screen.png")});await page.getByRole("button",{name:"Disconnect",exact:true}).click();
+      await page.screenshot({path:join(outputs,"desktop-screen.png")});
       assert.ok(received.some(p=>p[0]==="connect"&&p[1]==="VERSION_1_5_0"&&p.includes("sha256:"+"ab".repeat(32))));
-      assert.ok(!received.some(p=>p[0]==="mouse"||p[0]==="key"));
+      // Switch input: view-only -> input -> view-only on this one connection, no ticket or password asked
+      const screen=page.getByRole("application",{name:"Private desktop screen"});const toggle=page.getByRole("button",{name:"Switch input",exact:true});
+      const sent=()=>received.filter(p=>p[0]==="mouse"||p[0]==="key");
+      await page.getByText("View only: input is blocked",{exact:true}).waitFor();assert.equal(await toggle.getAttribute("aria-pressed"),"false");
+      assert.equal(await page.getByLabel("Observe only",{exact:true}).count(),0);
+      await screen.focus();await page.keyboard.press("x");await screen.click({position:{x:50,y:50}});
+      const tickets=desktopTickets;
+      await toggle.click();await page.getByText("Input on: mouse and keyboard reach the desktop",{exact:true}).waitFor();
+      assert.equal(await toggle.getAttribute("aria-pressed"),"true");
+      assert.equal(sent().length,0,"view-only passed no input");
+      await page.screenshot({path:join(outputs,"desktop-input-on.png")});
+      await screen.focus();await page.keyboard.press("b");
+      await page.waitForFunction(async()=>{const rows=await (await fetch("/fixture/keys")).json() as string[][];return rows.some(p=>p[0]==="key"&&p[1]==="98"&&p[2]==="0");});
+      await screen.click({position:{x:60,y:40}});
+      for(let n=0;n<200&&!sent().some(p=>p[0]==="mouse"&&p[3]==="1");n++){await Bun.sleep(10);}
+      assert.ok(sent().some(p=>p[0]==="mouse"&&p[3]==="1"),"a click reached the desktop");
+      // Shift and the left button held while switching back: both are let go
+      await screen.focus();await page.keyboard.down("Shift");await screen.hover({position:{x:70,y:30}});await page.mouse.down();
+      for(let n=0;n<200&&!sent().some(p=>p[0]==="key"&&p[1]==="65505"&&p[2]==="1");n++){await Bun.sleep(10);}
+      await toggle.evaluate(el=>(el as HTMLButtonElement).click());
+      await page.getByText("View only: input is blocked",{exact:true}).waitFor();
+      await page.keyboard.up("Shift");await page.mouse.up();
+      const shift=sent().filter(p=>p[0]==="key"&&p[1]==="65505").map(p=>p[2]);assert.deepEqual(shift.slice(-2),["1","0"]);
+      assert.equal(sent().filter(p=>p[0]==="mouse").at(-1)?.[3],"0");
+      const before=sent().length;
+      await screen.focus();await page.keyboard.press("c");await screen.click({position:{x:80,y:20}});
+      // fixed wait: proving that nothing arrives after view-only
+      await Bun.sleep(300);
+      assert.equal(sent().length,before,"view-only after the switch passed no input");
+      assert.equal(desktopTickets,tickets,"no new ticket for a switch");
+      assert.equal(await page.getByLabel("One-time viewer password",{exact:true}).inputValue(),"");
+      assert.ok(!received.some(p=>p[0]==="pi-input"),"the switch never reaches guacd");
+      // an unanswered switch (an older bridge): stays view-only and says why
+      dropSwitch=true;
+      await toggle.click();
+      await page.getByText(/did not confirm the input switch/).waitFor({timeout:10000});
+      await page.getByText("View only: input is blocked",{exact:true}).waitFor();
+      await screen.focus();await page.keyboard.press("d");
+      // fixed wait: proving that nothing arrives while the switch was unanswered
+      await Bun.sleep(300);
+      assert.equal(sent().length,before,"an unanswered switch passed no input");
+      dropSwitch=false;
+      await page.screenshot({path:join(outputs,"desktop-switch-unanswered.png")});
+      await page.getByRole("button",{name:"Disconnect",exact:true}).click();
+      await page.getByLabel("Observe only",{exact:true}).waitFor();
       // Reconnect on a fresh DOM input target; keyboard events must be sent once.
       await page.getByLabel("Observe only",{exact:true}).uncheck();
       await page.getByLabel("One-time viewer password",{exact:true}).fill("fixture-control");
@@ -83,6 +128,20 @@ try {
       await page.keyboard.press("a");
       await page.waitForFunction(async()=>{const rows=await (await fetch("/fixture/keys")).json() as string[][];return rows.some(p=>p[0]==="key"&&p[1]==="97"&&p[2]==="0");});
       assert.equal(received.filter(p=>p[0]==="key"&&p[1]==="97"&&p[2]==="1").length,1);
+      // started with input on, then an unanswered switch back to view-only ends the viewer
+      await page.getByText("Input on: mouse and keyboard reach the desktop",{exact:true}).waitFor();
+      dropSwitch=true;
+      await page.getByRole("button",{name:"Switch input",exact:true}).click();
+      await page.getByText(/did not confirm view-only mode/).waitFor({timeout:10000});
+      await page.getByRole("button",{name:"Connect",exact:true}).waitFor();
+      dropSwitch=false;
+      // reconnect for the rest of the checks
+      await page.getByLabel("Observe only",{exact:true}).uncheck();
+      await page.getByLabel("One-time viewer password",{exact:true}).fill("fixture-control");
+      await page.getByRole("button",{name:"Connect",exact:true}).click();
+      await page.getByRole("application",{name:"Private desktop screen"}).waitFor();
+      await page.getByText("Input on: mouse and keyboard reach the desktop",{exact:true}).waitFor();
+      await page.getByRole("application",{name:"Private desktop screen"}).focus();
       await page.keyboard.press("Shift+Escape");
       assert.equal(await page.getByRole("button",{name:"Close",exact:true}).evaluate(el=>el===document.activeElement),true);
       await page.getByRole("button",{name:"Disconnect",exact:true}).click();

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
-import { completionConflict, resolveViewer, type PiDesktopTicket, type PiGuiViewer, type PiVisualWorkers } from "../../../shared/pi-visual.ts";
+import { completionConflict, PI_INPUT_OPCODE, resolveViewer, type PiDesktopTicket, type PiGuiViewer, type PiInputMode, type PiVisualWorkers } from "../../../shared/pi-visual.ts";
 import { useT } from "../../lib/i18n.ts";
 import { useFocusTrap } from "../../lib/useFocusTrap.ts";
 import { usePhoneSheetBack } from "../../lib/sheetHistory.ts";
@@ -18,6 +18,9 @@ export interface DesktopTarget { worker: string | null; command: boolean; comple
 const FIND_MS = 45_000;
 /** A name no orche record and no viewer knows is given up on sooner. */
 const UNKNOWN_MS = 6_000;
+/** How long the desktop has to confirm an input switch (PI_INPUT_OPCODE) before it counts as lost. */
+const SWITCH_MS = 5_000;
+type Pointer = { x: number; y: number; left: boolean; middle: boolean; right: boolean; up: boolean; down: boolean };
 
 export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:string;machineId:string;session:string|null;target?:DesktopTarget;onClose:()=>void}) {
   const t=useT(); const surface=useFocusTrap<HTMLDivElement>(true); const display=useRef<HTMLDivElement>(null);
@@ -34,6 +37,9 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
   const [pcOff,setPcOff]=useState(false);
   const resolved=useRef<string|null>(session);
   const alive=useRef(true); const keyboardCleanup=useRef<()=>void>(()=>{});
+  // the open connection's input mode as its desktop confirmed it, and its switch while one is asked
+  const [inputMode,setInputMode]=useState<PiInputMode>("observe"); const [switching,setSwitching]=useState(false);
+  const switchInput=useRef<((mode:PiInputMode)=>void)|null>(null);
   usePhoneSheetBack(onClose,true);
   const disconnect=()=>{
     const controller=abort.current; abort.current=null;
@@ -76,22 +82,73 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
     const resize=()=>{const w=view.getWidth();if(w>0)view.scale(Math.min(1,host.clientWidth/w));};
     const observer=new ResizeObserver(resize);observer.observe(host);view.onresize=resize;
     const keyboard=new Guacamole.Keyboard(inputHost);const mouse=new Guacamole.Mouse(view.getElement());
-    if(!readOnly){
-      keyboard.onkeydown=key=>{if(owns())client.sendKeyEvent(1,key);return false;};
-      keyboard.onkeyup=key=>client.sendKeyEvent(0,key);
-      mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=mouseState=>{if(owns())client.sendMouseState(mouseState,true);};
-    }
-    const blur=()=>keyboard.reset(), focus=()=>inputHost.focus();
+    // Input reaches the desktop only in the mode it confirmed: the ticket's start, then each switch
+    // (PI_INPUT_OPCODE) the server answered. While a switch is asked nothing goes.
+    let mode:PiInputMode=readOnly?"observe":"interact";
+    let pending:{id:number;mode:PiInputMode;timer:ReturnType<typeof setTimeout>}|null=null; let nextId=0;
+    let pointer:Pointer|null=null;
+    const sending=()=>owns()&&mode==="interact"&&pending===null;
+    const releasePointer=()=>{
+      if(pointer&&(pointer.left||pointer.middle||pointer.right)&&sending())client.sendMouseState({...pointer,left:false,middle:false,right:false,up:false,down:false},true);
+      pointer=null;
+    };
+    const onMouse=(state:Pointer)=>{if(sending()){pointer=state;client.sendMouseState(state,true);}};
+    const attach=()=>{
+      keyboard.reset();
+      keyboard.onkeydown=key=>{if(sending())client.sendKeyEvent(1,key);return false;};
+      keyboard.onkeyup=key=>{if(sending())client.sendKeyEvent(0,key);};
+      mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=onMouse;
+    };
+    /** lets go of what this browser holds on the desktop, then stops passing input */
+    const detach=()=>{
+      keyboard.reset();releasePointer();
+      keyboard.onkeydown=null;keyboard.onkeyup=null;mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=null;
+      keyboard.reset();
+    };
+    if(mode==="interact")attach();
+    const blur=()=>{keyboard.reset();releasePointer();}, focus=()=>inputHost.focus();
     inputHost.addEventListener("blur",blur);inputHost.addEventListener("pointerdown",focus);
     keyboardCleanup.current=blur;
     let disposed=false;
+    const show=(next:PiInputMode,busy:boolean)=>{if(alive.current&&!disposed){setInputMode(next);setSwitching(busy);}};
+    const answered=(args:string[])=>{
+      const [granted,id,reason]=args;
+      // a late, repeated or foreign answer changes nothing
+      if(disposed||!pending||id!==String(pending.id)||(granted!=="observe"&&granted!=="interact"))return;
+      const asked=pending.mode;clearTimeout(pending.timer);pending=null;
+      if(asked==="observe"&&granted!=="observe"){mode="observe";failWith(owns,controller,t("The desktop did not confirm view-only mode, so this viewer disconnected to stop input."));return;}
+      mode=granted;
+      if(mode==="interact"){attach();inputHost.focus();} else detach();
+      show(mode,false);
+      if(granted!==asked&&alive.current)setError(reason||t("The desktop kept its input mode."));
+    };
+    const lost=(id:number)=>{
+      if(disposed||!pending||pending.id!==id)return;
+      const asked=pending.mode;pending=null;
+      // input was never let through for this switch; view-only unconfirmed ends the connection
+      if(asked==="observe"){mode="observe";failWith(owns,controller,t("The desktop did not confirm view-only mode, so this viewer disconnected to stop input."));return;}
+      show(mode,false);
+      if(alive.current)setError(t("The desktop did not confirm the input switch. Its PC may run an older Pi visual bridge: install this server's bridge there, or reconnect with Observe only unchecked."));
+    };
+    const request=(next:PiInputMode)=>{
+      if(disposed||pending||next===mode||!owns())return;
+      if(next==="observe")detach();
+      const id=++nextId;pending={id,mode:next,timer:setTimeout(()=>lost(id),SWITCH_MS)};
+      if(alive.current){setError("");setSwitching(true);}
+      tunnel.sendMessage(PI_INPUT_OPCODE,next,id);
+    };
+    // Guacamole.Client handles every other instruction; the switch's answer only passes by
+    const handle=tunnel.oninstruction;
+    tunnel.oninstruction=(opcode,args)=>{if(opcode===PI_INPUT_OPCODE)answered(args);handle?.(opcode,args);};
     const dispose=()=>{
-      if(disposed)return;disposed=true;
+      if(disposed)return;
+      detach();disposed=true;
+      if(pending){clearTimeout(pending.timer);pending=null;}
+      if(switchInput.current===request)switchInput.current=null;
+      if(alive.current)setSwitching(false);
       observer.disconnect();view.onresize=null;
       inputHost.removeEventListener("blur",blur);inputHost.removeEventListener("pointerdown",focus);
-      keyboard.reset();keyboard.onkeydown=null;keyboard.onkeyup=null;
-      mouse.onmousedown=mouse.onmouseup=mouse.onmousemove=null;
-      client.onerror=null;client.onstatechange=null;tunnel.onerror=null;
+      client.onerror=null;client.onstatechange=null;tunnel.onerror=null;tunnel.oninstruction=handle;
       client.disconnect();inputHost.remove();
       if(cleanup.current===dispose){cleanup.current=()=>{};keyboardCleanup.current=()=>{};}
     };
@@ -99,7 +156,7 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
     client.onerror=tunnel.onerror=status=>failWith(owns,controller,status.message||t("Desktop disconnected"));
     client.onstatechange=value=>{
       if(!owns())return;
-      if(value===3){setState("connected");inputHost.focus();}
+      if(value===3){switchInput.current=request;show(mode,false);setState("connected");inputHost.focus();}
       else if(value===5){dispose();abort.current=null;controller.abort();setState("idle");}
     };
     client.connect(new URLSearchParams({pi_desktop_ticket:ticket.ticket}).toString());
@@ -213,7 +270,7 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
   return createPortal(<div className="modal-scrim pi-visual-scrim"><div className="pi-visual-modal" ref={surface} role="dialog" aria-modal="true" aria-label={title} tabIndex={-1}>
     <header><h2>{title}</h2><button type="button" className="icon-button" onClick={onClose} aria-label={t("Close")}><X aria-hidden="true"/></button></header>
     {target
-      ? <p role="status">{state==="finding"?t("Waiting for {worker}'s viewer from /gui view…",{worker:target.worker??"?"}):state==="connecting"?t("Connecting…"):state==="connected"?t("Connected. Pause the worker before taking control."):t("Pause the worker before taking control.")}</p>
+      ? <p role="status">{state==="finding"?t("Waiting for {worker}'s viewer from /gui view…",{worker:target.worker??"?"}):state==="connecting"?t("Connecting…"):state==="connected"?(inputMode==="interact"?t("Input is on. Do not use the desktop while the worker is acting on it."):t("Connected. Pause the worker before taking control.")):t("Pause the worker before taking control.")}</p>
       : <p>{t("Run /gui view W1 or /gui view main in Pi, then enter its connection fields. Pause the worker before taking control.")}</p>}
     <form key={viewer?.pid??"manual"} onSubmit={event=>void start(event)} className="pi-desktop-form" autoComplete="off">
       {askPassword&&<>
@@ -221,7 +278,12 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
         <label>{t("One-time viewer password")}<input className="input" ref={password} type="password" maxLength={256} autoComplete="off" required disabled={busy}/></label>
         <label className="pi-fingerprint">{t("Certificate SHA-256")}<input className="input" name="fingerprint" maxLength={200} required disabled={busy} defaultValue={viewer?.fingerprint}/></label>
       </>}
-      <label><input ref={observe} name="observe" type="checkbox" defaultChecked disabled={busy}/>{t("Observe only")}</label>
+      {state==="connected"
+        ? <>
+          <span role="status" className={inputMode==="interact"?"pi-desktop-mode is-input":"pi-desktop-mode"}>{switching?t("Switching input…"):inputMode==="interact"?t("Input on: mouse and keyboard reach the desktop"):t("View only: input is blocked")}</span>
+          <button type="button" className="btn" aria-pressed={inputMode==="interact"} disabled={switching} onClick={()=>switchInput.current?.(inputMode==="interact"?"observe":"interact")}>{t("Switch input")}</button>
+        </>
+        : <label><input ref={observe} name="observe" type="checkbox" defaultChecked disabled={busy}/>{t("Observe only")}</label>}
       <button type="submit" className="btn" disabled={busy}>{state==="connecting"?t("Connecting…"):t("Connect")}</button>
       <button type="button" className="btn" disabled={state==="idle"} onClick={disconnect}>{t("Disconnect")}</button>
     </form>
@@ -230,6 +292,6 @@ export function DesktopViewer({paneId,machineId,session,target,onClose}:{paneId:
     {bridgeMissing&&machineId!=="local"&&<button type="button" className="btn" disabled={installing} onClick={()=>void install()}>{t("Install Pi visual bridge")}</button>}
     {pcOff&&<button type="button" className="btn" disabled={installing} onClick={()=>void turnOn()}>{t("Turn on desktop viewing for this PC")}</button>}
     <div className="pi-desktop-display" ref={display} onKeyDownCapture={event=>{if(event.key==="Escape"&&event.shiftKey){event.stopPropagation();event.preventDefault();keyboardCleanup.current();(surface.current?.querySelector("button") as HTMLButtonElement)?.focus();}}}/>
-    <p className="pi-visual-muted">{target&&!askPassword?t("Shift+Escape leaves screen focus. Closing this viewer keeps Pi and its desktop running."):t("Shift+Escape leaves screen focus. Closing this viewer keeps Pi and its desktop running. Reconnect requires the password again.")}</p>
+    <p className="pi-visual-muted">{t("Shift+Escape leaves screen focus. Closing this viewer keeps Pi and its desktop running. Switch input takes or hands back control without reconnecting; a reconnect asks for the password again.")}</p>
   </div></div>,document.body);
 }
