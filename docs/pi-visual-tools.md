@@ -76,6 +76,18 @@ Prerequisites on the machine running Pi and this web backend:
 guacd -f -b 127.0.0.1 -l 4822
 ```
 
+On Ubuntu 26.04, the retained installer is
+`bash install-guacd-h264-ubuntu26.04-v3.sh` (**Revision 4** in its header, despite the filename).
+It includes the glibc 2.43 fixes and a real AVC420 decoder probe. If a previous run installed
+FreeRDP but stopped before guacd, use the same script with `--resume [BUILD_DIRECTORY]`.
+The older unversioned and `-resume.sh` installers were removed; recovery is already in the latest
+script. `install-guacd-h264-ubuntu26.04-v3.check.sh` remains: it validates that installer without
+running its installation flow, and is not another installer. Neither script is run automatically.
+
+Images inside the Pi **terminal** use Kitty graphics, not guacd. herdr drops them from the attach
+stream; with the pi images extension's markers the browser draws tool-result images inline itself
+(see [Terminal images](terminal-images.md)). This RDP viewer and image review are not involved.
+
 Start the feature backend with the explicitly enabled desktop gateway:
 
 ```sh
