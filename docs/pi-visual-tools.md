@@ -82,6 +82,44 @@ Start the feature backend with the explicitly enabled desktop gateway:
 HERDR_PI_GUACD_ENABLED=1 PORT=7318 bun run server
 ```
 
+### Start guacd and the server together
+
+`scripts/pi-visual-stack.sh` runs both commands above in the background, each in a session of
+its own with its output in a log, so they keep running after the terminal closes:
+
+```sh
+scripts/pi-visual-stack.sh          # start (same as `start`): guacd, then the server
+scripts/pi-visual-stack.sh status   # exit 0 only when both run and listen
+scripts/pi-visual-stack.sh logs     # the end of both logs
+scripts/pi-visual-stack.sh stop     # stop the pair
+scripts/pi-visual-stack.sh restart
+```
+
+It starts `/opt/herdr-guacd/sbin/guacd -f -b 127.0.0.1 -l 4822 -L info` and
+`HERDR_PI_GUACD_ENABLED=1 PORT=7318 bun run server` (`HOST` defaults to `127.0.0.1`), waits until
+each listens, and prints the address. Before starting anything it checks that guacd exists and
+runs (`guacd -v`), that Bun is found, and that `bun install` and `bun run build` have been run;
+it names what is missing instead of installing or building it. It refuses to run as root.
+
+- **Settings:** `PORT` and `HOST` for the server (other server variables such as `HERDR_SOCKET`
+  or `HERDR_WEB_TOKEN` pass through), `HERDR_STACK_GUACD_BIN` for another guacd binary,
+  `HERDR_STACK_START_TIMEOUT` / `HERDR_STACK_STOP_TIMEOUT` in seconds (30 / 15). guacd always
+  binds `127.0.0.1:4822`, the address the gateway dials. Use the same variables for `status` and
+  `stop` as for `start`.
+- **Logs and records:** `guacd.log`, `web-ui.log` and the pid records live in
+  `${HERDR_WEB_STATE_DIR:-~/.config/herdr-web-ui}/pi-visual-stack/` (`HERDR_STACK_DIR` moves
+  them). Logs are appended to and kept after `stop`.
+- **Only its own processes:** a second `start` reuses the running pair, and two commands at once
+  are serialized by a lock. A port already held by a guacd or server started some other way is
+  refused and left alone; stop that one yourself first. `stop` signals only the sessions this
+  script started, recognized by pid, start time and boot, and sends KILL after the stop timeout.
+  When the server fails to start, the guacd this run started is stopped again.
+- `status` checks that the recorded processes listen on their ports. To ask the server itself,
+  `curl http://127.0.0.1:7318/api/health?scope=bridge` answers without herdr, while
+  `/api/health` also pings herdr.
+- It is an on-demand launcher, not a boot service: nothing starts it again after a reboot or a
+  crash.
+
 In Pi, run `/gui view W1` (or `/gui view main`). The existing Pi terminal prints
 the address, user, one-time password and SHA-256 certificate fingerprint.
 In the worker panel, select **Open private desktop** and enter the port,
