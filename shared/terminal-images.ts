@@ -18,8 +18,37 @@ export const TERMINAL_IMAGE_MAX_CELLS = 1000;
 
 /** pi's own session id rule (session-manager assertValidSessionId), bounded. */
 export const PI_SESSION_ID = /^(?=.{1,128}$)[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
-/** The image endpoint's pi ref: `pi:<tool call id>:<nth supported image of its result>`. */
-const PI_REF = /^pi:[A-Za-z0-9_:.-]{1,128}:\d{1,3}$/;
+/**
+ * The longest pi tool call id taken. pi stores a provider's id as it came, opaque: OpenAI Responses
+ * ids are `${call_id}|${item id}` (pi-ai's openai-responses-shared), and some providers' item ids run
+ * to hundreds of characters of base64 (`+/=`). A marker's ref is bounded further by
+ * TERMINAL_IMAGE_URI_MAX once encoded.
+ */
+export const PI_TOOL_CALL_ID_MAX = 1024;
+const PRINTABLE_ASCII = /^[\x21-\x7e]+$/;
+
+/**
+ * A pi tool call id, as the chat, the image endpoint and a marker name it: 1 to 1024 printable
+ * ASCII characters, space excluded (no control character, no non-ASCII). Otherwise opaque: compared
+ * whole, never split, decoded or used as a path.
+ */
+export function isPiToolCallId(value: string): boolean {
+  return value.length >= 1 && value.length <= PI_TOOL_CALL_ID_MAX && PRINTABLE_ASCII.test(value);
+}
+
+/**
+ * The image endpoint's pi ref, `pi:<tool call id>:<nth supported image of its result>`: the index is
+ * the digits after the last colon (1 to 3), the id everything between (it may hold colons). Null for
+ * anything else.
+ */
+export function parsePiImageRef(ref: string): { toolCallId: string; index: number } | null {
+  if (!ref.startsWith("pi:")) return null;
+  const colon = ref.lastIndexOf(":");
+  const toolCallId = ref.slice(3, colon), index = ref.slice(colon + 1);
+  if (colon <= 3 || !/^\d{1,3}$/.test(index) || !isPiToolCallId(toolCallId)) return null;
+  return { toolCallId, index: Number(index) };
+}
+
 const DIGEST = /^[0-9a-f]{32}$/;
 const COUNT = /^(?:0|[1-9]\d{0,3})$/;
 const KEYS = ["s", "ref", "h", "c", "r", "y"] as const;
@@ -39,7 +68,9 @@ export interface TerminalImageMarker {
 
 /**
  * The marker a hyperlink URI is, or null. Strict: version 1, exactly the six keys once each, in
- * any order. Anything else (another scheme, a forged or oversized value) is no marker.
+ * any order, each value RFC 3986 percent-encoded (the query holds unreserved characters, `%`, `:`,
+ * `=` and `&` only; the extension escapes `!'()*` too). Anything else (another scheme, a forged or
+ * oversized value, a raw `|`) is no marker.
  */
 export function parseTerminalImageMarker(uri: string): TerminalImageMarker | null {
   if (uri.length > TERMINAL_IMAGE_URI_MAX || !uri.startsWith(`${TERMINAL_IMAGE_SCHEME}v1?`)) return null;
@@ -57,7 +88,7 @@ export function parseTerminalImageMarker(uri: string): TerminalImageMarker | nul
   }
   if (values.size !== KEYS.length) return null;
   const [session, ref, digest, c, r, y] = KEYS.map((key) => values.get(key)!);
-  if (!PI_SESSION_ID.test(session!) || !PI_REF.test(ref!) || !DIGEST.test(digest!)) return null;
+  if (!PI_SESSION_ID.test(session!) || parsePiImageRef(ref!) === null || !DIGEST.test(digest!)) return null;
   if (!COUNT.test(c!) || !COUNT.test(r!) || !COUNT.test(y!)) return null;
   const cols = Number(c), rows = Number(r), row = Number(y);
   if (cols < 1 || rows < 1 || cols > TERMINAL_IMAGE_MAX_CELLS || rows > TERMINAL_IMAGE_MAX_CELLS || row >= rows) return null;

@@ -8,10 +8,16 @@ const asked: (string | null)[] = [];
 const promptAsked: (string | null)[] = [];
 const PLAN_CARD = { id: "claude-plan:abc", agent: "claude", kind: "plan", title: "Plan", question: "Would you like to proceed?", options: [{ label: "Yes", description: null }], multi_select: false, custom_option_index: null };
 const diffAsked: { path: string; search: string; authorization: string | null; cookie: string | null; forwarded: string | null }[] = [];
+/** What a PC's conversation routes received, decoded as that PC's server decodes it. */
+const conversationAsked: { path: string; pane_id: string | null; ref: string | null; session: string | null; digest: string | null }[] = [];
 const remote = Bun.serve({
   port: 0,
   fetch(request) {
     const path = new URL(request.url).pathname;
+    if (path === "/api/pane/conversation/image" || path === "/api/pane/conversation/tool-output") {
+      const search = new URL(request.url).searchParams;
+      conversationAsked.push({ path, pane_id: search.get("pane_id"), ref: search.get("ref"), session: search.get("session"), digest: search.get("digest") });
+    }
     if (path === "/api/pane/conversation/image") {
       // a bridge of this branch echoes the pi session it checked; an older one does not
       const session = new URL(request.url).searchParams.get("session");
@@ -79,6 +85,27 @@ it("keeps a PC's session check on a terminal image: the query goes up, the echo 
   expect(bound.headers.get("cache-control")).toBe("no-store");
   const unbound = await handleMachineRequest(new Request("http://127.0.0.1/api/machines/pc1/pane/conversation/image?pane_id=w1:p1&ref=pi%3Acall-1%3A0"), manager);
   expect(unbound.headers.get("x-herdr-pi-session")).toBeNull();
+});
+
+it("carries a provider-composite tool call id (call_…|fc_…) to the PC exactly, for the chat and a terminal marker", async () => {
+  const digest = "0123456789abcdef0123456789abcdef";
+  for (const id of ["call_E2E|fc_0123abcd", "toolu_01E2EsyntheticAbCdEf|fc_0123abcd", `call_test|fc_(x)*!'"\\+/=%7C&?#`]) {
+    conversationAsked.length = 0;
+    // the query as the browser builds it (URLSearchParams), through this server to the PC's
+    const query = (fields: Record<string, string>) => new URLSearchParams({ pane_id: "w1:p1", ...fields }).toString();
+    const bound = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/pane/conversation/image?${query({ ref: `pi:${id}:0`, session: "0190-a", digest })}`), manager);
+    expect(bound.status).toBe(200);
+    expect(bound.headers.get("x-herdr-pi-session")).toBe("0190-a");
+    const chat = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/pane/conversation/image?${query({ ref: `pi:${id}:1` })}`), manager);
+    expect(chat.status).toBe(200);
+    const output = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/pane/conversation/tool-output?${query({ ref: id })}`), manager);
+    expect(output.status).toBe(200);
+    expect(conversationAsked).toEqual([
+      { path: "/api/pane/conversation/image", pane_id: "w1:p1", ref: `pi:${id}:0`, session: "0190-a", digest },
+      { path: "/api/pane/conversation/image", pane_id: "w1:p1", ref: `pi:${id}:1`, session: null, digest: null },
+      { path: "/api/pane/conversation/tool-output", pane_id: "w1:p1", ref: id, session: null, digest: null },
+    ]);
+  }
 });
 
 it("opens a PC's file from a navigation another site started, and keeps every other route to this app", async () => {

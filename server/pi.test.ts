@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, appendFileSync, realpathSync, rmSync, symlinkSy
 import { join } from "node:path";
 
 import { defaultPiSessionDir, piTranscriptInStore, unwrittenSession } from "./pi.ts";
-import { transcriptPage, piTranscriptImage } from "./conversation.ts";
+import { transcriptPage, piTranscriptImage, transcriptToolOutput } from "./conversation.ts";
 import type { ConversationTurn } from "../shared/protocol.ts";
 
 const root = mkdtempSync(join(tmpdir(), "herdr-pi-store-"));
@@ -303,5 +303,58 @@ describe("a pi tool result's images reach the chat", () => {
   it("offers no image to a pane whose store is not pi's", () => {
     // a claude ref is a uuid and index; a pi ref names a tool call. Neither reads the other's file.
     expect(piTranscriptImage(session("claude-shaped", [asked]), "pi:c1:0")).toBeNull();
+  });
+
+  // synthetic ids in the shapes pi stores: OpenAI Responses `${call_id}|${item id}` (pi-ai's
+  // openai-responses-shared, whose item ids can run to hundreds of characters with `+/=`), an
+  // Anthropic-style call id behind the same pipe, punctuation, and characters JSON escapes
+  const COMPOSITE = [
+    "call_E2E|fc_0123abcd",
+    "toolu_01E2EsyntheticAbCdEf|fc_0123abcd",
+    "call_test|fc_(x)*!'",
+    `call_b64|fc_${"AbC+/dEf=".repeat(50)}==`,
+    "call:with:9|fc_1:2",
+    `call_q"uote\\back|fc_%7C&?#`,
+  ];
+  // pi names its entries with short hex ids of its own, whatever the provider's call id is
+  const resultOf = (id: string, extra: unknown[] = []) => ({ ...withImage(id, extra), id: "r1" });
+
+  it("addresses and serves the images and whole output of provider-composite tool call ids", () => {
+    for (const id of COMPOSITE) {
+      const long = `${"x".repeat(5000)} ${id}`;
+      const path = session(`composite-${COMPOSITE.indexOf(id)}`, [asked, callingRead(id), resultOf(id, [
+        { type: "text", text: long },
+        { type: "image", mimeType: "image/jpeg", data: "/9j/4AAQSkZJRg==" },
+      ])]);
+      const tool = transcriptPage("pi-transcript", path).turns[1]!.parts[0]! as Extract<ConversationTurn["parts"][number], { kind: "tool" }>;
+      // the page's refs are what the chat fetches, exactly
+      expect(tool.images).toEqual([{ media_type: "image/png", ref: `pi:${id}:0` }, { media_type: "image/jpeg", ref: `pi:${id}:1` }]);
+      expect(tool.output_ref).toBe(id);
+      expect(Buffer.from(piTranscriptImage(path, tool.images![0]!.ref)!.bytes).equals(PNG)).toBe(true);
+      expect(piTranscriptImage(path, tool.images![1]!.ref)?.mediaType).toBe("image/jpeg");
+      expect(piTranscriptImage(path, `pi:${id}:2`)).toBeNull();
+      expect(transcriptToolOutput("pi-transcript", path, tool.output_ref!)).toBe(`read 1 image${long}`);
+    }
+  });
+
+  it("matches a composite id exactly: no prefix, part, neighbour or forged spelling of it", () => {
+    const id = "call_E2E|fc_0123abcd";
+    const path = session("composite-exact", [asked, callingRead(id), resultOf(id)]);
+    for (const near of ["call_E2E", "fc_0123abcd", "call_E2E|fc_0123abc", "call_E2E|fc_0123abcde", "call_E2E%7Cfc_0123abcd", "call_E2E\\u007cfc_0123abcd"]) {
+      expect(piTranscriptImage(path, `pi:${near}:0`)).toBeNull();
+      expect(transcriptToolOutput("pi-transcript", path, near)).toBeNull();
+    }
+    // a ref outside the grammar never reaches the file: control characters, space, non-ASCII, oversized
+    const refused = ["call_E2E\n|fc_1", "call_E2E|fc_1\n", "call_E2E\r", "call_E2E |fc_1", "call_E2E\u0000", "call_E2E\u007f", "call_\u00c9", "call_\u2028", `call_${"a".repeat(1020)}`];
+    for (const [index, bad] of refused.entries()) {
+      const forged = session(`composite-forged-${index}`, [asked, callingRead(bad), resultOf(bad)]);
+      expect(piTranscriptImage(forged, `pi:${bad}:0`)).toBeNull();
+      expect(transcriptToolOutput("pi-transcript", forged, bad)).toBeNull();
+    }
+    // the longest id taken is 1024 characters (shared/terminal-images.ts)
+    const longest = `call_${"a".repeat(1019)}`;
+    const kept = session("composite-longest", [asked, callingRead(longest), resultOf(longest, [{ type: "text", text: "y".repeat(5000) }])]);
+    expect(Buffer.from(piTranscriptImage(kept, `pi:${longest}:0`)!.bytes).equals(PNG)).toBe(true);
+    expect(transcriptToolOutput("pi-transcript", kept, longest)).toContain("y".repeat(5000));
   });
 });

@@ -33,17 +33,27 @@ On each row of a native image except the first (a one-row image: on its only row
 writes one cell right of the image (column `left + c`): U+2800 inside an OSC 8 link
 
 ```text
-ESC ] 8 ; ; x-pi-image:v1?s=<pi session id>&ref=<encodeURIComponent("pi:<toolCallId>:<n>")>&h=<32 hex>&c=<cols>&r=<rows>&y=<row> ESC \  U+2800  ESC ] 8 ; ; ESC \
+ESC ] 8 ; ; x-pi-image:v1?s=<pct(pi session id)>&ref=<pct("pi:<toolCallId>:<n>")>&h=<32 hex>&c=<cols>&r=<rows>&y=<row> ESC \  U+2800  ESC ] 8 ; ; ESC \
 ```
 
-`n` counts the tool result's image blocks with base64 data and type png/jpeg/gif/webp; `h` is the
-first 32 hex digits of the SHA-256 of those decoded bytes. The URI is at most 512 characters. The
-marker holds no path, URL or pixels. Native Kitty output is otherwise unchanged; the first image row
-carries no marker because pi's fullscreen mode puts a cropped image line there.
+`pct` is RFC 3986 percent-encoding: `encodeURIComponent`, plus `!'()*`, which it leaves raw. So the
+query holds only unreserved characters, `%`, `:`, `=` and `&`; a `|` travels as `%7C`. `toolCallId`
+is the id pi stored for the call, whole and opaque: providers choose it, and pi keeps OpenAI
+Responses ids (OpenAI, Codex, Copilot and others) as `<call_id>|<item id>`, such as
+`call_…|fc_…` or `toolu_…|fc_…`. Any id of 1–1024 printable ASCII characters other than space is
+taken (no control character, no non-ASCII); `n` is the digits after the last colon, so an id may
+hold colons. `n` counts the tool result's image blocks with base64 data and type
+png/jpeg/gif/webp; `h` is the first 32 hex digits of the SHA-256 of those decoded bytes. The URI is
+at most 512 characters, which bounds a marker's id further: an id too long to fit gets no marker
+(and no image in the terminal), though the chat still serves it. The marker holds no path, URL or
+pixels. Native Kitty output is otherwise unchanged; the first image row carries no marker because
+pi's fullscreen mode puts a cropped image line there.
 
 `shared/terminal-images.ts` parses it strictly (six keys once each, pi's session-id rule, the ref
 grammar of the image endpoint, 1–1000 cells); anything else is no marker. Such links are swallowed
-like other links this app cannot open, so they are never drawn as links.
+like other links this app cannot open, so they are never drawn as links. The image endpoint, the
+chat's tool images and a pi tool's whole output take the same id rule (`parsePiImageRef`,
+`isPiToolCallId`) and compare the id whole; other agents keep their own, narrower refs.
 
 ## What the browser does
 
@@ -100,13 +110,20 @@ not show stale ones).
 1. **Web UI / bridge (this repository):** rebuild and restart the server you run (`bun run build`,
    then your usual `bun run start` or service restart; nothing restarts automatically). Remote PCs
    need a bridge bundle built from this branch (see [Remote PCs](remote-pcs.md)); an upstream
-   `remote-v29` bundle ignores `session`/`digest`, sends no echo, and its pane shows no images.
+   `remote-v29` bundle ignores `session`/`digest`, sends no echo, and its pane shows no images. A
+   remote PC resolves its images itself, so a fix to the id rule reaches it only with a new bridge:
+   `bun run build:remote <target>` on the connection server, then update that PC's bridge
+   (`POST /api/machines/<id>/update-bridge?feature=pi-visual`, which installs over the same version).
 2. **Pi on every PC (local and remote) where images should show:** pi 1.3.x and the pi images
-   extension with terminal references (`oh-my-pi-extensions/images`, `src/terminal-refs.ts`; at the
-   time of writing an uncommitted change in that repository). It writes markers only when pi uses
-   Kitty images inside a herdr pane (`TERM_PROGRAM=herdr`); `PI_IMAGES_TERMINAL_REFS=0` turns it off,
-   `=1` forces it on (still Kitty only). Restart pi sessions to load it. herdr's pi integration
-   (installed by herdr) must report the session, as it does for Chat.
+   extension with terminal references (`oh-my-pi-extensions/images`, `src/terminal-refs.ts`, from
+   its commit d264707). It writes markers only when pi uses Kitty images inside a herdr pane
+   (`TERM_PROGRAM=herdr`); `PI_IMAGES_TERMINAL_REFS=0` turns it off, `=1` forces it on (still Kitty
+   only). A pi session started before the extension was installed loads it on restart or `/reload`.
+   herdr's pi integration (installed by herdr) must report the session, as it does for Chat. That
+   extension already escapes `|`; an id with `!'()*` gets a marker only from a version that escapes
+   those too (RFC 3986). Ids such as `call_…|fc_…` need no extension update and no pi restart:
+   images that came up blank for them show once this server (and a remote PC's bridge) runs the
+   fixed build.
 3. herdr: unchanged (0.9.5 verified).
 
 ## Checks
@@ -116,8 +133,10 @@ not show stale ones).
   marker tracking on a real (headless) xterm 5.5: overwrites by a bare U+2800, another link or a run,
   erase, scroll, inserted characters and reset; and herdr 0.9.5's own captured attach bytes for a
   marker rewritten without its link, fed whole and one character per write.
-- `server/pi.contract.test.ts`, `server/machine-proxy.test.ts`: session/digest binding, a reused tool
-  call id in another session, the echo through a PC's proxy.
+- `server/pi.contract.test.ts`, `server/pi.test.ts`, `server/machine-proxy.test.ts`: session/digest
+  binding, a reused tool call id in another session, the echo through a PC's proxy; provider ids
+  (`call_…|fc_…`, `toolu_…|fc_…`, punctuation, quotes and backslashes, the 1024-character bound)
+  for the chat's images and whole output and for a marker's read, here and through a PC.
 - `bun run check run bun scripts/terminal-image-attach-probe.ts`: captures what herdr sends for
   markers drawn, rewritten bare and restored (server WebSocket and a loopback relay), and what the
   tracking makes of it.
@@ -135,5 +154,20 @@ not show stale ones).
   drawn in two parts), writes the markers again (the image is back); removal on `clear`; forged
   markers; a later session reusing a tool call id; and that herdr's attach stream never scrolled or
   shifted cells in the whole run. Screenshots and `result.json` go to `TERMINAL_IMAGE_EVIDENCE_DIR`.
+- End to end for the ids providers give, with pi started fresh at its default image width and the
+  extension loaded as an installed package:
+
+  ```sh
+  PI_IMAGES_PACKAGE=/path/to/oh-my-pi-extensions \
+    bun run check run --build bun scripts/terminal-image-provider-regression.ts   # PI_TUI_MODE=regular too
+  ```
+
+  The model is simulated (a loopback server speaking the OpenAI Responses stream with a dummy key,
+  `scripts/fixtures/responses-provider.ts`); pi itself builds and stores the ids `call_…|fc_…` and
+  `toolu_…|fc_…` while its `read` tool opens a PNG and a JPEG. With the browser on the terminal
+  before the reads, it checks pixels and placement locally and through a remote PC's bridge (loopback
+  fake SSH), the chat's images and whole output for those ids, and the pictures again after pi's
+  `/reload` plus a read after it. `PI_IMAGES_PUNCTUATION=1` also expects an id with `!'()*` to draw
+  (an extension that escapes them); otherwise it must draw nothing.
 - `scripts/terminal-image-diagnostic.ts` still documents that raw Kitty bytes never reach the attach
   stream (exit 2 is the expected result on herdr 0.9.5).

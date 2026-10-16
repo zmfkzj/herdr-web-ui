@@ -6,7 +6,9 @@ import { IMAGE_LIMITS, imageDimensions, MAX_MARKER_CELLS, TerminalImageLayer, Te
 
 const DIGEST = "0123456789abcdef0123456789abcdef";
 const SESSION = "0190abcd-0000-7000-8000-000000000001";
-const uri = (y: number, ref = "pi:call_01:0") => `x-pi-image:v1?s=${SESSION}&ref=${encodeURIComponent(ref)}&h=${DIGEST}&c=12&r=6&y=${y}`;
+/** The extension's value encoding: encodeURIComponent, plus RFC 3986's `!'()*` (it leaves those raw). */
+const rfc3986 = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+const uri = (y: number, ref = "pi:call_01:0") => `x-pi-image:v1?s=${SESSION}&ref=${rfc3986(ref)}&h=${DIGEST}&c=12&r=6&y=${y}`;
 const link = (y: number, ref?: string) => `;${uri(y, ref)}`;
 
 /** Cursor to a screen cell, as herdr's attach stream places it (0-based here, 1-based on the wire). */
@@ -87,6 +89,9 @@ describe("terminal image markers on a real xterm", () => {
     expect(await write(image())).toEqual(["pi:call_01:0 2,3 rows 3-8"]);
     // a frame that rewrites the same markers (a redraw) keeps it where it is
     expect(await write(image())).toEqual(["pi:call_01:0 2,3 rows 3-8"]);
+    // a provider's composite id (OpenAI Responses `${call_id}|${item id}`), punctuated, is the same
+    const { write: writeComposite } = terminal();
+    expect(await writeComposite(image("pi:call_E2E|fc_(x)*!':0"))).toEqual(["pi:call_E2E|fc_(x)*!':0 2,3 rows 3-8"]);
   });
 
   it("forgets a marker cell overwritten by U+2800 without its link (the glyph alone proves nothing)", async () => {
@@ -276,5 +281,15 @@ describe("terminalImageSource", () => {
     // the same ref and session on two PCs, or two panes, are two images
     expect(new Set([local.key, remote.key, terminalImageSource("local", "w1:p2", placement)!.key]).size).toBe(3);
     expect(terminalImageSource("local", null, placement)).toBeNull();
+  });
+
+  it("sends a composite tool call id whole, so the PC's server reads back the marker's own ref", () => {
+    const ref = "pi:call_E2E|fc_(x)*!'+/=:0";
+    const composite = { image: `${SESSION}\n${ref}\n${DIGEST}`, ref, session: SESSION, digest: DIGEST };
+    for (const machine of ["local", "pc 2"]) {
+      const url = new URL(terminalImageSource(machine, "w1:p1", composite)!.url, "http://127.0.0.1");
+      expect(url.pathname).toBe(machine === "local" ? "/api/pane/conversation/image" : "/api/machines/pc%202/pane/conversation/image");
+      expect(Object.fromEntries(url.searchParams)).toEqual({ pane_id: "w1:p1", ref, session: SESSION, digest: DIGEST });
+    }
   });
 });

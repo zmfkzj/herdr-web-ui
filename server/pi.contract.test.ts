@@ -171,6 +171,68 @@ it("binds a terminal image read to the pane's current pi session (same ref, anot
   }
 });
 
+it("serves provider-composite tool call ids (call_…|fc_…) to the chat and to a terminal marker, over HTTP", async () => {
+  // synthetic ids in the shapes pi stores for OpenAI Responses (`${call_id}|${item id}`) and an
+  // Anthropic-style call id behind the same pipe; punctuation RFC 3986 escapes on the wire
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+  const calls = [
+    { id: "call_E2E|fc_0123abcd", type: "image/png", bytes: PNG },
+    { id: "toolu_01E2EsyntheticAbCdEf|fc_0123abcd", type: "image/jpeg", bytes: JPEG },
+    { id: `call_test|fc_(x)*!'"\\+/=`, type: "image/png", bytes: Buffer.concat([PNG, Buffer.from("punctuated")]) },
+  ];
+  const long = "z".repeat(6000);
+  const entries: unknown[] = [
+    { type: "model_change", id: "m1", parentId: null, timestamp: "2026-09-30T00:00:00Z", provider: "test", modelId: "pi-contract-model" },
+    { type: "message", id: "u1", parentId: "m1", timestamp: "2026-09-30T00:00:01Z", message: { role: "user", content: "open the pictures" } },
+  ];
+  calls.forEach((call, index) => {
+    entries.push({ type: "message", id: `a${index}`, parentId: index === 0 ? "u1" : `r${index - 1}`, timestamp: "2026-09-30T00:00:02Z", message: {
+      role: "assistant", model: "pi-contract-model", provider: "test", stopReason: "toolUse", usage: { input: 4, output: 1 },
+      content: [{ type: "toolCall", id: call.id, name: "read", arguments: { path: `shot-${index}` } }],
+    } });
+    entries.push({ type: "message", id: `r${index}`, parentId: `a${index}`, timestamp: "2026-09-30T00:00:03Z", message: {
+      role: "toolResult", toolCallId: call.id, toolName: "read",
+      content: [{ type: "text", text: long }, { type: "image", mimeType: call.type, data: call.bytes.toString("base64") }],
+    } });
+  });
+  writeFileSync(transcript, page(entries));
+  const digestOf = (bytes: Buffer) => new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 32);
+  const get = (path: string, query: Record<string, string>) => fetch(`http://127.0.0.1:${server.port}/api/pane/conversation/${path}?${new URLSearchParams({ pane_id: paneId, ...query })}`);
+  try {
+    const tools = (await read()).turns.flatMap((turn) => turn.parts).filter((part) => part.kind === "tool");
+    expect(tools.map((tool) => tool.kind === "tool" && tool.output_ref)).toEqual(calls.map((call) => call.id));
+    for (const [index, call] of calls.entries()) {
+      const tool = tools[index]!;
+      if (tool.kind !== "tool") throw new Error("not a tool");
+      // the chat: the page's own refs, sent back exactly as the client sends them
+      expect(tool.images).toEqual([{ media_type: call.type, ref: `pi:${call.id}:0` }]);
+      const chatImage = await get("image", { ref: tool.images![0]!.ref });
+      expect(chatImage.status).toBe(200);
+      expect(chatImage.headers.get("content-type")).toBe(call.type);
+      expect(Buffer.from(await chatImage.arrayBuffer()).equals(call.bytes)).toBe(true);
+      const output = await get("tool-output", { ref: tool.output_ref! });
+      expect(output.status).toBe(200);
+      expect(await output.text()).toBe(long);
+      // a terminal marker's read: bound to the session and the digest of the picture
+      const bound = await get("image", { ref: `pi:${call.id}:0`, session: "session", digest: digestOf(call.bytes) });
+      expect(bound.status).toBe(200);
+      expect(bound.headers.get("x-herdr-pi-session")).toBe("session");
+      expect(Buffer.from(await bound.arrayBuffer()).equals(call.bytes)).toBe(true);
+      expect((await get("image", { ref: `pi:${call.id}:0`, session: "session-two", digest: digestOf(call.bytes) })).status).toBe(404);
+      expect((await get("image", { ref: `pi:${call.id}:0`, session: "session", digest: digestOf(Buffer.from("other")) })).status).toBe(404);
+      expect((await get("image", { ref: `pi:${call.id}:1`, session: "session", digest: digestOf(call.bytes) })).status).toBe(404);
+    }
+    // exact ids only: a part of one, another spelling of its pipe, or an id outside the grammar
+    for (const ref of ["pi:call_E2E:0", "pi:fc_0123abcd:0", "pi:call_E2E%7Cfc_0123abcd:0", "pi:call_E2E\n|fc_0123abcd:0", "pi:call_E2E |fc_0123abcd:0"]) {
+      expect((await get("image", { ref })).status).toBe(404);
+    }
+    expect((await get("tool-output", { ref: "call_E2E" })).status).toBe(404);
+    expect((await get("tool-output", { ref: "call_E2E|fc_0123abcd\u0000" })).status).toBe(404);
+  } finally {
+    writeFileSync(transcript, turns("Check chat", "Answer one"));
+  }
+});
+
 it("resolves pi's context window from the agent dir pi reads its models from", async () => {
   writeFileSync(transcript, turns("Check chat", "Answer one"));
   expect((await read()).metadata?.context?.window).toBeNull();

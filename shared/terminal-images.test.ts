@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { parseTerminalImageMarker, terminalImagePlacements, TERMINAL_IMAGE_URI_MAX, type MarkerCell } from "./terminal-images.ts";
+import { isPiToolCallId, parsePiImageRef, parseTerminalImageMarker, PI_TOOL_CALL_ID_MAX, terminalImagePlacements, TERMINAL_IMAGE_URI_MAX, type MarkerCell } from "./terminal-images.ts";
 
 const DIGEST = "0123456789abcdef0123456789abcdef";
 const uri = (fields: Record<string, string | number>) => `x-pi-image:v1?${Object.entries(fields).map(([key, value]) => `${key}=${value}`).join("&")}`;
@@ -33,9 +33,92 @@ describe("terminal image markers", () => {
       uri({ ...base, y: 6 }),
       // a taller image never marks its image line
       uri({ ...base, y: 0 }),
-      uri({ ...base, ref: encodeURIComponent(`pi:${"a".repeat(130)}:0`) }),
+      // the URI cap bounds a marker's ref whatever its id (docs/terminal-images.md)
+      uri({ ...base, ref: encodeURIComponent(`pi:${"a".repeat(TERMINAL_IMAGE_URI_MAX)}:0`) }),
       `${uri(base)}&pad=${"a".repeat(TERMINAL_IMAGE_URI_MAX)}`,
       uri(base).replace("&h=", "&h=%0A"),
+    ];
+    for (const value of refused) expect(parseTerminalImageMarker(value)).toBeNull();
+  });
+});
+
+/** The extension's value encoding: encodeURIComponent, plus RFC 3986's `!'()*` (it leaves those raw). */
+const rfc3986 = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+describe("pi tool call ids in markers", () => {
+  // synthetic ids in the shapes pi stores: OpenAI Responses `${call_id}|${item id}` (pi-ai's
+  // openai-responses-shared), an Anthropic-style call id behind the same pipe, a base64-ish item id,
+  // punctuation RFC 3986 escapes, and the simple ids markers carried before
+  const ids = [
+    "call_E2E|fc_0123abcd",
+    "toolu_01E2EsyntheticAbCdEf|fc_0123abcd",
+    "call_test|fc_(x)*!'",
+    "call_b64|fc_AbC+/dEf==",
+    "call:with:colons|fc_9:0",
+    `call_q"uote\\back<>{}[]^\`~#$&@;,?=|fc_1`,
+    "call_01", "call-1", "toolu_01AbCdEf",
+  ];
+
+  it("reads the exact opaque id, however it is punctuated, as the extension encodes it", () => {
+    for (const id of ids) {
+      const ref = `pi:${id}:0`;
+      expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(ref) }))?.ref).toBe(ref);
+      // the index is the last colon's digits: an id may hold colons and digits of its own
+      expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(`pi:${id}:123`) }))?.ref).toBe(`pi:${id}:123`);
+    }
+    // decoded once: an escape inside the id stays the literal characters it was
+    expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986("pi:call_E2E%7Cfc_1:0") }))?.ref).toBe("pi:call_E2E%7Cfc_1:0");
+  });
+
+  it("splits a ref at its last colon, and bounds the id by characters and length alone", () => {
+    expect(parsePiImageRef("pi:call_E2E|fc_0123abcd:0")).toEqual({ toolCallId: "call_E2E|fc_0123abcd", index: 0 });
+    expect(parsePiImageRef("pi:a:1:2:345")).toEqual({ toolCallId: "a:1:2", index: 345 });
+    expect(parsePiImageRef("pi:a::7")).toEqual({ toolCallId: "a:", index: 7 });
+    expect(parsePiImageRef("pi::a:7")).toEqual({ toolCallId: ":a", index: 7 });
+    for (const bad of ["pi::0", "pi:0", "pi:", "pi:a:", "pi:a:b", "pi:a:1\n", "pi:a\n:1", "pi:a:01234", "xpi:a:0", " pi:a:0"]) expect(parsePiImageRef(bad)).toBeNull();
+    const longest = "x".repeat(PI_TOOL_CALL_ID_MAX);
+    expect(PI_TOOL_CALL_ID_MAX).toBe(1024);
+    expect(isPiToolCallId(longest) && parsePiImageRef(`pi:${longest}:0`)?.toolCallId === longest).toBe(true);
+    expect(isPiToolCallId(`${longest}x`) || parsePiImageRef(`pi:${longest}x:0`) !== null).toBe(false);
+    // every printable ASCII character but space, and nothing else
+    const printable = Array.from({ length: 0x7e - 0x21 + 1 }, (_, i) => String.fromCharCode(0x21 + i)).join("");
+    expect(isPiToolCallId(printable)).toBe(true);
+    for (let code = 0; code < 0x110; code++) {
+      if (code >= 0x21 && code <= 0x7e) continue;
+      const char = String.fromCharCode(code);
+      for (const id of [char, `call${char}`, `${char}call`, `ca${char}ll`]) expect(isPiToolCallId(id)).toBe(false);
+    }
+    expect(isPiToolCallId("")).toBe(false);
+  });
+
+  it("takes the longest id the URI cap leaves room for, and nothing past the cap", () => {
+    const at = (length: number) => uri({ ...base, ref: rfc3986(`pi:call_E2E|fc_${"a".repeat(length)}:0`) });
+    const fits = TERMINAL_IMAGE_URI_MAX - at(0).length;
+    expect(at(fits).length).toBe(TERMINAL_IMAGE_URI_MAX);
+    expect(parseTerminalImageMarker(at(fits))?.ref).toBe(`pi:call_E2E|fc_${"a".repeat(fits)}:0`);
+    expect(parseTerminalImageMarker(at(fits + 1))).toBeNull();
+  });
+
+  it("refuses ids that are no printable ASCII word, and refs that are malformed", () => {
+    const refused = [
+      // the query stays RFC 3986: an unescaped pipe, or the raw `!'()*` plain encodeURIComponent leaves
+      uri({ ...base, ref: `pi%3Acall_E2E|fc_0123abcd%3A0` }),
+      uri({ ...base, ref: encodeURIComponent("pi:call_test|fc_(x)*!':0") }),
+      // space, control characters, DEL and anything outside ASCII, encoded
+      ...["%20", "%09", "%0A", "%0D", "%00", "%1B", "%7F", "%C3%A9", "%E2%80%A8", "%E2%A0%80"].map((bad) => uri({ ...base, ref: `pi%3Acall_E2E${bad}fc_1%3A0` })),
+      // a line feed closing the id or the index
+      uri({ ...base, ref: "pi%3Acall_E2E%7Cfc_1%0A%3A0" }),
+      uri({ ...base, ref: "pi%3Acall_E2E%7Cfc_1%3A0%0A" }),
+      // no id, no index, an index too long or not a number, no `pi:`, a truncated escape
+      uri({ ...base, ref: rfc3986("pi::0") }),
+      uri({ ...base, ref: rfc3986("pi:call_E2E|fc_0123abcd") }),
+      uri({ ...base, ref: rfc3986("pi:call_E2E|fc_0123abcd:") }),
+      uri({ ...base, ref: rfc3986("pi:call_E2E|fc_0123abcd:1000") }),
+      uri({ ...base, ref: rfc3986("pi:call_E2E|fc_0123abcd:-1") }),
+      uri({ ...base, ref: rfc3986("call_E2E|fc_0123abcd:0") }),
+      uri({ ...base, ref: rfc3986("PI:call_E2E|fc_0123abcd:0") }),
+      uri({ ...base, ref: "pi%3Acall_E2E%7Cfc_0123abcd%3A0%7" }),
+      uri({ ...base, ref: "pi%3Acall_E2E%7" }),
     ];
     for (const value of refused) expect(parseTerminalImageMarker(value)).toBeNull();
   });

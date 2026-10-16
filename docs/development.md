@@ -653,8 +653,9 @@ the maintainer.
 See [Terminal input](terminal-input.md) for input readiness, draft ownership and the mobile
 input regression matrix.
 See [Terminal images](terminal-images.md) for pi's inline images in the terminal (the marker
-contract with the pi images extension, `scripts/terminal-image-regression.ts`) and the raw Kitty
-attach diagnostic, which still fails on herdr 0.9.5 by design.
+contract with the pi images extension, `scripts/terminal-image-regression.ts`,
+`scripts/terminal-image-provider-regression.ts` for the tool call ids providers give) and the raw
+Kitty attach diagnostic, which still fails on herdr 0.9.5 by design.
 
 ## Layout
 

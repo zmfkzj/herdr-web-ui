@@ -41,7 +41,7 @@ import type { ConversationMetadata, ConversationPart, ConversationTurn, HerdrPan
 import { herdrRpc, paneRead, sessionSnapshot } from "./herdr/client.ts";
 import { codexHistorySegments, createCodexTranscriptParser, codexOutputText, codexTranscriptPath, defaultCodexHome, forgetAllCodexState, forgetCodexStateFor, paneCodexHome, parseCodexTranscript, readRange } from "./codex.ts";
 import { CODEX_IMAGE_REF, codexTranscriptImage } from "./codex-images.ts";
-import { PI_SESSION_ID } from "../shared/terminal-images.ts";
+import { isPiToolCallId, parsePiImageRef, PI_SESSION_ID } from "../shared/terminal-images.ts";
 import { AmbiguousClaudeStore, claudeProcessSession, claudeTranscriptFile, defaultClaudeConfigDir, forgetClaudeSessionFile, forgetClaudeSessions, isClaudeProcess, processClaudeConfigDir } from "./claude-store.ts";
 import { forgetGjcState, gjcPidUnderShell, gjcTranscriptForPane, isGjcProcess, storeRelative } from "./gjc-runtime.ts";
 import { omoProcessIdentity, omoSessionForPane } from "./omo.ts";
@@ -1629,8 +1629,9 @@ function transcriptPageRead(source: StreamSource, path: string, page: Conversati
  * answers null.
  */
 export async function conversationImage(paneId: string, ref: string, codexHome?: string, opencodeDb?: string, piBinding?: { session: string; digest: string }): Promise<{ mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null> {
-  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !PI_IMAGE_REF.test(ref) && !OPENCODE_IMAGE_REF.test(ref)) return null;
-  if (piBinding !== undefined && (!PI_IMAGE_REF.test(ref) || !PI_SESSION_ID.test(piBinding.session) || !IMAGE_DIGEST.test(piBinding.digest))) return null;
+  const piRef = parsePiImageRef(ref) !== null;
+  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !piRef && !OPENCODE_IMAGE_REF.test(ref)) return null;
+  if (piBinding !== undefined && (!piRef || !PI_SESSION_ID.test(piBinding.session) || !IMAGE_DIGEST.test(piBinding.digest))) return null;
   const snapshot = await sessionSnapshot();
   const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId);
   if (pane === undefined || typeof pane.cwd !== "string" || pane.cwd.length === 0) return null;
@@ -1699,18 +1700,27 @@ export function transcriptImage(path: string, ref: string): { mediaType: string;
 }
 
 const TOOL_REF = /^[A-Za-z0-9_:.-]{1,128}$/;
+/**
+ * The transcripts whose tool results are pi records (piMessage), named by the provider's own tool
+ * call id: an opaque pi id (`call_…|fc_…` and the like), where other agents keep TOOL_REF. Agents
+ * with refs of their own (OpenCode, Hermes, Grok, Antigravity) check them where they read them.
+ */
+const PI_RECORD_SOURCES = new Set<string>(["pi-transcript", "omp-transcript", "omo-transcript", "gjc-transcript"]);
+const toolRefFits = (source: string, ref: string) => PI_RECORD_SOURCES.has(source) ? isPiToolCallId(ref) : TOOL_REF.test(ref);
 /** A whole output is still bounded: a page of it, not a log file. */
 const TOOL_OUTPUT_MAX = 2_000_000;
 
 /** The whole output of a tool call whose page output was cut, by its id; null when there is none. */
 export async function toolOutput(paneId: string, ref: string, codexHome?: string, opencodeDb?: string, hermesHome?: string, grokHome?: string): Promise<string | null> {
-  if (!TOOL_REF.test(ref)) return null;
+  // TOOL_REF is narrower than a pi id: the source the pane resolves to decides which one it takes
+  if (!isPiToolCallId(ref)) return null;
   const snapshot = await sessionSnapshot();
   const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId);
   if (pane === undefined || typeof pane.cwd !== "string" || pane.cwd.length === 0) return null;
   let resolved: ResolvedTranscript;
   try { resolved = await resolveTranscript(pane, pane.cwd, codexHome, snapshot.panes, opencodeDb, hermesHome, grokHome); }
   catch (error) { if (error instanceof ConversationUnavailable) return null; throw error; }
+  if (!toolRefFits(resolved.source, ref)) return null;
   if (resolved.source === "opencode-transcript") {
     const output = opencodeToolOutput(resolved.path, resolved.session, ref);
     return output !== null && output.length > TOOL_OUTPUT_MAX ? `${output.slice(0, TOOL_OUTPUT_MAX)}\n… trimmed` : output;
@@ -1724,7 +1734,7 @@ export async function toolOutput(paneId: string, ref: string, codexHome?: string
 
 /** The output a transcript file holds for one tool call id, whole (up to TOOL_OUTPUT_MAX). */
 export function transcriptToolOutput(source: StreamSource, path: string, ref: string, codexHome?: string): string | null {
-  if (!TOOL_REF.test(ref)) return null;
+  if (!toolRefFits(source, ref)) return null;
   if (source === "codex-transcript") {
     let segments: ReturnType<typeof codexHistorySegments>;
     try { segments = codexHistorySegments(path, codexHome); } catch { return null; }
@@ -1771,31 +1781,33 @@ function piToolOutput(path: string, ref: string): string | null {
 }
 
 /**
- * The image a pi tool call returned, by the ref the page gave it (`pi:<call id>:<nth image>`).
+ * The image a pi tool call returned, by the ref the page gave it (`pi:<call id>:<nth image>`,
+ * parsePiImageRef: the id is opaque and may hold `|`, `:` or other punctuation).
  * Like the output, it is read on the active branch only: an image from a branch a /tree
  * abandoned is one the chat never showed, so it is not offered.
  */
 export function piTranscriptImage(path: string, ref: string): { mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null {
-  const match = PI_IMAGE_REF.exec(ref);
-  if (match === null || match[1] === undefined || match[2] === undefined) return null;
-  const [, callId, nth] = match;
+  const parsed = parsePiImageRef(ref);
+  if (parsed === null) return null;
+  const { toolCallId: callId, index: nth } = parsed;
+  // the id as pi's JSON writes it (a quote or backslash escaped): a substring check on the raw id
+  // would skip the record holding it; piImageBlock then compares the parsed id whole
+  const needle = JSON.stringify(callId);
   let size: number;
   let branch: ReturnType<typeof piBranchSegments>;
   try { size = statSync(path).size; branch = piBranchSegments(path, size); } catch { return null; }
   if (branch === null) return null;
   for (const line of piBranchRecords(path, size)) {
-    if (!line.includes(callId)) continue;
+    if (!line.includes(needle)) continue;
     let entry: unknown;
     try { entry = JSON.parse(line); } catch { continue; }
     const message = piMessage(entry);
     if (message === null) continue;
-    const image = piImageBlock(message, callId, Number(nth));
+    const image = piImageBlock(message, callId, nth);
     if (image !== null) return { mediaType: image.media_type, bytes: new Uint8Array(Buffer.from(image.data, "base64")) };
   }
   return null;
 }
-
-const PI_IMAGE_REF = /^pi:([A-Za-z0-9_:.\-]{1,128}):(\d{1,3})$/;
 
 function outputInText(source: RecognizedConversation["source"], text: string, ref: string): string | null {
   text = activeHistoryText(text, source);
