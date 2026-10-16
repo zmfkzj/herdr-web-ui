@@ -30,7 +30,10 @@
     "scripts/repo-diff-fixture.tsx",
     "scripts/lan-exposure-notice-regression.ts",
     "scripts/application-paging-regression.ts",
-    "scripts/pane-paging-demo-regression.ts"
+    "scripts/pane-paging-demo-regression.ts",
+    "scripts/pi-visual-browser-qa.ts",
+    "scripts/fixtures/pi-visual.tsx",
+    "src/lib/pi-visual/guacamole.d.ts"
   ],
   "include": []
 }

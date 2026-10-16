@@ -1,3 +1,4 @@
+import { ImageReview } from "./pi-visual/ImageReview.tsx";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -738,6 +739,7 @@ export const ChatView = memo(function ChatView({ paneId, active = true, visible:
   const [newMessages, setNewMessages] = useState(false);
   /** scrolled up from the end: the way back is offered even when nothing new came */
   const [away, setAway] = useState(false);
+  const [reviewImage, setReviewImage] = useState<GalleryImage | null>(null);
   const [viewer, setViewer] = useState<{ images: GalleryImage[]; index: number } | null>(null);
   const openViewer = useCallback((images: GalleryImage[], index: number) => setViewer({ images, index }), []);
   const closeViewer = useCallback(() => setViewer(null), []);
@@ -1428,6 +1430,7 @@ export const ChatView = memo(function ChatView({ paneId, active = true, visible:
       if (prompt.steps) setPromptPollKey((key) => key + 1);
       onPendingAnswerDone?.(paneId, prompt.id);
     }} />, promptDock)}
-  {viewer !== null && <ImageLightbox images={viewer.images} index={viewer.index} onClose={closeViewer} />}
+  {reviewImage !== null && agent === "pi" && <ImageReview key={`${machineId}:${paneId}:${reviewImage.src}`} paneId={paneId} machineId={machineId} image={reviewImage} onClose={() => setReviewImage(null)} />}
+      {viewer !== null && <ImageLightbox images={viewer.images} index={viewer.index} onClose={closeViewer} onReview={agent === "pi" ? (image) => { setViewer(null); setReviewImage(image); } : undefined} />}
   </ImageViewerContext.Provider></ChatHistoryContext.Provider></ChatPaneContext.Provider>;
 });

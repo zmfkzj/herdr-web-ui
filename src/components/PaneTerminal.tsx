@@ -1,3 +1,4 @@
+import { PiVisualTools } from "./pi-visual/PiVisualTools.tsx";
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -2759,6 +2760,7 @@ export function PaneTerminal({
         <FindBar key={paneId} paneId={paneId} viewportIntent={viewportIntent} onResult={setSearchState} activePane={active} focusRequest={findRequest} disabled={!connected || held || ended || released || !outputReady}
           onClose={() => { setFindOpen(false); if (activeRef.current && !coarse) termRef.current?.focus(); }} />
       )}
+      {paneId !== null && agent === "pi" && chatView && !observing && <PiVisualTools key={`${machineId}:${paneId}`} paneId={paneId} machineId={machineId} enabled={presented && connected && !ended} />}
       <div className="terminal-surface">
         {/* xterm hides its rendered rows from assistive technology, so the region around the
             visible grid carries the pane's name: a screen reader announces which pane

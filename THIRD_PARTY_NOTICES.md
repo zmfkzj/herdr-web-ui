@@ -2151,3 +2151,13 @@ schemes in d3-scale-chromatic.
    See the License for the specific language governing permissions and
    limitations under the License.
 ```
+
+## guacamole-common-js 1.5.0 (Pi visual feature)
+
+The optional browser desktop viewer bundles the Apache Guacamole JavaScript
+client via the `guacamole-common-js` npm repack published by Christopher Mühl.
+Upstream: https://github.com/apache/guacamole-client
+Repack: https://github.com/padarom/guacamole-common-js
+License: Apache License, Version 2.0. The full Apache 2.0 license appears in this
+notice file and at https://www.apache.org/licenses/LICENSE-2.0 . Apache Software
+Foundation copyright/license headers are retained in the distributed package.

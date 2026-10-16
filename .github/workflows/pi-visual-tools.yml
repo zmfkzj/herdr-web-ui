@@ -1,0 +1,33 @@
+name: Pi visual tools
+on:
+  push:
+    branches: [feat/pi-visual-tools]
+    paths-ignore:
+      - '.github/pi-visual-transfer.*'
+      - '.github/workflows/pi-visual-apply.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ci
+        with:
+          node: 'true'
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+      - name: Visual feature browser checks
+        if: hashFiles('scripts/pi-visual-browser-qa.ts') != ''
+        run: CHROME_PATH="$(command -v google-chrome)" bun scripts/pi-visual-browser-qa.ts
+      - run: bun run test:unit
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pi-visual-browser-evidence
+          path: evidence/pi-visual
+          retention-days: 7
+          if-no-files-found: ignore
