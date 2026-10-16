@@ -1,7 +1,8 @@
 ### Removed
 
 - Superseded Ubuntu 26.04 guacd installers: keep only `install-guacd-h264-ubuntu26.04-v3.sh`
-  (Revision 4, including recovery mode) and its non-installing `.check.sh` validation companion.
+  (the latest revision, including recovery mode) and its non-installing `.check.sh` validation
+  companion.
 
 ### Maintenance
 

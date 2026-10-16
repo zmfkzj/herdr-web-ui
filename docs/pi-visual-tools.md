@@ -76,13 +76,31 @@ Prerequisites on the machine running Pi and this web backend:
 guacd -f -b 127.0.0.1 -l 4822
 ```
 
-On Ubuntu 26.04, the retained installer is
-`bash install-guacd-h264-ubuntu26.04-v3.sh` (**Revision 4** in its header, despite the filename).
-It includes the glibc 2.43 fixes and a real AVC420 decoder probe. If a previous run installed
-FreeRDP but stopped before guacd, use the same script with `--resume [BUILD_DIRECTORY]`.
-The older unversioned and `-resume.sh` installers were removed; recovery is already in the latest
-script. `install-guacd-h264-ubuntu26.04-v3.check.sh` remains: it validates that installer without
-running its installation flow, and is not another installer. Neither script is run automatically.
+On **Ubuntu 24.04 LTS or 26.04 LTS** (point releases included), the retained installer is
+`install-guacd-h264-ubuntu26.04-v3.sh`. The filename is kept for existing callers; its header says
+**Revision 5**, and it builds the same private FreeRDP 3.32.2 and guacd 1.6.0 into
+`/opt/herdr-guacd` on both releases, with the glibc 2.43 fixes and a real AVC420 decoder probe.
+Run it as your normal user: it asks for sudo for apt and for `/opt/herdr-guacd`. It needs the
+`universe` component (ninja-build and the FFmpeg `-dev` packages) and HTTPS access to GitHub and
+downloads.apache.org.
+
+```sh
+bash install-guacd-h264-ubuntu26.04-v3.sh                          # new install
+bash install-guacd-h264-ubuntu26.04-v3.sh --resume [BUILD_DIRECTORY]  # FreeRDP installed, guacd not
+bash install-guacd-h264-ubuntu26.04-v3.check.sh [--build]           # checks; installs nothing
+```
+
+Other Ubuntu releases and derivatives such as Linux Mint are refused before anything changes.
+`--resume` runs no apt. It reuses a cached build directory and `/opt/herdr-guacd` only when both
+were built for this release and architecture (recorded in the build directory's
+`herdr-build-target` and in `/opt/herdr-guacd/share/herdr-guacd/build-target`) and the FreeRDP
+build used the same GCC major version. Unrecorded ones from the earlier 26.04-only revision remain
+usable on Ubuntu 26.04 after the same library and AVC420 decode checks. After a release upgrade,
+move `/opt/herdr-guacd` away and install again. The older unversioned and `-resume.sh` installers
+were removed; recovery is in this script. The `.check.sh` companion is not another installer: it
+checks release detection, apt candidates, resume compatibility, the source fixes and the decoder,
+and with `--build` compiles guacd with `-Werror` in a temporary directory, without running the
+installation flow. Neither script is run automatically.
 
 Images inside the Pi **terminal** use Kitty graphics, not guacd. herdr drops them from the attach
 stream; with the pi images extension's markers the browser draws tool-result images inline itself

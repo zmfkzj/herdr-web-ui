@@ -5,8 +5,12 @@
 # Private FreeRDP/guacd libraries are installed only under /opt/herdr-guacd.
 # apt may install/update distribution dependencies; Herdr/Pi files, services,
 # firewall rules, and system dynamic-loader configuration are not changed.
-# Target: Ubuntu 26.04 (resolute, glibc 2.43, GCC 15). Not end-to-end tested
-# against a real KRDP session.
+# Targets: Ubuntu 24.04 LTS (noble: glibc 2.39, GCC 13, CMake 3.28, FFmpeg 6.1)
+# and Ubuntu 26.04 LTS (resolute: glibc 2.43, GCC 15, CMake 4.2, FFmpeg 8.0),
+# including their point releases. Both use the same package names and the same
+# FreeRDP / guacd sources, options and fixes. The filename still says 26.04 so
+# that existing callers keep working. Not end-to-end tested against a real KRDP
+# session.
 #
 # Where H.264 is used: the RDP server (KRDP) encodes the desktop as H.264
 # (RDP Graphics Pipeline, AVC420). guacd decodes it through FreeRDP + FFmpeg
@@ -14,6 +18,17 @@
 # never receives H.264. KRDP closes a session whose client does not advertise
 # AVC420, and upstream guacd 1.6.0 does not advertise it, hence the local
 # settings.c edit below. Do not set the RDP connection parameter disable-gfx.
+#
+# Revision 5 (Ubuntu 24.04 and 26.04):
+# - Accepts Ubuntu 24.04 and 26.04 (ID=ubuntu, VERSION_ID and codename
+#   checked) and explains every other system before anything is changed.
+# - Checks that every apt dependency has a candidate (universe) before apt
+#   installs anything.
+# - Records the build target (ubuntu-VERSION-ARCH) in new build directories
+#   and in the prefix. --resume refuses a build directory or prefix made for
+#   another release or architecture, or a FreeRDP build configured by another
+#   GCC major version. Unrecorded artifacts of the earlier 26.04-only revision
+#   remain usable on Ubuntu 26.04 after the same checks.
 #
 # Revision 4 (fixes the failures of revision 3 on Ubuntu 26.04):
 # - Backports upstream fixes that 1.6.0 lacks and that -Werror turns into
@@ -31,7 +46,7 @@
 # https://github.com/apache/guacamole-server/commit/2e2a33621d673345e7b9d22c9388be80c6d77598
 # https://github.com/FreeRDP/FreeRDP/releases/tag/3.32.2
 # https://github.com/FreeRDP/FreeRDP/blob/3.32.2/channels/rdpgfx/client/rdpgfx_main.c
-# Non-destructive checks: install-guacd-h264-ubuntu26.04-v3.check.sh
+# Non-destructive checks: install-guacd-h264-ubuntu26.04-v3.check.sh [--build]
 set -Eeuo pipefail
 export LC_ALL=C
 umask 022
@@ -40,9 +55,12 @@ trap 'printf "Build failed at line %s. Build directory: %s\n" "$LINENO" "${work:
 usage() {
     printf '%s\n' \
         'Usage: bash install-guacd-h264-ubuntu26.04-v3.sh [--resume [BUILD_DIRECTORY]]' \
+        'Supported: Ubuntu 24.04 LTS and 26.04 LTS (and their point releases), with universe.' \
+        'Run as your normal user; sudo is requested for apt and for installing into /opt/herdr-guacd.' \
         'No arguments: install a new private FreeRDP / guacd stack.' \
         '--resume: reuse installed FreeRDP and finish guacd; no apt or FreeRDP rebuild.' \
         '  Use it after a run that installed FreeRDP but failed before guacd was installed.' \
+        '  The build directory and FreeRDP must have been built for this Ubuntu release.' \
         'An omitted BUILD_DIRECTORY is allowed only if exactly one matching cached build exists.' \
         'BUILD_JOBS controls build parallelism (default: 4).' \
         'Nothing is deleted. No Herdr/Pi files, services, or firewall rules are changed.'
@@ -51,6 +69,169 @@ usage() {
 # BEGIN testable functions (loaded by install-guacd-h264-ubuntu26.04-v3.check.sh)
 guacamole_url='https://downloads.apache.org/guacamole/1.6.0/source/guacamole-server-1.6.0.tar.gz'
 guacamole_sha256=8bc45675da96d7b6f39728160181e3d4ff3c08f460f6d26de5805b642bf13f2b
+
+# One list for both releases: 24.04 and 26.04 use the same package names. The
+# FFmpeg development packages and ninja-build are in the universe component.
+# libicu-dev: WinPR's Unicode conversion (FreeRDP default WITH_UNICODE_BUILTIN=OFF)
+# needs ICU; without it FreeRDP's CMake step fails on a fresh system.
+build_packages=(
+    build-essential cmake ninja-build pkg-config libtool-bin patch curl ca-certificates python3
+    libcairo2-dev libjpeg-turbo8-dev libpng-dev uuid-dev libssl-dev zlib1g-dev
+    libwebp-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev
+    libavformat-dev libxkbcommon-dev libicu-dev
+)
+# Build-target records (target=ubuntu-VERSION-ARCH), compared by --resume.
+build_target_record=herdr-build-target                  # in each new build directory
+prefix_target_record=share/herdr-guacd/build-target      # relative to $prefix
+
+# Read os-release (default /etc/os-release) and set target_pretty and
+# build_target (ubuntu-VERSION-ARCH). Point releases keep VERSION_ID 24.04 /
+# 26.04. $2 overrides the dpkg architecture (tests only).
+detect_target_release() {
+    local file=${1:-/etc/os-release} arch=${2:-} id version codename pretty expected
+    local -a fields=()
+    if [[ ! -f $file || ! -r $file ]]; then
+        printf 'Cannot read %s. This installer supports native Ubuntu 24.04 LTS and 26.04 LTS only.\n' "$file" >&2
+        return 1
+    fi
+    # os-release is a list of shell assignments; read it in a subshell only.
+    mapfile -t fields < <(
+        trap - ERR; set +eu
+        # shellcheck source=/dev/null
+        . "$file" > /dev/null 2>&1
+        printf '%s\n' "${ID-}" "${VERSION_ID-}" "${VERSION_CODENAME-}" "${PRETTY_NAME-}")
+    id=${fields[0]-} version=${fields[1]-} codename=${fields[2]-} pretty=${fields[3]-}
+    case $version in
+        24.04) expected=noble ;;
+        26.04) expected=resolute ;;
+        *) expected= ;;
+    esac
+    if [[ $id != ubuntu ]]; then
+        printf 'Unsupported system: %s (ID=%s). Supported: native Ubuntu 24.04 LTS and 26.04 LTS;\n' \
+            "${pretty:-unknown}" "${id:-missing}" >&2
+        echo 'Ubuntu derivatives and other distributions are not supported. Nothing was modified.' >&2
+        return 1
+    fi
+    if [[ -z $expected ]]; then
+        printf 'Unsupported Ubuntu release: %s (VERSION_ID=%s). Supported: 24.04 LTS (noble) and\n' \
+            "${pretty:-unknown}" "${version:-missing}" >&2
+        echo '26.04 LTS (resolute), including their point releases. Nothing was modified.' >&2
+        return 1
+    fi
+    if [[ $codename != "$expected" ]]; then
+        printf 'Inconsistent %s: VERSION_ID=%s requires VERSION_CODENAME=%s, found %s. Nothing was modified.\n' \
+            "$file" "$version" "$expected" "${codename:-nothing}" >&2
+        return 1
+    fi
+    [[ -n $arch ]] || arch=$(dpkg --print-architecture 2> /dev/null) || arch=
+    if [[ ! $arch =~ ^[a-z0-9]+$ ]]; then
+        echo 'Cannot determine the dpkg architecture (dpkg --print-architecture). Nothing was modified.' >&2
+        return 1
+    fi
+    target_pretty=${pretty:-Ubuntu $version}
+    build_target=ubuntu-$version-$arch
+    printf 'Target system: %s (%s, %s); build target %s\n' "$target_pretty" "$codename" "$arch" "$build_target"
+}
+
+# After apt-get update: fail before installing anything when a dependency has
+# no candidate, usually because the universe component is disabled.
+check_package_candidates() {
+    local pkg candidate
+    local -a missing=()
+    for pkg in "${build_packages[@]}"; do
+        candidate=$(apt-cache policy "$pkg" 2> /dev/null \
+            | sed -n 's/^[[:space:]]*Candidate:[[:space:]]*//p' | head -n 1) || candidate=
+        [[ -n $candidate && $candidate != '(none)' ]] || missing+=("$pkg")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf 'No apt installation candidate on %s for: %s\n' "${target_pretty:-this system}" "${missing[*]}" >&2
+        echo 'ninja-build and the FFmpeg -dev packages are in the universe component. Enable it' >&2
+        echo '(sudo add-apt-repository universe && sudo apt-get update) and rerun. Nothing was installed.' >&2
+        return 1
+    fi
+    printf 'All %s build dependencies have an apt candidate.\n' "${#build_packages[@]}"
+}
+
+write_build_target_record() {  # $1 = file to create
+    printf '%s\n' \
+        '# Written by install-guacd-h264-ubuntu26.04-v3.sh; --resume compares target=.' \
+        "target=$build_target" "os=$target_pretty" 'freerdp=3.32.2' 'guacamole-server=1.6.0' > "$1"
+}
+
+read_build_target_record() {  # $1 = record file; prints its target
+    local -a targets=()
+    mapfile -t targets < <(sed -n 's/^target=//p' "$1")
+    if [[ ${#targets[@]} -ne 1 || ! ${targets[0]} =~ ^ubuntu-[0-9]{2}\.[0-9]{2}-[a-z0-9]+$ ]]; then
+        printf 'Unreadable build-target record: %s\n' "$1" >&2
+        return 1
+    fi
+    printf '%s\n' "${targets[0]}"
+}
+
+# GCC major version that configured the FreeRDP build in build directory $1.
+cached_compiler_major() {
+    local file version
+    local -A majors=()
+    for file in "$1"/freerdp-build/CMakeFiles/*/CMakeCCompiler.cmake; do
+        [[ -f $file ]] || continue
+        version=$(sed -n 's/^set(CMAKE_C_COMPILER_VERSION "\([0-9][0-9.]*\)")$/\1/p' "$file")
+        if [[ -n $version ]]; then majors[${version%%.*}]=1; fi
+    done
+    if [[ ${#majors[@]} -ne 1 ]]; then
+        printf 'Cannot tell which GCC configured the FreeRDP build in %s.\n' "$1" >&2
+        return 1
+    fi
+    printf '%s\n' "${!majors[@]}"
+}
+
+# Is cached build directory $1 usable for $build_target with GCC $host_gcc_major?
+# Unrecorded directories come from the earlier Ubuntu 26.04-only revision.
+check_build_dir_target() {
+    local dir=$1 recorded compiler origin
+    if [[ -f $dir/$build_target_record ]]; then
+        recorded=$(read_build_target_record "$dir/$build_target_record") || return 1
+        if [[ $recorded != "$build_target" ]]; then
+            printf 'Build directory %s was created for %s; this system is %s.\n' \
+                "$dir" "$recorded" "$build_target" >&2
+            return 1
+        fi
+        origin="recorded target $recorded"
+    elif [[ $build_target == ubuntu-26.04-* ]]; then
+        origin='no target record: earlier Ubuntu 26.04-only revision'
+    else
+        printf 'Build directory %s has no build-target record: the earlier installer made it on\n' "$dir" >&2
+        printf 'Ubuntu 26.04 only, so it cannot be reused on %s.\n' "$build_target" >&2
+        return 1
+    fi
+    compiler=$(cached_compiler_major "$dir") || return 1
+    if [[ $compiler != "$host_gcc_major" ]]; then
+        printf 'FreeRDP in %s was configured by GCC %s; /usr/bin/gcc is GCC %s.\n' \
+            "$dir" "$compiler" "${host_gcc_major:-unknown}" >&2
+        return 1
+    fi
+    printf 'Build directory target: OK (%s, GCC %s).\n' "$origin" "$compiler"
+}
+
+# Is the FreeRDP installed in $prefix recorded for $build_target? Unrecorded
+# prefixes come from the earlier Ubuntu 26.04-only revision; the pkg-config,
+# runtime-library and AVC420 decode checks that follow still apply to them.
+check_prefix_target() {
+    local record=$prefix/$prefix_target_record recorded
+    if [[ -f $record ]]; then
+        recorded=$(read_build_target_record "$record") || return 1
+        if [[ $recorded != "$build_target" ]]; then
+            printf '%s was built for %s; this system is %s.\n' "$prefix" "$recorded" "$build_target" >&2
+            return 1
+        fi
+        printf 'Installed FreeRDP target: OK (recorded target %s).\n' "$recorded"
+    elif [[ $build_target == ubuntu-26.04-* ]]; then
+        printf 'Installed FreeRDP target: no record (earlier Ubuntu 26.04-only revision); checked below.\n'
+    else
+        printf '%s has no build-target record: the earlier installer built it on Ubuntu 26.04 only,\n' "$prefix" >&2
+        printf 'so it cannot be reused on %s.\n' "$build_target" >&2
+        return 1
+    fi
+}
 
 verify_private_freerdp() {
     local expected_root expected_pc expected_lib pc actual_pc raw_prefix raw_lib
@@ -90,7 +271,7 @@ verify_private_freerdp() {
 }
 
 select_resume_work() {
-    local candidate selected actual_source saved_source saved_prefix
+    local candidate selected actual_source saved_source saved_prefix reason
     local -a candidates=()
     if [[ -n $resume_dir ]]; then
         candidates=("$resume_dir")
@@ -102,6 +283,11 @@ select_resume_work() {
                && -f $candidate/guacamole/src/protocols/rdp/settings.c ]] || continue
             saved_prefix=$(sed -n 's/^CMAKE_INSTALL_PREFIX:PATH=//p' "$candidate/freerdp-build/CMakeCache.txt")
             [[ $saved_prefix == "$prefix" ]] || continue
+            if ! reason=$(check_build_dir_target "$candidate" 2>&1 > /dev/null); then
+                printf 'Skipping incompatible cached build %s:\n' "$candidate" >&2
+                printf '%s\n' "$reason" | sed 's/^/  /' >&2
+                continue
+            fi
             candidates+=("$candidate")
         done
     fi
@@ -128,6 +314,10 @@ select_resume_work() {
         echo 'CMake cache does not match this install/source directory; nothing was modified.' >&2
         return 1
     fi
+    check_build_dir_target "$selected" || {
+        echo 'This cached build cannot be resumed on this system; nothing was modified.' >&2
+        return 1
+    }
     work=$selected
 }
 
@@ -725,19 +915,17 @@ if [[ $EUID -eq 0 ]]; then
     echo 'Run as your normal user; this script requests sudo when needed.' >&2
     exit 1
 fi
-source /etc/os-release
-if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 26.04 ]]; then
-    echo 'This script targets native Ubuntu 26.04 only.' >&2
-    exit 1
-fi
+detect_target_release || exit 1
 prefix=/opt/herdr-guacd
 if [[ $mode == install && ( -e $prefix || -L $prefix ) ]]; then
     echo "$prefix already exists; nothing was overwritten." >&2
     if [[ -e $prefix/sbin/guacd ]]; then
         echo 'guacd is already installed there. Move /opt/herdr-guacd away to reinstall.' >&2
-    else
+    elif check_prefix_target > /dev/null; then
         echo 'If an earlier run installed FreeRDP but failed before guacd, run:' >&2
         echo '  bash install-guacd-h264-ubuntu26.04-v3.sh --resume' >&2
+    else
+        echo 'It cannot be resumed on this system. Move /opt/herdr-guacd away and rerun.' >&2
     fi
     exit 1
 fi
@@ -749,6 +937,17 @@ if [[ $mode == resume && -e $prefix/sbin/guacd ]]; then
     echo "$prefix/sbin/guacd already exists; refusing to overwrite it in recovery mode." >&2
     echo 'This recovery is for a failure before guacd was installed.' >&2
     exit 1
+fi
+if [[ $mode == resume ]]; then
+    check_prefix_target || {
+        echo "Nothing was modified. Move $prefix away and run a fresh install." >&2
+        exit 1
+    }
+    if ! host_gcc_major=$(/usr/bin/gcc -dumpfullversion 2> /dev/null); then
+        echo '/usr/bin/gcc is missing. --resume does not run apt; run a fresh install instead.' >&2
+        exit 1
+    fi
+    host_gcc_major=${host_gcc_major%%.*}
 fi
 jobs=${BUILD_JOBS:-4}
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo 'BUILD_JOBS must be a positive integer.' >&2; exit 1; }
@@ -765,21 +964,19 @@ if [[ $mode == resume ]]; then
 else
     sudo -v
     sudo apt-get update
-    sudo apt-get install -y --no-remove --no-install-recommends \
-        build-essential cmake ninja-build pkg-config libtool-bin patch curl ca-certificates python3 \
-        libcairo2-dev libjpeg-turbo8-dev libpng-dev uuid-dev libssl-dev zlib1g-dev \
-        libwebp-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
-        libavformat-dev libxkbcommon-dev
+    check_package_candidates || exit 1
+    sudo apt-get install -y --no-remove --no-install-recommends "${build_packages[@]}"
 
     # Fail early when an expected development library is unavailable. The FFmpeg
     # development packages are in Ubuntu's universe component; no foreign PPA is used.
-    for pc in libavcodec libavutil libswscale openssl xkbcommon; do
+    for pc in libavcodec libavutil libswscale openssl xkbcommon icu-uc icu-io icu-i18n; do
         pkg-config --exists "$pc" || { echo "Missing pkg-config module: $pc" >&2; exit 1; }
     done
 
     mkdir -p "$HOME/.cache/herdr-guacd"
     work=$(mktemp -d "$HOME/.cache/herdr-guacd/build.XXXXXX")
     cd "$work"
+    write_build_target_record "$work/$build_target_record"
     printf 'Sources and logs: %s\nInstall prefix: %s\n' "$work" "$prefix"
 
     fetch() {
@@ -818,6 +1015,8 @@ else
         -DWITH_FREERDP_DEPRECATED=ON -DWITHOUT_FREERDP_3x_DEPRECATED=OFF \
         2>&1 | tee freerdp-configure.log
     cmake --build freerdp-build --parallel "$jobs" 2>&1 | tee freerdp-build.log
+    # Record the target first: every prefix this revision creates carries it.
+    sudo install -D -m 0644 -- "$work/$build_target_record" "$prefix/$prefix_target_record"
     sudo cmake --install freerdp-build 2>&1 | tee freerdp-install.log
 
 fi
@@ -825,6 +1024,14 @@ fi
 export LD_LIBRARY_PATH="$prefix/lib"
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
 verify_private_freerdp
+# FreeRDP built for another release fails here (e.g. a missing FFmpeg soname or
+# glibc symbol version), before any guacd source is touched.
+if ! env -u LD_LIBRARY_PATH ldd "$prefix/lib/libfreerdp3.so" > "$work/freerdp-libraries.log" 2>&1 \
+    || grep -q 'not found' "$work/freerdp-libraries.log"; then
+    grep 'not found' "$work/freerdp-libraries.log" >&2 || cat "$work/freerdp-libraries.log" >&2
+    echo "The private FreeRDP in $prefix cannot load on $build_target. Nothing was installed." >&2
+    exit 1
+fi
 probe_h264_decoder "$prefix/lib/libfreerdp3.so"
 
 apply_guacamole_source_fixes
@@ -854,7 +1061,7 @@ for lib in libfreerdp3.so.3 libfreerdp-client3.so.3 libwinpr3.so.3; do
     fi
 done
 env -u LD_LIBRARY_PATH "$prefix/sbin/guacd" -v
-printf '\nInstalled. No service was started.\n'
+printf '\nInstalled for %s. No service was started.\n' "$build_target"
 printf 'Start as a normal user:\n%s/sbin/guacd -f -b 127.0.0.1 -l 4822 -L info\n' "$prefix"
 printf 'Sources and logs remain in: %s\n' "$work"
 printf 'H.264 is decoded inside guacd; browsers receive image updates, not H.264.\n'
