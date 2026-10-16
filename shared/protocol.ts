@@ -1222,6 +1222,10 @@ export type ServerMessage =
   | { type: "watch-end"; pane_id: string }
   /** the answer to a `ping`, with its id; only this frame, for a ping in flight, ends the client's liveness probe */
   | { type: "pong"; id: number }
+  /** Pi in this pane ran `/gui view <worker>` right after an Enter this connection delivered there
+   * (pi-gui's gui.log said so: server/pi-visual/runs.ts); that desktop opens in this browser.
+   * Sent only to that connection; an older client ignores it. */
+  | { type: "gui-view"; pane_id: string; worker: string }
   /** `pane_id` names the pane an error is about, when it is about one (`attach_held`) */
   | { type: "error"; code: string; message: string; pane_id?: string };
 

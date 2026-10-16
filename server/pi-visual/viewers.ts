@@ -124,7 +124,7 @@ export const procViewerSystem: ViewerSystem = {
 export interface ViewerSecret extends PiGuiViewer { password: string; piStartedAt: number }
 
 /** pi-gui's agent dir for that Pi process: its own PI_CODING_AGENT_DIR, else its HOME's ~/.pi/agent. */
-function agentDirOf(env: Record<string, string> | undefined): string {
+export function agentDirOf(env: Record<string, string> | undefined): string {
   const home = env?.["HOME"] || homedir();
   const dir = env?.["PI_CODING_AGENT_DIR"];
   if (dir) return dir === "~" ? home : dir.startsWith("~/") ? join(home, dir.slice(2)) : dir;

@@ -1,6 +1,6 @@
 import type { ClientMessage, ClientRole, PendingMessage, ServerFeature, ServerMessage } from "../../shared/protocol.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../../shared/terminal-flow.ts";
-import { TypedLine, type TypedGuiView } from "../../shared/pi-visual.ts";
+import { GUI_VIEW_NAME, TypedLine, type TypedGuiView } from "../../shared/pi-visual.ts";
 
 type Handler = (message: ServerMessage) => void;
 
@@ -353,6 +353,10 @@ export class HerdrSocket {
         if (this.attached.has(message.pane_id)) this.inputReady.add(message.pane_id);
       }
       if ((message.type === "input-ready" && message.ready === false) || message.type === "pty-exit" || (message.type === "error" && message.pane_id && ["attach_held", "input_not_ready"].includes(message.code))) { this.inputReady.delete(message.pane_id!); this.typedLines.delete(message.pane_id!); }
+      // Pi ran `/gui view <worker>` right after an Enter of this connection, however it was typed
+      if (message.type === "gui-view" && typeof message.pane_id === "string" && typeof message.worker === "string" && GUI_VIEW_NAME.test(message.worker)) {
+        for (const listener of this.guiViewListeners) listener(message.pane_id, { worker: message.worker, completing: false, confirmed: true });
+      }
       if (message.type === "submit-result" && this.matchesRequest(message.id, "submit", message.pane_id)) {
         this.resolveRequest(message.id, message.ok ? { ok: true, ...(message.pending ? { pending: message.pending } : {}) }
           : { ok: false, code: message.code ?? "submit_failed", message: message.message ?? "the pane did not take the message", ...(message.draft ? { draft: message.draft } : {}),

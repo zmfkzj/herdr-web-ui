@@ -220,10 +220,16 @@ observe-only by default, without asking for the password pi-gui printed.
   Press Esc before Enter, or send the command from the message box.
 - **What counts as the command.** The server that passed the keys on follows the line typed into
   that pane (printable keys, Backspace, Delete, ←, →, Home, End, one-line pastes; Ctrl+C or Ctrl+U at
-  the end of the line empties it; mouse and focus reports change nothing). A key it cannot follow
-  (↑/↓ history or completion choice, Tab, word motions, a modified Enter, a multi-line paste) makes
-  that line's Enter open nothing. Output on the screen, `gui.log` and text such as
-  `echo /gui view W1` never count.
+  the end of the line empties it; mouse and focus reports change nothing); the desktop then opens at
+  once. A key it cannot follow (↑/↓ history or completion choice, Tab, word motions, a modified
+  Enter, a multi-line paste) leaves the line unnamed, and so does a chat message that waited for Pi
+  to finish its turn. Then Pi's own word counts: after an Enter this browser delivered to an
+  original Pi pane (typed, a chat message, **Send now**, a held message sent on its turn), the PC
+  watches that pane's Pi processes' `gui.log` for up to 10 s for the line pi-gui writes for every
+  `/gui view` it answers (`view W1: client not opened (…)`, `opened …`, `could not open a client`),
+  and the desktop it names opens in the browser whose Enter came last before it
+  (`server/pi-visual/runs.ts`, the `gui-view` frame). Output on the screen and text such as
+  `echo /gui view W1` never count, and a `gui.log` line counts only after this browser's own Enter.
 - **Who may open it.** Only the browser that ran the command, on that PC's pane and through the same
   bridge connection, once, within 2 minutes (`server/pi-visual/grants.ts`). Typing the pane did not
   take (observe mode, a held or unready terminal, a refused submit) grants nothing, and a revoked

@@ -140,8 +140,12 @@ export function completionConflict(name: string, names: Iterable<string>): strin
   return null;
 }
 
-/** A `/gui view` an Enter submitted; `completing`: Pi's completion list may have been open then. */
-export interface TypedGuiView { worker: string | null; completing: boolean }
+/**
+ * A `/gui view` an Enter submitted; `completing`: Pi's completion list may have been open then.
+ * `confirmed`: Pi's own log names the desktop it opened for an Enter from this browser (the server's
+ * `gui-view` frame, server/pi-visual/runs.ts), so no completion can have taken another name.
+ */
+export interface TypedGuiView { worker: string | null; completing: boolean; confirmed?: boolean }
 const MOVES: Record<string, "left" | "right" | "home" | "end" | "delete"> = {
   "\x1b[D": "left", "\x1bOD": "left", "\x1b[C": "right", "\x1bOC": "right",
   "\x1b[H": "home", "\x1bOH": "home", "\x1b[1~": "home", "\x1b[7~": "home",

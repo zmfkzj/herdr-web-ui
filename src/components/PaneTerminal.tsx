@@ -327,10 +327,16 @@ export function PaneTerminal({
   // `/gui view <worker>` this browser just ran in an original Pi pane, typed into its terminal or sent
   // from a message box: that worker's desktop opens here at once (components/pi-visual/DesktopViewer.tsx),
   // on the PC this pane belongs to. `completing`: Pi's completion list may have taken another name.
+  // The server also says which desktop Pi itself opened after an Enter from here (`confirmed`): a line
+  // recalled from Pi's history or finished with Tab opens that way. A desktop already open for that
+  // name stays as it is; another name is the one Pi opened.
   const [guiView, setGuiView] = useState<{ pane: string; worker: string | null; completing: boolean; serial: number } | null>(null);
   const agentRef = useRef(agent); agentRef.current = agent;
   const openGuiViewRef = useRef((pane: string, view: TypedGuiView) => {
-    if (agentRef.current === "pi") setGuiView({ pane, worker: view.worker, completing: view.completing, serial: Date.now() });
+    if (agentRef.current !== "pi") return;
+    setGuiView((open) => view.confirmed && open !== null && open.pane === pane
+      && (open.worker === null || open.worker.toLowerCase() === view.worker?.toLowerCase())
+      ? open : { pane, worker: view.worker, completing: view.completing, serial: Date.now() });
   });
   const openGuiView = useCallback((pane: string, text: string) => {
     const command = guiViewCommand(text);

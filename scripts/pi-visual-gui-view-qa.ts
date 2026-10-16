@@ -96,13 +96,23 @@ try {
   process.env["HERDR_PI_GUACD_ENABLED"] = "1";
   const bin = join(root, "bin"); mkdirSync(bin);
   const fakePi = join(bin, "pi");
-  // a stand-in Pi: herdr takes it for one by its name; it echoes each line it is given
-  writeFileSync(fakePi, "#!/bin/sh\nprintf 'fixture pi ready\\n'\nwhile IFS= read -r line; do printf 'pi got: %s\\n' \"$line\"; done\n");
+  // a stand-in Pi: herdr takes it for one by its name; it echoes each line it is given, and writes
+  // pi-gui's line for a `/gui view <name>` it answers to its own agent dir's gui.log (pi-gui
+  // src/viewer.ts `connect`), arrow keys left in the line by its tty taken out
+  const agentDir = join(root, "agent"); mkdirSync(agentDir);
+  writeFileSync(fakePi, [
+    "#!/bin/sh", "printf 'fixture pi ready\\n'",
+    "while IFS= read -r line; do",
+    "  printf 'pi got: %s\\n' \"$line\"",
+    "  clean=$(printf '%s' \"$line\" | sed 's/\\x1b\\[[0-9;]*[A-Za-z]//g')",
+    "  case \"$clean\" in \"/gui view \"*) printf '%s [gui] main pid=%s view %s: client not opened (fixture)\\n' \"$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)\" \"$$\" \"${clean#/gui view }\" >> \"$PI_CODING_AGENT_DIR/gui.log\";; esac",
+    "done", "",
+  ].join("\n"));
   chmodSync(fakePi, 0o755);
   const created = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-gui-view" });
   workspaceId = created.workspace.workspace_id;
   const paneId = created.root_pane.pane_id;
-  await herdrRpc("pane.send_text", { pane_id: paneId, text: `${fakePi}\n` });
+  await herdrRpc("pane.send_text", { pane_id: paneId, text: `PI_CODING_AGENT_DIR=${agentDir} ${fakePi}\n` });
   await until(async () => (await sessionSnapshot()).panes.find((pane) => pane.pane_id === paneId)?.agent === "pi", "the stand-in pi is detected");
   await herdrRpc("pane.report_agent", { pane_id: paneId, source: "herdr:pi", agent: "pi", state: "idle", seq: Date.now() * 1000 });
 
@@ -188,11 +198,30 @@ try {
   await dialog.getByRole("button", { name: "Close" }).click();
   await until(() => localGuacd.sockets.size === 0, "closing ends that guacd connection");
 
+  // 1b. a line whose keys the browser cannot follow (an arrow here; ↑ from Pi's history or Tab from its
+  // completion list alike) names nothing, but Pi's own log says it ran `/gui view W2`: it opens all the same
+  await typeInTerminal("/gui view W2");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await dialog.getByRole("heading", { name: "W2's private desktop" }).waitFor();
+  await dialog.getByText("Connected. Pause the worker before taking control.").waitFor();
+  await until(async () => near(await desktopColour(page), COLORS.localW2), "W2's desktop is painted again");
+  await page.screenshot({ path: join(shots, "1b-local-w2-from-pi-log.png") });
+  assert.equal(localGuacd.connects.length, 2, "Pi's word opened W2 once more");
+  assert.equal(await dialog.getByLabel("One-time viewer password").count(), 0, "no password was asked for");
+  await dialog.getByRole("button", { name: "Close" }).click();
+  await until(() => localGuacd.sockets.size === 0, "closing ends that guacd connection");
+  // the command was one: nothing opens again after it closed
+  // fixed wait: proving that no second desktop opens (the server watches Pi's log for 10 s after an Enter)
+  await Bun.sleep(1500);
+  assert.equal(await dialog.count(), 0, "a desktop opened once per command");
+
   // 2. a name no desktop has fails clearly, and opens nothing else
   await typeInTerminal("/gui view W9");
   await page.keyboard.press("Enter");
   await dialog.getByRole("alert").filter({ hasText: "No GUI desktop named W9" }).waitFor({ timeout: 20_000 });
-  assert.equal(localGuacd.connects.length, 1, "no other desktop was opened for W9");
+  assert.equal(localGuacd.connects.length, 2, "no other desktop was opened for W9");
   await page.screenshot({ path: join(shots, "2-local-unknown.png") });
   await dialog.getByRole("button", { name: "Close" }).click();
 
@@ -215,7 +244,7 @@ try {
   await until(async () => near(await desktopColour(page), COLORS.remote), "the remote PC's desktop is painted");
   await page.screenshot({ path: join(shots, "4-remote-w1.png") });
   assert.deepEqual(remoteGuacd.connects.map((row) => row.slice(2, 6)), [["127.0.0.1", "3391", "pi", "remote-secret"]], "the remote PC's guacd connected its W1 with its password");
-  assert.equal(localGuacd.connects.length, 1, "this PC's W1 was not opened for the remote W1");
+  assert.equal(localGuacd.connects.length, 2, "this PC's W1 was not opened for the remote W1");
   const machines = ((await (await api("/api/machines")).json()) as { machines: Machine[] }).machines;
   assert.equal(machines.find((machine) => machine.id === remoteId)?.pi_desktop, true, "the choice is recorded for that PC");
   // the PC's SSH link drops: its desktop ends with it

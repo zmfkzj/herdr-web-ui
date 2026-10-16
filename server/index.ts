@@ -1,6 +1,8 @@
 import { PiVisualService, visualResponse, type VisualDependencies } from "./pi-visual/service.ts";
 import { desktopBinding, type DesktopTunnel, type DesktopWebSocket } from "./pi-visual/guacamole.ts";
 import { GuiViewGrants, GuiViewTyping, RelayedGuiViews } from "./pi-visual/grants.ts";
+import { GuiViewRuns } from "./pi-visual/runs.ts";
+import type { ViewerSystem } from "./pi-visual/viewers.ts";
 import { RemoteDesktops } from "./pi-visual/relay.ts";
 import { VisualError } from "./pi-visual/identity.ts";
 import { readHerdrProfiles, type HerdrMachineProfile } from "./herdr-profiles.ts";
@@ -520,6 +522,8 @@ export function createServer(
     sidecar?: boolean;
     /** the Pi visual tools' guacd port and Pi lookups; tests point them at fixtures, never at the PC's own guacd */
     piVisual?: Partial<VisualDependencies>;
+    /** the processes and gui.log reads that confirm a `/gui view` Pi ran after an Enter (server/pi-visual/runs.ts); tests give fixtures */
+    guiViewRunSystem?: ViewerSystem;
   } = {},
 ): ServerInstance {
   const attachments = new Map<string, PaneAttachment>();
@@ -1048,6 +1052,8 @@ export function createServer(
       automatic, arrivedAt, (working, restarting) => pending.committing(item, working, restarting), interruptWorkingCodex);
     pending.settle(item, reply.ok ? undefined : { code: reply.code!, message: reply.message! }, reply.code === "submit_changed",
       automatic && ["pending_wait", "agent_blocked"].includes(reply.code ?? ""));
+    // a waiting message typed now (sent on its turn, or by Send now): Pi may run a `/gui view` in it
+    if (reply.ok) guiViewEntered(item.owner, item.paneId, arrivedAt);
     return reply;
   }
   function drainPending(paneId: string): void {
@@ -1224,6 +1230,23 @@ export function createServer(
   const guiOrigin = (client: ServerWebSocket<SocketData>) => client.data.binding && !client.data.readOnly && client.data.mode === "interact" && !client.data.revoked
     ? { binding: client.data.binding, ...(client.data.deviceId ? { deviceId: client.data.deviceId } : {}), machine: "local" } : null;
   const typingOf = (client: ServerWebSocket<SocketData>) => client.data.guiTyping ??= new GuiViewTyping(guiViewGrants, () => guiOrigin(client));
+  /**
+   * `/gui view` that this pane's Pi logged right after a connection's Enter (server/pi-visual/runs.ts):
+   * the connection gets that desktop's grant here, if it may open desktops here, and is told which
+   * desktop to open. A bridge's connection server reads the same frame for its own browser (grants.ts).
+   */
+  const guiViewRuns = new GuiViewRuns<Client>(async (paneId) => (await paneContext(paneId)).agent === "pi", (client, paneId, worker, enteredAt) => {
+    if (!clients.has(client) || client.data.closing || client.data.mode !== "interact") return;
+    // a browser here: told only when its own keys did not already name that command (it opened the
+    // desktop itself then). A connection server relaying for its browser has no grant here: it decides.
+    const origin = guiOrigin(client);
+    if (origin && !guiViewGrants.confirm(origin, paneId, worker, enteredAt - 1000)) return;
+    send(client, { type: "gui-view", pane_id: paneId, worker });
+  }, options.guiViewRunSystem);
+  /** an Enter a connection delivered to a pane, arrived at `at`: watched only while desktop viewing is on */
+  const guiViewEntered = (client: Client, paneId: string, at: number) => {
+    if (process.env["HERDR_PI_GUACD_ENABLED"] === "1" && client.data.mode === "interact") guiViewRuns.entered(client, paneId, at);
+  };
   /** other PCs' private desktops, through their bridges (server/pi-visual/relay.ts) */
   const remoteDesktops = machines ? new RemoteDesktops(machines, guiViewGrants) : null;
 
@@ -3182,6 +3205,12 @@ export function createServer(
               // the pty holds a lone ESC ~150ms and a Stop would overtake nothing
               // typing reaches an attached pane only, queued or not
               const attachment = attachments.get(message.pane_id);
+              // an Enter's arrival, before its write: Pi logs what it ran after it (guiViewEntered)
+              const typedAt = Date.now();
+              const typed = (text: string) => {
+                typingOf(client).input(message.pane_id, text);
+                if (text.includes("\r")) guiViewEntered(client, message.pane_id, typedAt);
+              };
               const inputFailed = () => {
                 if (clients.has(client)) send(client, { type: "error", code: "input_failed", message: "Terminal input could not be confirmed. Check the terminal before typing again.", pane_id: message.pane_id });
               };
@@ -3218,7 +3247,7 @@ export function createServer(
                   if (!clients.has(client)) return;
                   authorizeSocket(client);
                   await paneSendText(message.pane_id, shaped, undefined, allowed);
-                  typingOf(client).input(message.pane_id, text);
+                  typed(text);
                   // the echo is read at once, not at the mirror's next idle read
                   attachments.get(message.pane_id)?.mirror?.poke();
                 }).catch(inputFailed);
@@ -3264,11 +3293,11 @@ export function createServer(
                   if (mouse) {
                     if (!allowed() || !pty.write(text)) { inputFailed(); return; }
                     typedIntoPty(text);
-                    typingOf(client).input(message.pane_id, text);
+                    typed(text);
                     return;
                   }
                   await paneSendText(message.pane_id, text, undefined, allowed);
-                  typingOf(client).input(message.pane_id, text);
+                  typed(text);
                   // herdr still holds a lone ESC a moment: a message after the Stop waits out the same
                   // settling gap as after a typed one, and checks again for a question before pasting
                   if (stop) typedIntoPty(text);
@@ -3276,7 +3305,7 @@ export function createServer(
               } else {
                 if (!attachment.pty.write(message.text)) { inputFailed(); break; }
                 typedIntoPty(message.text);
-                typingOf(client).input(message.pane_id, message.text);
+                typed(message.text);
               }
               break;
             }
@@ -3575,10 +3604,12 @@ export function createServer(
                       try { await dispatch(); return { ok: true }; }
                       catch (error) { return { ok: false, ...pendingFault(error) }; }
                     }, message.resend_generation));
+                  if (answer.ok) guiViewEntered(client, message.pane_id, arrivedAt);
                   result(answer.ok, answer.code, answer.message);
                   break;
                 }
                 await serialize(message.pane_id, dispatch);
+                guiViewEntered(client, message.pane_id, arrivedAt);
                 if (message.clear_draft !== undefined || message.send_anyway) draftConfirmations.get(client)?.delete(message.pane_id);
                 // `/gui view <worker>` typed into the pane from this browser: it may open that desktop (grants.ts)
                 const origin = guiOrigin(client);
@@ -3679,6 +3710,7 @@ export function createServer(
         if (client.data.relay) { client.data.relay.close(); return; }
         killWatches(client);
         pending.close(client);
+        guiViewRuns.forget(client);
         clients.delete(client);
         for (const paneId of client.data.attached.keys()) detach(paneId, client);
         client.data.attached.clear();
@@ -3721,6 +3753,7 @@ export function createServer(
       stopped = true;
       settlePortalStartup({ ok: false, error: new Error("Server stopped before Portal startup cleanup completed") });
       piVisual.close();
+      guiViewRuns.close();
       remoteDesktops?.close();
       conversations.stop();
       clearInterval(outputTimer);

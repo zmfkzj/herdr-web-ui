@@ -28,6 +28,23 @@ describe("/gui view grants", () => {
     grants.take(grant);
     expect(grants.find(A, "p1", "W3-2")).toBeUndefined();
   });
+  it("grants what Pi says it ran after an Enter, unless the typed command already granted it", () => {
+    let now = 1000;
+    const grants = new GuiViewGrants(() => now);
+    // typed and read: Pi's word on the same command adds nothing, before or after the open
+    grants.observe(A, "p1", "/gui view W3");
+    expect(grants.confirm(A, "p1", "w3", 900)).toBe(false);
+    grants.take(grants.find(A, "p1", "W3")!);
+    expect(grants.confirm(A, "p1", "W3", 900)).toBe(false);
+    expect(grants.count()).toBe(0);
+    // a later Enter whose keys named nothing (a line recalled from history): Pi's word grants it once
+    now = 5000;
+    expect(grants.confirm(A, "p1", "W3", 4900)).toBe(true);
+    expect(grants.find(A, "p1", "W3")?.at).toBe(5000);
+    // another browser's command is not this one's
+    expect(grants.confirm({ ...A, binding: "browser-b" }, "p1", "W3", 4900)).toBe(true);
+    expect(grants.count()).toBe(2);
+  });
   it("belongs to the bridge connection it was made on: a reconnect leaves it behind", () => {
     const first = {}, second = {};
     const grants = new GuiViewGrants();
@@ -119,10 +136,35 @@ describe("/gui view through a relayed PC socket", () => {
     relayed.server(frame({ type: "submit-result", id: 4, pane_id: "p1", ok: true }));
     expect(grants.find(origin, "p1", "W1")).toBeDefined();
   });
+  it("grants the desktop the PC's Pi says it ran after this connection's Enter, while it may type", () => {
+    const grants = new GuiViewGrants();
+    const origin = { ...A, connection: {} };
+    const relayed = new RelayedGuiViews(grants, origin, false);
+    // a line recalled from Pi's history: its keys name nothing, the PC's Pi says what ran
+    relayed.client(frame({ type: "keys", pane_id: "p1", keys: ["Up"] }));
+    relayed.client(frame({ type: "input", pane_id: "p1", text: "\r" }));
+    expect(grants.count()).toBe(0);
+    expect(relayed.server(frame({ type: "gui-view", pane_id: "p1", worker: "W3" }))).toBe(true);
+    expect(grants.find(origin, "p1", "W3")?.worker).toBe("W3");
+    expect(grants.find(origin, "p2", "W3")).toBeUndefined();
+    // a command its keys named: the browser opened it itself, and is not told again
+    relayed.client(frame({ type: "input", pane_id: "p1", text: "/gui view W5\r" }));
+    expect(relayed.server(frame({ type: "gui-view", pane_id: "p1", worker: "W5" }))).toBe(false);
+    expect(grants.count()).toBe(2);
+    // not a desktop name, or while observing: nothing
+    expect(relayed.server(frame({ type: "gui-view", pane_id: "p1", worker: "../x" }))).toBe(false);
+    relayed.client(frame({ type: "role", mode: "observe" }));
+    expect(relayed.server(frame({ type: "gui-view", pane_id: "p1", worker: "W4" }))).toBe(false);
+    expect(grants.find(origin, "p1", "W4")).toBeUndefined();
+    expect(grants.count()).toBe(2);
+    // every other frame passes
+    expect(relayed.server(frame({ type: "pty-data", pane_id: "p1", data: "x" }))).toBe(true);
+  });
   it("grants nothing for a watch device", () => {
     const grants = new GuiViewGrants();
     const relayed = new RelayedGuiViews(grants, A, true);
     relayed.client(frame({ type: "input", pane_id: "p1", text: "/gui view W1\r" }));
+    relayed.server(frame({ type: "gui-view", pane_id: "p1", worker: "W1" }));
     expect(grants.count()).toBe(0);
   });
 });
