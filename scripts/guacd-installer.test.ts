@@ -68,7 +68,7 @@ describe("retained Ubuntu 24.04 / 26.04 guacd installer", () => {
     }
     const help = Bun.spawnSync(["bash", resolve(root, installer), "--help"]);
     expect(help.exitCode).toBe(0);
-    expect(help.stdout.toString()).toContain(`${installer} [--resume [BUILD_DIRECTORY]]`);
+    expect(help.stdout.toString()).toContain(`${installer} [--resume | --rebuild-guacd [BUILD_DIRECTORY]]`);
     expect(help.stdout.toString()).toContain("Supported: Ubuntu 24.04 LTS and 26.04 LTS");
     expect(help.stdout.toString()).toContain("Nothing is deleted.");
   });
@@ -160,5 +160,69 @@ build_target=ubuntu-26.04-amd64 host_gcc_major=15; select_resume_work`);
     writeFileSync(join(prefix, "share", "herdr-guacd", "build-target"), "target=ubuntu-24.04-amd64\n");
     expect(prefixCheck("ubuntu-24.04-amd64").code).toBe(0);
     expect(prefixCheck("ubuntu-26.04-amd64").out).toContain("was built for ubuntu-24.04-amd64");
+  });
+
+  // guacd 1.6.0 called gdi_init() in PreConnect; FreeRDP 3.31+ creates the cache it needs only later,
+  // so every RDP connection aborted on WINPR_ASSERT(cache->brush) before the first frame
+  it("moves guacd's GDI setup to PostConnect (GUACAMOLE-2328) once, and refuses partial or diverged rdp.c", () => {
+    if (!hasBash || !Bun.which("python3")) return;
+    const text = readFileSync(resolve(root, installer), "utf8");
+    const opener = text.indexOf("<<'PY_POSTCONNECT_GDI'");
+    expect(opener).toBeGreaterThan(0);
+    const edit = text.slice(text.indexOf("\n", opener) + 1, text.indexOf("\nPY_POSTCONNECT_GDI\n"));
+    // the shape of guacamole-server 1.6.0's src/protocols/rdp/rdp.c around the callbacks
+    const pristine = [
+      "static BOOL rdp_freerdp_pre_connect(freerdp* instance) {", "",
+      "    rdpContext* context = GUAC_RDP_CONTEXT(instance);",
+      "    rdpGraphics* graphics = context->graphics;", "",
+      "    guac_client* client = ((rdp_freerdp_context*) context)->client;", "",
+      "    if (settings->remote_app != NULL)", "        guac_rdp_rail_load_plugin(context);", "",
+      "    /* Init FreeRDP internal GDI implementation */",
+      "    if (!gdi_init(instance, guac_rdp_get_native_pixel_format(FALSE)))", "        return FALSE;", "",
+      "    graphics_register_pointer(graphics, &pointer);",
+      "    GUAC_RDP_CONTEXT(instance)->update->EndPaint = guac_rdp_gdi_end_paint;", "",
+      "    GUAC_RDP_CONTEXT(instance)->update->altsec->FrameMarker = guac_rdp_gdi_frame_marker;", "",
+      "    #ifndef RDP_INST_HAS_LOAD_CHANNELS", "        rdp_freerdp_load_channels(instance);", "    #endif", "",
+      "    return TRUE;", "}", "",
+      "static int guac_rdp_handle_connection(guac_client* client) {",
+      "    rdp_inst->PreConnect = rdp_freerdp_pre_connect;",
+      "    rdp_inst->Authenticate = rdp_freerdp_authenticate;", "}", "",
+    ].join("\n");
+    const dir = join(scratch, "rdp-2328");
+    mkdirSync(join(dir, "src", "protocols", "rdp"), { recursive: true });
+    writeFileSync(join(dir, "edit.py"), edit);
+    const rdp = join(dir, "src", "protocols", "rdp", "rdp.c");
+    const apply = () => {
+      const run = Bun.spawnSync(["python3", join(dir, "edit.py")], { cwd: dir });
+      return { code: run.exitCode, out: run.stdout.toString() + run.stderr.toString() };
+    };
+    writeFileSync(rdp, pristine);
+    expect(apply()).toEqual({ code: 0, out: "GUACAMOLE-2328 PostConnect GDI change applied.\n" });
+    const fixed = readFileSync(rdp, "utf8");
+    const pre = fixed.slice(fixed.indexOf("rdp_freerdp_pre_connect(freerdp"), fixed.indexOf("rdp_freerdp_post_connect(freerdp"));
+    const post = fixed.slice(fixed.indexOf("static BOOL rdp_freerdp_post_connect"), fixed.indexOf("static int guac_rdp_handle_connection"));
+    expect(pre).not.toContain("gdi_init(instance");
+    expect(pre).not.toContain("rdpGraphics* graphics");
+    expect(pre).toContain("guac_rdp_rail_load_plugin(context);");
+    expect(pre).toContain("rdp_freerdp_load_channels(instance);");
+    expect(fixed).toContain("Local backport of GUACAMOLE-2328");
+    for (const line of ["rdpGraphics* graphics = context->graphics;", "gdi_init(instance", "graphics_register_pointer", "guac_rdp_gdi_end_paint", "guac_rdp_gdi_frame_marker"]) expect(post).toContain(line);
+    // handlers stay after gdi_init(), which installs FreeRDP's own EndPaint
+    expect(post.indexOf("gdi_init(instance")).toBeLessThan(post.indexOf("guac_rdp_gdi_end_paint"));
+    expect(fixed.match(/rdp_inst->PostConnect = rdp_freerdp_post_connect;/g)).toHaveLength(1);
+    expect(fixed.indexOf("rdp_inst->PreConnect")).toBeLessThan(fixed.indexOf("rdp_inst->PostConnect"));
+    // a repeat run keeps the file as is
+    expect(apply()).toEqual({ code: 0, out: "Existing GUACAMOLE-2328 PostConnect GDI change retained.\n" });
+    expect(readFileSync(rdp, "utf8")).toBe(fixed);
+    // the marker alone (GDI still in PreConnect) is refused, untouched
+    const partial = pristine.replace("static BOOL rdp_freerdp_pre_connect", "/* Local backport of GUACAMOLE-2328 */\nstatic BOOL rdp_freerdp_pre_connect");
+    writeFileSync(rdp, partial);
+    expect(apply()).toMatchObject({ code: 1, out: expect.stringContaining("Partial or diverged GUACAMOLE-2328") });
+    expect(readFileSync(rdp, "utf8")).toBe(partial);
+    // diverged source (no PreConnect GDI block to move) is refused, untouched
+    const diverged = pristine.replace("    /* Init FreeRDP internal GDI implementation */\n", "");
+    writeFileSync(rdp, diverged);
+    expect(apply()).toMatchObject({ code: 1, out: expect.stringContaining("refusing the GUACAMOLE-2328 edit") });
+    expect(readFileSync(rdp, "utf8")).toBe(diverged);
   });
 });

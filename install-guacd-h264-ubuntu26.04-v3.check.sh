@@ -297,7 +297,14 @@ check_fixed_source() {  # $1 = guacamole source directory
         && [[ $(grep -c 'FreeRDP_GfxH264, TRUE' "$1/src/protocols/rdp/settings.c") == 1 ]] \
         && grep -q '^    const char\* chr;' "$1/src/libguac/string.c" \
         && grep -q 'struct sockaddr_storage wol_dest;' "$1/src/libguac/wol.c" \
-        && ! grep -q 'inet_pton(wol_dest.sin_family' "$1/src/libguac/wol.c"
+        && ! grep -q 'inet_pton(wol_dest.sin_family' "$1/src/libguac/wol.c" \
+        && gdi_in_post_connect "$1/src/protocols/rdp/rdp.c"
+}
+gdi_in_post_connect() {  # GUACAMOLE-2328: gdi_init() once, in PostConnect only
+    [[ $(grep -c 'gdi_init(instance' "$1") == 1 ]] \
+        && [[ $(grep -c 'rdp_inst->PostConnect = rdp_freerdp_post_connect;' "$1") == 1 ]] \
+        && ! sed -n '/^static BOOL rdp_freerdp_pre_connect/,/^}/p' "$1" | grep -q 'gdi_init(instance' \
+        && sed -n '/^static BOOL rdp_freerdp_post_connect/,/^}/p' "$1" | grep -q 'gdi_init(instance'
 }
 work=$tmp/pristine
 fresh_source "$work"
@@ -306,6 +313,7 @@ if (apply_guacamole_source_fixes > "$tmp/fix1.log" 2>&1) \
     && check_fixed_source "$work/guacamole" \
     && grep -q 'already applied: GUACAMOLE-2070' "$tmp/fix2.log" \
     && grep -q 'Existing AVC420 source change retained' "$tmp/fix2.log" \
+    && grep -q 'Existing GUACAMOLE-2328 PostConnect GDI change retained' "$tmp/fix2.log" \
     && [[ -z $(find "$work/guacamole" -name '*.orig' -o -name '*.rej') ]]; then
     pass 'source fixes: applied once, repeat run is a no-op'
 else
@@ -324,6 +332,20 @@ elif grep -q 'does not apply' "$tmp/fix3.log" \
     pass 'source fixes: diverged source rejected without touching it'
 else
     cat "$tmp/fix3.log" >&2; fail 'source fixes: diverged source rejected'
+fi
+
+# GUACAMOLE-2328: a half-applied rdp.c (marker, GDI still in PreConnect) is refused untouched.
+work=$tmp/partial2328
+fresh_source "$work"
+sed -i 's|^static BOOL rdp_freerdp_pre_connect|/* Local backport of GUACAMOLE-2328 */\n&|' "$work/guacamole/src/protocols/rdp/rdp.c"
+cp "$work/guacamole/src/protocols/rdp/rdp.c" "$tmp/rdp.before"
+if (apply_guacamole_source_fixes > "$tmp/fix2328.log" 2>&1); then
+    fail 'source fixes: partial GUACAMOLE-2328 rejected'
+elif grep -q 'Partial or diverged GUACAMOLE-2328' "$tmp/fix2328.log" \
+    && cmp -s "$tmp/rdp.before" "$work/guacamole/src/protocols/rdp/rdp.c"; then
+    pass 'source fixes: partial GUACAMOLE-2328 rejected without touching rdp.c'
+else
+    cat "$tmp/fix2328.log" >&2; fail 'source fixes: partial GUACAMOLE-2328 rejected'
 fi
 
 # A copy of a cached build (AVC420 edit, guarded config.h, objects).

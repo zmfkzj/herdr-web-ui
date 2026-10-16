@@ -87,7 +87,21 @@ downloads.apache.org.
 ```sh
 bash install-guacd-h264-ubuntu26.04-v3.sh                          # new install
 bash install-guacd-h264-ubuntu26.04-v3.sh --resume [BUILD_DIRECTORY]  # FreeRDP installed, guacd not
+bash install-guacd-h264-ubuntu26.04-v3.sh --rebuild-guacd [BUILD_DIRECTORY]  # replace an installed guacd
 bash install-guacd-h264-ubuntu26.04-v3.check.sh [--build]           # checks; installs nothing
+```
+
+**guacd built before revision 6 draws nothing.** guacd 1.6.0 initializes FreeRDP's GDI in
+PreConnect, but FreeRDP 3.31+ (this stack uses 3.32.2) creates the cache that `gdi_init()` needs
+only later, so each connection's guacd process aborts on `WINPR_ASSERT(cache->brush)`
+(`libfreerdp/cache/brush.c`) right after "Loading Dynamic Virtual Channel rdpgfx": the viewer
+stays on "Connecting…" and guacd's log shows a WinPR backtrace. Revision 6 applies upstream's fix
+(GUACAMOLE-2328, initialize the GDI in PostConnect). Rebuild guacd only, reusing FreeRDP and the
+cached build, then restart the stack:
+
+```sh
+bash install-guacd-h264-ubuntu26.04-v3.sh --rebuild-guacd    # sudo make install into /opt/herdr-guacd
+scripts/pi-visual-stack.sh restart
 ```
 
 Other Ubuntu releases and derivatives such as Linux Mint are refused before anything changes.

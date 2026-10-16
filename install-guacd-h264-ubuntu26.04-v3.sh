@@ -19,6 +19,14 @@
 # AVC420, and upstream guacd 1.6.0 does not advertise it, hence the local
 # settings.c edit below. Do not set the RDP connection parameter disable-gfx.
 #
+# Revision 6:
+# - GUACAMOLE-2328 (upstream ab36756), adapted to 1.6.0: initialize the GDI in
+#   PostConnect. FreeRDP 3.31+ creates the context cache after PreConnect, so
+#   1.6.0's gdi_init() in PreConnect aborts every RDP connection on
+#   WINPR_ASSERT(cache->brush) in libfreerdp/cache/brush.c (no frame is drawn).
+# - --rebuild-guacd [BUILD_DIRECTORY] rebuilds and reinstalls guacd over an
+#   existing install (sudo make install), reusing the installed FreeRDP.
+#
 # Revision 5 (Ubuntu 24.04 and 26.04):
 # - Accepts Ubuntu 24.04 and 26.04 (ID=ubuntu, VERSION_ID and codename
 #   checked) and explains every other system before anything is changed.
@@ -44,6 +52,7 @@
 # https://issues.apache.org/jira/browse/GUACAMOLE-2182
 # https://github.com/apache/guacamole-server/commit/c3c4685be6bc528870f2c2fe55e071df339280f3
 # https://github.com/apache/guacamole-server/commit/2e2a33621d673345e7b9d22c9388be80c6d77598
+# https://github.com/apache/guacamole-server/commit/ab36756b596520ae2a94cd4d25e406e0b5aa820b
 # https://github.com/FreeRDP/FreeRDP/releases/tag/3.32.2
 # https://github.com/FreeRDP/FreeRDP/blob/3.32.2/channels/rdpgfx/client/rdpgfx_main.c
 # Non-destructive checks: install-guacd-h264-ubuntu26.04-v3.check.sh [--build]
@@ -54,13 +63,15 @@ trap 'printf "Build failed at line %s. Build directory: %s\n" "$LINENO" "${work:
 
 usage() {
     printf '%s\n' \
-        'Usage: bash install-guacd-h264-ubuntu26.04-v3.sh [--resume [BUILD_DIRECTORY]]' \
+        'Usage: bash install-guacd-h264-ubuntu26.04-v3.sh [--resume | --rebuild-guacd [BUILD_DIRECTORY]]' \
         'Supported: Ubuntu 24.04 LTS and 26.04 LTS (and their point releases), with universe.' \
         'Run as your normal user; sudo is requested for apt and for installing into /opt/herdr-guacd.' \
         'No arguments: install a new private FreeRDP / guacd stack.' \
         '--resume: reuse installed FreeRDP and finish guacd; no apt or FreeRDP rebuild.' \
         '  Use it after a run that installed FreeRDP but failed before guacd was installed.' \
         '  The build directory and FreeRDP must have been built for this Ubuntu release.' \
+        '--rebuild-guacd [BUILD_DIRECTORY]: like --resume, but replaces an installed guacd' \
+        '  (e.g. to pick up the GUACAMOLE-2328 fix); FreeRDP and apt are left alone.' \
         'An omitted BUILD_DIRECTORY is allowed only if exactly one matching cached build exists.' \
         'BUILD_JOBS controls build parallelism (default: 4).' \
         'Nothing is deleted. No Herdr/Pi files, services, or firewall rules are changed.'
@@ -430,6 +441,87 @@ else:
     p.write_text(s.replace(needle, needle + extra))
     print('AVC420 source change applied.')
 PY_AVC420
+
+    # GUACAMOLE-2328 (upstream ab36756): FreeRDP 3.31+ creates the rdpContext
+    # cache only at Confirm Active, after PreConnect, and gdi_init() registers the
+    # brush/glyph cache callbacks on it, so guacd 1.6.0's gdi_init() in PreConnect
+    # aborts on WINPR_ASSERT(cache->brush) (libfreerdp/cache/brush.c) before any
+    # frame. Upstream's diff targets a rewritten rdp.c, so this is the same move
+    # against 1.6.0: GDI, pointer and update handlers go to a new PostConnect
+    # callback; settings, add-in provider, RAIL/SVC plugins and channel loading
+    # stay in PreConnect.
+    python3 - <<'PY_POSTCONNECT_GDI' || return 1
+from pathlib import Path
+p = Path('src/protocols/rdp/rdp.c')
+s = p.read_text()
+marker = 'Local backport of GUACAMOLE-2328'
+def fixed(text):
+    # GDI only in PostConnect, which is assigned once; PreConnect keeps no GDI.
+    pre_at = text.find('static BOOL rdp_freerdp_pre_connect(freerdp* instance) {')
+    post_at = text.find('static BOOL rdp_freerdp_post_connect(freerdp* instance) {')
+    if pre_at < 0 or post_at < pre_at:
+        return False
+    post = text[post_at:text.find('\n}\n', post_at)]
+    return (text.count('gdi_init(instance') == 1 and 'gdi_init(instance' not in text[pre_at:post_at]
+            and all(part in post for part in ('gdi_init(instance', 'graphics_register_pointer(graphics, &pointer);',
+                                              'update->EndPaint = guac_rdp_gdi_end_paint;',
+                                              'altsec->FrameMarker = guac_rdp_gdi_frame_marker;'))
+            and text.count('rdp_inst->PostConnect = rdp_freerdp_post_connect;') == 1
+            and 'rdp_freerdp_load_channels(instance);\n    #endif\n\n    return TRUE;\n}\n\n/**\n * ' + marker in text)
+if marker in s:
+    if not fixed(s):
+        raise SystemExit('Partial or diverged GUACAMOLE-2328 change in rdp.c; refusing to modify source.')
+    print('Existing GUACAMOLE-2328 PostConnect GDI change retained.')
+    raise SystemExit(0)
+if 'rdp_freerdp_post_connect' in s or 'PostConnect =' in s:
+    raise SystemExit('Unexpected guacd source: a PostConnect callback already exists; refusing the GUACAMOLE-2328 edit.')
+head = ('    rdpContext* context = GUAC_RDP_CONTEXT(instance);\n'
+        '    rdpGraphics* graphics = context->graphics;\n'
+        '\n'
+        '    guac_client* client = ((rdp_freerdp_context*) context)->client;\n')
+gdi_start = '    /* Init FreeRDP internal GDI implementation */\n'
+gdi_end = '    GUAC_RDP_CONTEXT(instance)->update->altsec->FrameMarker = guac_rdp_gdi_frame_marker;\n\n'
+tail = ('    #ifndef RDP_INST_HAS_LOAD_CHANNELS\n'
+        '        rdp_freerdp_load_channels(instance);\n'
+        '    #endif\n'
+        '\n'
+        '    return TRUE;\n'
+        '}\n')
+assign = '    rdp_inst->PreConnect = rdp_freerdp_pre_connect;\n'
+for needle in (head, gdi_start, gdi_end, tail, assign):
+    if s.count(needle) != 1:
+        raise SystemExit('Unexpected guacd source: refusing the GUACAMOLE-2328 edit.')
+start = s.index(gdi_start)
+end = s.index(gdi_end) + len(gdi_end)
+if not s.index(head) < start < end <= s.index(tail):
+    raise SystemExit('Unexpected guacd source order: refusing the GUACAMOLE-2328 edit.')
+gdi = s[start:end].rstrip('\n') + '\n'
+s = s[:start] + s[end:]
+s = s.replace(head, head.replace('    rdpGraphics* graphics = context->graphics;\n', ''))
+post = ('\n/**\n'
+        ' * Local backport of GUACAMOLE-2328 (apache/guacamole-server ab36756):\n'
+        ' * initializes the FreeRDP GDI and registers Guacamole\'s rendering handlers\n'
+        ' * once the connection sequence has completed. gdi_init() needs the rdpContext\n'
+        ' * cache, which FreeRDP 3.31.0 and later create only after PreConnect; the\n'
+        ' * handlers follow gdi_init(), which replaces BeginPaint, EndPaint and\n'
+        ' * DesktopResize.\n'
+        ' */\n'
+        'static BOOL rdp_freerdp_post_connect(freerdp* instance) {\n'
+        '\n'
+        '    rdpContext* context = GUAC_RDP_CONTEXT(instance);\n'
+        '    rdpGraphics* graphics = context->graphics;\n'
+        '\n'
+        + gdi +
+        '\n'
+        '    return TRUE;\n'
+        '}\n')
+s = s.replace(tail, tail + post)
+s = s.replace(assign, assign + '    rdp_inst->PostConnect = rdp_freerdp_post_connect;\n')
+if not fixed(s):
+    raise SystemExit('GUACAMOLE-2328 edit produced unexpected source; nothing was written.')
+p.write_text(s)
+print('GUACAMOLE-2328 PostConnect GDI change applied.')
+PY_POSTCONNECT_GDI
 
     # Verbatim diffs of the upstream commits named in the header.
     apply_upstream_patch GUACAMOLE-2136-c3c4685 <<'GUAC_PATCH_2136' || return 1
@@ -901,8 +993,9 @@ mode=install
 resume_dir=
 case ${1:-} in
     --help|-h) usage; exit 0 ;;
-    --resume)
+    --resume|--rebuild-guacd)
         mode=resume
+        [[ $1 == --rebuild-guacd ]] && mode=rebuild
         shift
         if [[ $# -gt 1 ]]; then usage >&2; exit 1; fi
         resume_dir=${1:-}
@@ -929,16 +1022,16 @@ if [[ $mode == install && ( -e $prefix || -L $prefix ) ]]; then
     fi
     exit 1
 fi
-if [[ $mode == resume && ! -d $prefix ]]; then
+if [[ $mode != install && ! -d $prefix ]]; then
     echo "No installed FreeRDP at $prefix; --resume cannot continue." >&2
     exit 1
 fi
 if [[ $mode == resume && -e $prefix/sbin/guacd ]]; then
     echo "$prefix/sbin/guacd already exists; refusing to overwrite it in recovery mode." >&2
-    echo 'This recovery is for a failure before guacd was installed.' >&2
+    echo 'This recovery is for a failure before guacd was installed; use --rebuild-guacd to replace it.' >&2
     exit 1
 fi
-if [[ $mode == resume ]]; then
+if [[ $mode != install ]]; then
     check_prefix_target || {
         echo "Nothing was modified. Move $prefix away and run a fresh install." >&2
         exit 1
@@ -957,7 +1050,7 @@ unset LD_LIBRARY_PATH PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
 unset CMAKE_PREFIX_PATH CMAKE_TOOLCHAIN_FILE CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH
 unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
 
-if [[ $mode == resume ]]; then
+if [[ $mode != install ]]; then
     select_resume_work
     cd "$work"
     printf 'Resuming guacd only. Existing FreeRDP is reused.\nBuild directory: %s\n' "$work"
