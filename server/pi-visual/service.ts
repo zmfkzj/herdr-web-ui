@@ -5,7 +5,7 @@ import { jsonResponse } from "../http.ts";
 import { conversationImage } from "../conversation.ts";
 import { locateFile } from "../file-view.ts";
 import { canSendSecret } from "../machine-security.ts";
-import { originalPi, VisualError, type PiPane } from "./identity.ts";
+import { originalPi, PRIVATE_DESKTOP_TRANSPORT, VisualError, type PiPane } from "./identity.ts";
 import { readWorkers } from "./workers.ts";
 import { MAX_REVIEW_IMAGE_BYTES, ReviewStore } from "./reviews.ts";
 import { DesktopTickets, DesktopTunnel, desktopBinding, desktopRequest } from "./guacamole.ts";
@@ -49,6 +49,11 @@ export interface VisualCaller {
    * its time on this server's clock; `consume` once a desktop ticket was issued for it.
    */
   command?: (paneId: string, worker: string) => { worker: string | null; at: number; consume(): void } | undefined;
+  /**
+   * The browser reached this server over an encrypted link the URL does not show: straight over
+   * Tailscale to its tailnet address (access.ts directTailnetRequest). HTTPS and localhost need no flag.
+   */
+  encrypted?: boolean;
 }
 /** Clock slack between a command, Pi's log line and the processes it names. */
 const COMMAND_SLACK_MS = 3000;
@@ -150,7 +155,7 @@ export class PiVisualService {
       }
       if(route==="desktop" && request.method==="POST") {
         if(!this.desktopEnabled()) throw new VisualError("desktop_disabled",(await this.availability(caller)).message,503);
-        if(!canSendSecret(request)) throw new VisualError("https_required","Use HTTPS or localhost for private desktops",403);
+        if(!caller.encrypted && !canSendSecret(request)) throw new VisualError("https_required",PRIVATE_DESKTOP_TRANSPORT,403);
         let requestFields: PiDesktopRequest|undefined; const value=await body(request);
         try {
           if(typeof value.worker==="string") {

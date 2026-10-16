@@ -178,7 +178,7 @@ Touch keyboard/IME forwarding is not implemented; keyboard/mouse control is
 intended for a desktop browser. Mobile viewing remains possible.
 
 The password is entered into an uncontrolled DOM input, transmitted on the
-explicit connect action over HTTPS or localhost, and cleared. It is not put in
+explicit connect action over HTTPS, localhost or a direct Tailscale link (below), and cleared. It is not put in
 chat, localStorage, a URL, a retry queue, or application logs. The backend uses a
 30-second, one-use, cookie/device-bound ticket; reconnects require the password
 again. RDP uses TLS and the **explicit certificate fingerprint**, not blanket
@@ -196,6 +196,19 @@ Run `/gui view W1` (or `main`, `W3-2`, or a bare `/gui view`) in an original Pi 
 typed straight into its terminal, sent from the chat message box, or sent from the terminal's input
 box. The desktop opens in this browser, on the PC the pane belongs to (this PC or a remote one),
 observe-only by default, without asking for the password pi-gui printed.
+
+- **Which addresses.** Private desktops open over HTTPS, on `localhost`, or straight over Tailscale:
+  with `HOST` set to this PC's tailnet address or MagicDNS name (`HOST=100.x.y.z` or
+  `HOST=pc.tailnet.ts.net`, as `scripts/pi-visual-stack.sh` is often started), a browser on another
+  tailnet device at `http://100.x.y.z:7318` counts, because WireGuard encrypts that link end to end.
+  It counts only when the server is bound to tailnet addresses only (a name: every address it
+  resolved to at startup), the connecting peer is a tailnet address (Tailscale's own firewall rules drop such
+  sources arriving on other interfaces) and no proxy header (`X-Forwarded-*`, `Forwarded`, `Via`,
+  `X-Real-IP`, `Tailscale-User-Login`) says it was relayed (`server/access.ts`
+  `directTailnetRequest`). A wildcard (`0.0.0.0`) or LAN bind, a LAN address and plain HTTP through
+  a proxy are still refused with "Use HTTPS, localhost or this PC's Tailscale address". The same
+  rule applies to another PC's desktop relayed through this server. SSH passwords and key
+  passphrases keep their HTTPS-or-localhost rule.
 
 - **Names** resolve the way pi-gui resolves them: the exact name first, then a case-insensitive
   one. Two case-insensitive matches, an unknown name, or no viewer within 45 s end with a message;

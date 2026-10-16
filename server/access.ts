@@ -154,6 +154,39 @@ tailnetIpv4.addSubnet("100.64.0.0", 10, "ipv4");
 const tailnetIpv6 = new BlockList();
 tailnetIpv6.addSubnet("fd7a:115c:a1e0::", 48, "ipv6");
 
+/** Is this address (bracketed, IPv4-mapped or plain) one Tailscale assigns to tailnet nodes? */
+export function isTailnetAddress(address: string): boolean {
+  const plain = address.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1").replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, "");
+  const family = isIP(plain);
+  return family === 4 ? tailnetIpv4.check(plain, "ipv4") : family === 6 && tailnetIpv6.check(plain, "ipv6");
+}
+
+/**
+ * Is the server bound only to tailnet addresses? `hostname` is HOST as Bun was given it: an
+ * address literal decides by itself; a name (this PC's MagicDNS name, `pc.tailnet.ts.net`) counts
+ * when every address it resolved to at startup (`resolved`) is a tailnet one. Not resolved yet,
+ * or a wildcard, LAN or loopback bind: false.
+ */
+export function isTailnetBind(hostname: string, resolved?: readonly string[]): boolean {
+  const name = hostname.trim().replace(/^\[(.*)\]$/, "$1");
+  if (isIP(name)) return isTailnetAddress(name);
+  return !!resolved && resolved.length > 0 && resolved.every(isTailnetAddress);
+}
+
+/**
+ * Did this request reach the server straight over Tailscale's WireGuard tunnel? The server is
+ * bound to this PC's tailnet address (`isTailnetBind`: HOST=100.x.y.z or its MagicDNS name), so
+ * nothing but tailscaled delivers to it, the peer is a tailnet node (Tailscale's firewall rules
+ * drop tailnet-sourced packets arriving on any other interface), and no proxy header says it
+ * relayed someone else (the Host names the tailnet node, so `cameThroughProxy`'s Host test does
+ * not apply). Such a connection is encrypted end to end like HTTPS, though the browser sees plain
+ * `http:`. A wildcard or LAN bind never counts: the peer address alone is not proof there.
+ */
+export function directTailnetRequest(input: { tailnetBind: boolean; peer: string | null; headers: Headers }): boolean {
+  return input.tailnetBind && input.peer !== null && isTailnetAddress(input.peer)
+    && !PROXY_HEADERS.some((name) => input.headers.has(name));
+}
+
 export function decideAccess(input: AccessInput): Access {
   if (input.tokenMatched) return { level: "full", via: "token", role: "drive" };
   if (input.device !== null) return { level: "full", via: "device", role: input.device.role, device: input.device };

@@ -7,6 +7,8 @@ import { readHerdrProfiles, type HerdrMachineProfile } from "./herdr-profiles.ts
 import { randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 import { join, resolve, isAbsolute } from "node:path";
 import type { ServerWebSocket } from "bun";
 
@@ -14,7 +16,7 @@ import type { AgentKind, AgentRenameRequest, AgentStatus, ClientMessage, ClientR
 import { alertStatus, paneTitle } from "../shared/notify-policy.ts";
 import { DEFAULT_PORT } from "../shared/protocol.ts";
 import { DEVICE_COOKIE, authClient, handleAuthRequest, isAuthenticated, parseCookies, presentedToken, presentedTokenHeld, recordPresentedTokenFailure, requiresAuth, unauthorizedJson } from "./auth.ts";
-import { cameThroughProxy, decideAccess, isLoopbackAddress, isLoopbackBind, isServeOwnerRequest, lanExposed } from "./access.ts";
+import { cameThroughProxy, decideAccess, directTailnetRequest, isLoopbackAddress, isLoopbackBind, isServeOwnerRequest, isTailnetBind, lanExposed } from "./access.ts";
 import { DeviceStore, handleDeviceRequest, type DeviceMatch } from "./devices.ts";
 import { handlePreferencesRequest, PreferenceStore } from "./preferences.ts";
 import { remoteAccess, TailnetIdentitySource } from "./tailscale.ts";
@@ -578,6 +580,11 @@ export function createServer(
   /** per pane, the WS keys still waiting at the tail of the pane's queue: later keys of the same sender join them */
   const waitingKeys = new Map<string, { keys: string[]; client: unknown; origin: unknown; pty: unknown; claim: unknown; roles: number; run: Promise<unknown> | null; sent: boolean }>();
   const hostname = options.hostname ?? process.env["HOST"] ?? "127.0.0.1";
+  // a named HOST (this PC's MagicDNS name) binds where it resolved at startup: tailnet-only or not (access.ts isTailnetBind)
+  let resolvedHost: string[] | undefined;
+  if (!isIP(hostname.replace(/^\[(.*)\]$/, "$1"))) void lookup(hostname, { all: true }).then((found) => { resolvedHost = found.map((entry) => entry.address); }, () => {});
+  /** reached straight over Tailscale, though the URL says http: (private desktops, access.ts directTailnetRequest) */
+  const overTailnet = (peer: string | null, headers: Headers) => directTailnetRequest({ tailnetBind: isTailnetBind(hostname, resolvedHost), peer, headers });
   /** Empty token = gate disabled; every route then behaves exactly as it did before auth existed. */
   const token = options.token ?? process.env["HERDR_WEB_TOKEN"] ?? "";
   /** paired devices (server/devices.ts) and the PC's Tailscale login: the two ways in besides the token and this PC itself */
@@ -1949,7 +1956,7 @@ export function createServer(
           // a worktree made with an agent waits on git and then agent.start, up to 150 s on the PC
           bunServer.timeout(request, pathname === "/api/machines/events" ? 0 : pathname.endsWith("/worktree/create") ? 180 : 80);
           const deviceId = access.level === "full" ? access.device?.id : undefined;
-          const response = await handleMachineRequest(request, machines, deviceId ? (close) => devices.onRevoke(deviceId, close) : undefined, preferences, readOnly, remoteDesktops ? { desktops: remoteDesktops, ...(deviceId ? { deviceId } : {}) } : undefined);
+          const response = await handleMachineRequest(request, machines, deviceId ? (close) => devices.onRevoke(deviceId, close) : undefined, preferences, readOnly, remoteDesktops ? { desktops: remoteDesktops, ...(deviceId ? { deviceId } : {}), encrypted: overTailnet(ip?.address ?? null, request.headers) } : undefined);
           response.headers.set("cache-control", "no-store");
           return response;
         }
@@ -1964,7 +1971,8 @@ export function createServer(
         const relayed = pairedDevice === null && !request.headers.get("cookie") && /^bearer /i.test(request.headers.get("authorization") ?? "")
           && (bridgeAuthorized || (machines === null && token !== "" && tokenMatched));
         const origin = { binding: desktopBinding(request, deviceId), machine: "local" };
-        return piVisual.handle(request, url, readOnly, deviceId, relayed ? { relayed } : { relayed, command: (paneId, worker) => {
+        const encrypted = overTailnet(ip?.address ?? null, request.headers);
+        return piVisual.handle(request, url, readOnly, deviceId, relayed ? { relayed } : { relayed, encrypted, command: (paneId, worker) => {
           const grant = guiViewGrants.find(origin, paneId, worker);
           return grant && { worker: grant.worker, at: grant.at, consume: () => guiViewGrants.take(grant) };
         } });

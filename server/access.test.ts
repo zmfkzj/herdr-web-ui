@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { cameThroughProxy, decideAccess, isLoopbackAddress, isLoopbackBind, isLoopbackHost, lanExposed, type AccessInput } from "./access.ts";
+import { cameThroughProxy, decideAccess, directTailnetRequest, isLoopbackAddress, isTailnetBind, isLoopbackBind, isLoopbackHost, lanExposed, type AccessInput } from "./access.ts";
 
 const device = { id: "d1", label: "Phone", role: "drive" as const };
 const base: AccessInput = { loopback: true, forwarded: false, funnel: false, tailscaleLogin: null, forwardedFor: "100.64.0.9", host: null, tokenMatched: false, device: null, owner: null, tagged: false, soleLogin: null, dnsName: null, tailnetIp: null, serveOnly: false, tokenConfigured: false, gated: false };
@@ -184,5 +184,42 @@ describe("lanExposed", () => {
     expect(warned({ tokenConfigured: true })).toBe(false);
     expect(warned({ gated: true })).toBe(false);
     expect(warned({ tokenConfigured: true, gated: true })).toBe(false);
+  });
+});
+
+describe("directTailnetRequest", () => {
+  const plain = new Headers({ host: "100.127.163.32:7318" });
+  const direct = (over: Partial<{ tailnetBind: boolean; peer: string | null; headers: Headers }>) => directTailnetRequest({ tailnetBind: true, peer: "100.73.169.62", headers: plain, ...over });
+  it("accepts a tailnet peer reaching a server bound to its tailnet address, though Host is not loopback", () => {
+    expect(direct({})).toBe(true);
+    expect(direct({ peer: "::ffff:100.73.169.62" })).toBe(true);
+    expect(direct({ peer: "fd7a:115c:a1e0::9" })).toBe(true);
+    expect(cameThroughProxy(plain)).toBe(true);
+  });
+  it("regression: refuses a server not bound to the tailnet and non-tailnet peers", () => {
+    expect(direct({ tailnetBind: false })).toBe(false);
+    for (const peer of [null, "192.168.0.7", "203.0.113.5", "127.0.0.1", "100.128.0.1", "100.63.255.255"]) expect(direct({ peer })).toBe(false);
+  });
+  it("regression: refuses a request any proxy header says was relayed for someone else", () => {
+    for (const name of ["x-forwarded-for", "x-forwarded-proto", "forwarded", "via", "x-real-ip", "tailscale-user-login"]) {
+      expect(direct({ headers: new Headers({ host: "100.127.163.32:7318", [name]: "100.73.169.62" }) })).toBe(false);
+    }
+  });
+});
+
+describe("isTailnetBind", () => {
+  it("takes a tailnet address literal, or a name that resolved only to tailnet addresses", () => {
+    for (const hostname of ["100.127.163.32", "fd7a:115c:a1e0::5", "[fd7a:115c:a1e0::5]"]) expect(isTailnetBind(hostname)).toBe(true);
+    expect(isTailnetBind("pc.tail4826ad.ts.net", ["100.127.163.32"])).toBe(true);
+    expect(isTailnetBind("pc.tail4826ad.ts.net", ["100.127.163.32", "fd7a:115c:a1e0::5"])).toBe(true);
+  });
+  it("regression: refuses wildcard, LAN, loopback and unresolved or mixed names", () => {
+    for (const hostname of ["0.0.0.0", "::", "192.168.0.10", "127.0.0.1", "[::1]"]) expect(isTailnetBind(hostname)).toBe(false);
+    // a literal is never overridden by what a name lookup said
+    expect(isTailnetBind("0.0.0.0", ["100.127.163.32"])).toBe(false);
+    expect(isTailnetBind("pc.tail4826ad.ts.net")).toBe(false);
+    expect(isTailnetBind("pc.tail4826ad.ts.net", [])).toBe(false);
+    expect(isTailnetBind("pc.example.net", ["100.127.163.32", "192.168.0.10"])).toBe(false);
+    expect(isTailnetBind("localhost", ["127.0.0.1"])).toBe(false);
   });
 });

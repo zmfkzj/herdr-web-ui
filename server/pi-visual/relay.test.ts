@@ -217,6 +217,16 @@ describe("private desktops of other PCs", () => {
     const insecure = await handleMachineRequest(new Request("http://pc.example.net/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://pc.example.net" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, { desktops });
     expect(insecure.status).toBe(403);
     expect((await insecure.json() as { error: { code: string } }).error.code).toBe("https_required");
+    // straight over Tailscale to this server's tailnet address (index.ts: directTailnetRequest): plain http passes,
+    // and the browser still needs its own `/gui view` grant
+    const overTailnet = (encrypted: boolean) => handleMachineRequest(new Request("http://100.127.163.32:7318/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://100.127.163.32:7318" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, { desktops, encrypted });
+    expect((await (await overTailnet(true)).json() as { error: { code: string } }).error.code).toBe("gui_view_required");
+    ran("pc-b");
+    const cleartext = await overTailnet(false);
+    expect((await cleartext.json() as { error: { code: string } }).error.code).toBe("https_required");
+    const tunnelled = await overTailnet(true);
+    expect(tunnelled.status).toBe(200);
+    expect((await tunnelled.json() as { ticket?: string }).ticket).toMatch(/^[a-f0-9]{64}$/);
     process.env["HERDR_PI_GUACD_ENABLED"] = "0";
     try {
       ran("pc-b");

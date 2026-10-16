@@ -4,7 +4,7 @@ import { jsonResponse } from "../http.ts";
 import { canSendSecret } from "../machine-security.ts";
 import { desktopBinding, instruction, type DesktopWebSocket } from "./guacamole.ts";
 import type { Grant, GuiViewGrants } from "./grants.ts";
-import { VisualError } from "./identity.ts";
+import { PRIVATE_DESKTOP_TRANSPORT, VisualError } from "./identity.ts";
 
 const FRAME_LIMIT = 4 * 1024 * 1024;
 const INPUT_LIMIT = 256 * 1024;
@@ -81,11 +81,12 @@ export class RemoteDesktops {
   }
   private prune(): void { for (const [id, ticket] of this.tickets) if (ticket.expiresAt <= this.now()) this.tickets.delete(id); }
   /** POST /api/machines/<id>/pane/pi-visual/desktop: checked here, then asked of the PC's bridge. */
-  async issue(request: Request, machine: string, url: URL, deviceId?: string): Promise<Response> {
+  /** `encrypted`: the browser came straight over Tailscale to this server's tailnet address (access.ts directTailnetRequest). */
+  async issue(request: Request, machine: string, url: URL, deviceId?: string, encrypted = false): Promise<Response> {
     try {
       if (!localDesktopEnabled()) throw new VisualError("desktop_disabled", LOCAL_DESKTOP_OFF.message, 503);
       // the PC's bridge sees only this server's loopback: HTTPS is decided on the browser's request
-      if (!canSendSecret(request)) throw new VisualError("https_required", "Use HTTPS or localhost for private desktops", 403);
+      if (!encrypted && !canSendSecret(request)) throw new VisualError("https_required", PRIVATE_DESKTOP_TRANSPORT, 403);
       const endpoint = this.machines.endpoint(machine);
       if (!endpoint) throw new VisualError("machine_offline", "This PC is disconnected", 503);
       const problem = bridgeProblem(this.machines.piVisual(machine));

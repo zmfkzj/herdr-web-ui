@@ -101,7 +101,7 @@ describe("private desktop boundary",()=>{
     for(const char of wire)parser.write(char);expect(got).toEqual([["name","한글🙂;comma,"],["sync","123"]]);
     for(const bad of ["-1.x;","a.x;","99999999.x;"])expect(()=>new InstructionParser(()=>{}).write(bad)).toThrow();
   });
-  it("opens a /gui view desktop only for the browser that ran the command, the viewer it names, on HTTPS or localhost",async()=>{
+  it("opens a /gui view desktop only for the browser that ran the command, the viewer it names, on HTTPS, localhost or a direct Tailscale link",async()=>{
     const previous=process.env["HERDR_PI_GUACD_ENABLED"];process.env["HERDR_PI_GUACD_ENABLED"]="1";close.push(()=>{if(previous===undefined)delete process.env["HERDR_PI_GUACD_ENABLED"];else process.env["HERDR_PI_GUACD_ENABLED"]=previous;});
     const now=Date.now();
     const viewer={worker:"W1",port:3390,display:"wayland-virtual-1",pid:77,startedAt:now-60_000,fingerprint:"ab".repeat(32),password:"from-the-viewer",piStartedAt:now-120_000};
@@ -111,7 +111,7 @@ describe("private desktop boundary",()=>{
     const url=new URL("http://localhost/api/pane/pi-visual/desktop?pane_id=p1");
     let consumed=0;
     type Command={worker:string|null;at:number}|undefined;
-    const ask=(body:Record<string,unknown>,command:Command,at=url)=>svc.handle(new Request(at,{method:"POST",body:JSON.stringify({session,worker:"W1",viewerPid:77,readOnly:true,width:1024,height:768,...body})}),at,false,undefined,{relayed:false,command:()=>command&&{...command,consume:()=>{consumed++;}}});
+    const ask=(body:Record<string,unknown>,command:Command,at=url,encrypted?:boolean)=>svc.handle(new Request(at,{method:"POST",body:JSON.stringify({session,worker:"W1",viewerPid:77,readOnly:true,width:1024,height:768,...body})}),at,false,undefined,{relayed:false,...(encrypted===undefined?{}:{encrypted}),command:()=>command&&{...command,consume:()=>{consumed++;}}});
     const code=async(response:Response)=>((await response.json()) as {error?:{code:string}}).error?.code;
     const typed={worker:"W1",at:now-1000};
     expect(await code(await ask({},undefined))).toBe("gui_view_required");
@@ -128,10 +128,20 @@ describe("private desktop boundary",()=>{
     expect(await code(await ask({},{worker:null,at:now}))).toBe("viewer_missing");
     const lan=new URL("http://192.168.1.20/api/pane/pi-visual/desktop?pane_id=p1");
     expect(await code(await ask({},typed,lan))).toBe("https_required");
+    // plain http to a tailnet address is refused too unless the server saw a direct Tailscale peer
+    const tailnet=new URL("http://100.127.163.32:7318/api/pane/pi-visual/desktop?pane_id=p1");
+    expect(await code(await ask({},typed,tailnet))).toBe("https_required");
+    expect(await code(await ask({},typed,tailnet,false))).toBe("https_required");
     expect(consumed).toBe(0);
     const opened=await ask({},typed);expect(opened.status).toBe(200);
     const text=await opened.text();expect(text).not.toContain("from-the-viewer");
     expect(consumed).toBe(1);
+    // straight over Tailscale (index.ts: directTailnetRequest): the same command opens it over plain http
+    const overTailnet=await ask({},typed,tailnet,true);expect(overTailnet.status).toBe(200);
+    expect(await overTailnet.text()).not.toContain("from-the-viewer");
+    expect(consumed).toBe(2);
+    // the flag never stands in for the command grant
+    expect(await code(await ask({},undefined,tailnet,true))).toBe("gui_view_required");
     const exact=await ask({worker:"w1",viewerPid:79},{worker:"w1",at:now});expect(exact.status).toBe(200);
     const list=await svc.handle(new Request("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),new URL("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),false);
     const listed=await list.json() as {viewers:{worker:string}[];desktop:{state:string};discovery:string};

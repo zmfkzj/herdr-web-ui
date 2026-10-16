@@ -31,7 +31,7 @@ function transportFailure(id: string, path: string, error: unknown): Response {
 
 export async function handleMachineRequest(request: Request, manager: MachineManager, onRevoke?: (close: () => void) => () => void,
   preferences?: { get(): SharedPreferences; subscribe(listener: (preferences: SharedPreferences) => void): () => void }, readOnly = false,
-  visual?: { desktops: RemoteDesktops; deviceId?: string }): Promise<Response> {
+  visual?: { desktops: RemoteDesktops; deviceId?: string; /** straight over Tailscale (access.ts directTailnetRequest) */ encrypted?: boolean }): Promise<Response> {
   const url = new URL(request.url);
   // A PC's file opens as this PC's /api/fs/file does, from any navigation: reading it changes
   // nothing, and Chrome on Android shows a PDF in the viewer's frame as an "Open" button whose
@@ -133,7 +133,7 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
       if (problem) return fail("pi_visual_bridge_required", problem, 409);
       if (path === "pane/pi-visual/desktop") {
         if (request.method !== "POST" || !visual) return fail("not_found", "Unknown PC endpoint", 404);
-        return visual.desktops.issue(request, id, url, visual.deviceId);
+        return visual.desktops.issue(request, id, url, visual.deviceId, visual.encrypted === true);
       }
     }
     if (MACHINE_PROXY_PATH.test(path)) {

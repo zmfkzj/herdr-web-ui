@@ -7,6 +7,8 @@ import { object, type PiVisualIdentity } from "../../shared/pi-visual.ts";
 export class VisualError extends Error {
   constructor(readonly code: string, message: string, readonly status = 400) { super(message); }
 }
+/** Why a private desktop was refused on a cleartext link (this server's own desktops and another PC's alike). */
+export const PRIVATE_DESKTOP_TRANSPORT = "Use HTTPS, localhost or this PC's Tailscale address (HOST=100.x.y.z) for private desktops";
 export interface PiPane extends PiVisualIdentity { path: string; cwd: string | null; paneId: string }
 export function readHeader(path: string): Record<string, unknown> {
   const fd = openSync(path, "r");
