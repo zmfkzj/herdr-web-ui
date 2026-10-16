@@ -57,6 +57,7 @@ import { fileUriPath, hyperlinkFilter, isWebLink, terminalFileLinkProvider } fro
 import { adjustTerminalGlyphs } from "../lib/terminalGlyphs.ts";
 import { terminalLabel } from "../lib/terminalLabel.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
+import { TerminalImageLayer, terminalImageSource } from "../lib/terminalImages.ts";
 import { modalOpen } from "../lib/focus.ts";
 import { pinchFontSize } from "../lib/pinchFontSize.ts";
 import { narrowPaneFontSize } from "../lib/narrowPaneFont.ts";
@@ -231,6 +232,8 @@ export function PaneTerminal({
   const fitRef = useRef<FitAddon | null>(null);
   /** OSC 8 links this app cannot open are not drawn (#739); its state ends with `term.reset()` */
   const hyperlinksRef = useRef(hyperlinkFilter());
+  /** pi images drawn over the rows the images extension marks (docs/terminal-images.md) */
+  const imagesRef = useRef<TerminalImageLayer | null>(null);
   const socketRef = useRef<HerdrSocket | null>(null);
   const paneRef = useRef<string | null>(paneId);
   const onConnectionChangeRef = useRef(onConnectionChange);
@@ -586,6 +589,15 @@ export function PaneTerminal({
     term.loadAddon(new WebLinksAddon((_event, uri) => { if (isWebLink(uri)) window.open(uri, "_blank", "noopener,noreferrer"); }));
     term.registerLinkProvider(terminalFileLinkProvider(() => term.buffer.active, (path, event) => { if (linkPressed(event)) openFileRef.current?.(path); }));
     term.open(host);
+    // pi images the images extension marks, asked of this PC for the pane shown now and the pi
+    // session the marker names; the server checks both and the picture's digest. A marker of a
+    // pane left behind that is parsed late names a session this pane does not run: no image.
+    const images = new TerminalImageLayer(term, (placement) => terminalImageSource(machineId, paneRef.current, placement));
+    imagesRef.current = images;
+    const onImagesParsed = term.onWriteParsed(() => images.schedule());
+    // a resized grid is redrawn whole by herdr; until then a marker's cell may have moved
+    const onImagesResize = term.onResize(() => images.clear());
+    const onImagesBuffer = term.buffer.onBufferChange(() => images.clear());
     let compositionEndTimer: number | null = null;
     compositionCommitPendingRef.current = false;
     const compositionStart = () => {
@@ -1063,8 +1075,17 @@ export function PaneTerminal({
       }
       return true;
     });
-    // OSC 8: a hyperlink this app cannot open (OmO's `omo-panel:` rows) is not drawn as one (#739)
-    const osc8 = term.parser.registerOscHandler(8, (payload) => hyperlinksRef.current.handler(payload));
+    // OSC 8: a hyperlink this app cannot open (OmO's `omo-panel:` rows) is not drawn as one (#739).
+    // A pi image marker is one of those; it is noted first (the link it opens, or the one it ends).
+    const osc8 = term.parser.registerOscHandler(8, (payload) => {
+      images.hyperlink(payload);
+      return hyperlinksRef.current.handler(payload);
+    });
+    // RIS, in stream order (a resume or watch writes it before the new screen): no marker survives it
+    const ris = term.parser.registerEscHandler({ final: "c" }, () => {
+      images.reset();
+      return false;
+    });
     // modifyOtherKeys (CSI > 4 ; level m): xterm.js has no handler for it, so this one only
     // listens, and Ctrl+Enter is sent as the program asked (see onModifiedEnter)
     const modifyOtherKeys = (final: "m" | "n") => term.parser.registerCsiHandler({ prefix: ">", final }, (params) => {
@@ -1968,6 +1989,12 @@ export function PaneTerminal({
       offDisconnect();
       osc52.dispose();
       osc8.dispose();
+      ris.dispose();
+      onImagesParsed.dispose();
+      onImagesResize.dispose();
+      onImagesBuffer.dispose();
+      images.dispose();
+      imagesRef.current = null;
       modifyOtherKeysSet.dispose();
       modifyOtherKeysOff.dispose();
       if (clipboardTimerRef.current !== null) window.clearTimeout(clipboardTimerRef.current);
@@ -2153,6 +2180,8 @@ export function PaneTerminal({
     draftPaneRef.current = paneId;
     term.reset();
     hyperlinksRef.current.reset();
+    // another pane (or the same id after a herdr restart): its images come with its own screen
+    imagesRef.current?.reset();
     modifyOtherKeysRef.current = 0;
     if (!paneId) return;
     const leavePane = (): void => {

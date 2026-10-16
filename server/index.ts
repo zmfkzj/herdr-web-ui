@@ -114,6 +114,7 @@ import { handleVoiceRequest, VoiceService } from "./voice.ts";
 
 import { BRIDGE_PROTOCOL } from "../shared/machines.ts";
 import { MAX_LABEL_CHARS } from "../shared/labels.ts";
+import { PI_SESSION_HEADER, PI_SESSION_ID } from "../shared/terminal-images.ts";
 import { bridgeIdentity, registerBridge } from "./bridge.ts";
 import { bridgeAgentNews, MachineManager } from "./machines.ts";
 import { handleMachineRequest } from "./machine-api.ts";
@@ -2679,12 +2680,22 @@ export function createServer(
         const paneId = url.searchParams.get("pane_id");
         const ref = url.searchParams.get("ref");
         if (!paneId || !ref) return badRequest("missing_parameter", "pane_id and ref query parameters are required");
+        // a terminal image marker names the pi session that drew it and the digest of the picture
+        // (docs/terminal-images.md); both or neither
+        const session = url.searchParams.get("session") ?? undefined;
+        const digest = url.searchParams.get("digest") ?? undefined;
+        if ((session === undefined) !== (digest === undefined)) return badRequest("missing_parameter", "session and digest go together");
+        if (session !== undefined && !PI_SESSION_ID.test(session)) return badRequest("invalid_session", "session must be a pi session id");
+        if (digest !== undefined && !/^[0-9a-f]{32}$/.test(digest)) return badRequest("invalid_digest", "digest must be 32 lowercase hex digits");
         try {
-          const image = await conversationImage(paneId, ref, options.codexHome, options.opencodeDb);
+          const image = await conversationImage(paneId, ref, options.codexHome, options.opencodeDb, session !== undefined && digest !== undefined ? { session, digest } : undefined);
           if (image === null) return jsonResponse({ error: { code: "image_not_found", message: "no such image in this pane's conversation" } }, 404);
           // Claude embeds immutable bytes; Codex files and OpenCode tool-image ordinals can change.
-          const cacheControl = ref.startsWith("codex-") || ref.startsWith("opencode:") ? "private, no-store" : "private, max-age=86400, immutable";
-          return new Response(image.bytes, { headers: { "content-type": image.mediaType, "cache-control": cacheControl, "x-content-type-options": "nosniff" } });
+          // A session-bound read is an answer about the pane's current session, which can change.
+          const cacheControl = session !== undefined || ref.startsWith("codex-") || ref.startsWith("opencode:") ? "private, no-store" : "private, max-age=86400, immutable";
+          const headers: Record<string, string> = { "content-type": image.mediaType, "cache-control": cacheControl, "x-content-type-options": "nosniff" };
+          if (session !== undefined) headers[PI_SESSION_HEADER] = session;
+          return new Response(image.bytes, { headers });
         } catch (error) {
           return errorResponse(error);
         }

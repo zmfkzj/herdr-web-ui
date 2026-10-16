@@ -122,6 +122,55 @@ it("offers a tool's own picture over the image endpoint", async () => {
   }
 });
 
+it("binds a terminal image read to the pane's current pi session (same ref, another session)", async () => {
+  const toolImage = (id: string, bytes: Buffer) => [
+    { type: "model_change", id: "m1", parentId: null, timestamp: "2026-09-30T00:00:00Z", provider: "test", modelId: "pi-contract-model" },
+    { type: "message", id: "u1", parentId: "m1", timestamp: "2026-09-30T00:00:01Z", message: { role: "user", content: `open ${id}` } },
+    { type: "message", id: "a1", parentId: "u1", timestamp: "2026-09-30T00:00:02Z", message: {
+      role: "assistant", model: "pi-contract-model", provider: "test", stopReason: "toolUse", usage: { input: 4, output: 1 },
+      content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "shot.png" } }],
+    } },
+    { type: "message", id: "r1", parentId: "a1", timestamp: "2026-09-30T00:00:03Z", message: {
+      role: "toolResult", toolCallId: "call-1", toolName: "read",
+      content: [{ type: "text", text: "read 1 image" }, { type: "image", mimeType: "image/png", data: bytes.toString("base64") }],
+    } },
+  ];
+  const other = Buffer.concat([PNG, Buffer.from("second session")]);
+  const second = join(slug, "session-two.jsonl");
+  writeFileSync(transcript, page(toolImage("first", PNG)));
+  writeFileSync(second, [{ type: "session", version: 3, id: "session-two", timestamp: new Date().toISOString(), cwd: root }, ...toolImage("second", other)].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  const digestOf = (bytes: Buffer) => new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 32);
+  const image = (session: string, digest = digestOf(PNG), ref = "pi:call-1:0") => fetch(`http://127.0.0.1:${server.port}/api/pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ref, session, digest })}`);
+  try {
+    const bound = await image("session");
+    expect(bound.status).toBe(200);
+    expect(bound.headers.get("x-herdr-pi-session")).toBe("session");
+    // the answer is about the pane's session now, which can change under the same URL
+    expect(bound.headers.get("cache-control")).toBe("private, no-store");
+    expect(Buffer.from(await bound.arrayBuffer()).equals(PNG)).toBe(true);
+    expect((await image("session-two")).status).toBe(404);
+    // the ref is there, but not the picture the marker drew
+    expect((await image("session", digestOf(other))).status).toBe(404);
+    expect((await image("bad id!")).status).toBe(400);
+    expect((await image("session", "NOT-A-DIGEST")).status).toBe(400);
+    expect((await fetch(`http://127.0.0.1:${server.port}/api/pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ref: "pi:call-1:0", session: "session" })}`)).status).toBe(400);
+    // a session-bound read is a pi tool image or nothing: a Claude-shaped ref is refused
+    expect((await image("session", digestOf(PNG), "0123abcd-0000-0000-0000-000000000000:0")).status).toBe(404);
+    // the pane moves to another pi session that has the same tool call id: the old marker's
+    // session no longer resolves, the new one serves its own bytes
+    await reportSession(second);
+    expect((await image("session")).status).toBe(404);
+    expect((await image("session-two")).status).toBe(404);
+    const moved = await image("session-two", digestOf(other));
+    expect(moved.status).toBe(200);
+    expect(Buffer.from(await moved.arrayBuffer()).equals(other)).toBe(true);
+  } finally {
+    await reportSession(transcript);
+    writeFileSync(transcript, turns("Check chat", "Answer one"));
+    rmSync(second, { force: true });
+  }
+});
+
 it("resolves pi's context window from the agent dir pi reads its models from", async () => {
   writeFileSync(transcript, turns("Check chat", "Answer one"));
   expect((await read()).metadata?.context?.window).toBeNull();

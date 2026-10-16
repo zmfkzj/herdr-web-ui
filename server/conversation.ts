@@ -41,6 +41,7 @@ import type { ConversationMetadata, ConversationPart, ConversationTurn, HerdrPan
 import { herdrRpc, paneRead, sessionSnapshot } from "./herdr/client.ts";
 import { codexHistorySegments, createCodexTranscriptParser, codexOutputText, codexTranscriptPath, defaultCodexHome, forgetAllCodexState, forgetCodexStateFor, paneCodexHome, parseCodexTranscript, readRange } from "./codex.ts";
 import { CODEX_IMAGE_REF, codexTranscriptImage } from "./codex-images.ts";
+import { PI_SESSION_ID } from "../shared/terminal-images.ts";
 import { AmbiguousClaudeStore, claudeProcessSession, claudeTranscriptFile, defaultClaudeConfigDir, forgetClaudeSessionFile, forgetClaudeSessions, isClaudeProcess, processClaudeConfigDir } from "./claude-store.ts";
 import { forgetGjcState, gjcPidUnderShell, gjcTranscriptForPane, isGjcProcess, storeRelative } from "./gjc-runtime.ts";
 import { omoProcessIdentity, omoSessionForPane } from "./omo.ts";
@@ -1620,21 +1621,56 @@ function transcriptPageRead(source: StreamSource, path: string, page: Conversati
  * (`<entry uuid>:<block index>`): the transcript holds it as base64, so it is decoded
  * here rather than sent with every poll of the conversation. Null when there is no such
  * image. Codex uses a hash of the native attachment and searches only the bound history.
+ *
+ * `piBinding` binds the read to one pi session and one picture (a terminal image marker names
+ * the session that drew it and the digest of what it drew): the pane must be running pi now, on
+ * the transcript whose header has that id, and the ref's bytes must have that digest, or there
+ * is no image. A pane reused by another session or agent, or a ref reused for other bytes,
+ * answers null.
  */
-export async function conversationImage(paneId: string, ref: string, codexHome?: string, opencodeDb?: string): Promise<{ mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null> {
+export async function conversationImage(paneId: string, ref: string, codexHome?: string, opencodeDb?: string, piBinding?: { session: string; digest: string }): Promise<{ mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null> {
   if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !PI_IMAGE_REF.test(ref) && !OPENCODE_IMAGE_REF.test(ref)) return null;
+  if (piBinding !== undefined && (!PI_IMAGE_REF.test(ref) || !PI_SESSION_ID.test(piBinding.session) || !IMAGE_DIGEST.test(piBinding.digest))) return null;
   const snapshot = await sessionSnapshot();
   const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId);
   if (pane === undefined || typeof pane.cwd !== "string" || pane.cwd.length === 0) return null;
   let resolved: ResolvedTranscript;
   try { resolved = await resolveTranscript(pane, pane.cwd, codexHome, snapshot.panes, opencodeDb); }
   catch (error) { if (error instanceof ConversationUnavailable) return null; throw error; }
+  if (piBinding !== undefined) {
+    if (resolved.source !== "pi-transcript" || piTranscriptSessionId(resolved.path) !== piBinding.session) return null;
+    rememberPaneRead(paneId, resolved.path);
+    const image = piTranscriptImage(resolved.path, ref);
+    return image !== null && imageDigest(image.bytes) === piBinding.digest ? image : null;
+  }
   // OpenCode's store is read per request and keeps nothing for the pane to release
   if (resolved.source === "opencode-transcript") return opencodeImage(resolved.path, resolved.session, ref);
   rememberPaneRead(paneId, resolved.path);
   if (resolved.source === "codex-transcript") return codexTranscriptImage(codexHistorySegments(resolved.path, resolved.codexHome ?? codexHome), ref, pane.cwd);
   if (resolved.source === "pi-transcript") return piTranscriptImage(resolved.path, ref);
   return resolved.source === "claude-transcript" ? transcriptImage(resolved.path, ref) : null;
+}
+
+const IMAGE_DIGEST = /^[0-9a-f]{32}$/;
+/** A terminal image marker's digest: the first 32 hex digits of the bytes' SHA-256. */
+export function imageDigest(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex").slice(0, 32);
+}
+
+/** The id in a pi transcript's header record, read bounded; null when the file has none. */
+export function piTranscriptSessionId(path: string): string | null {
+  let fd: number;
+  try { fd = openSync(path, "r"); } catch { return null; }
+  try {
+    const buffer = Buffer.alloc(4096);
+    const size = readSync(fd, buffer, 0, buffer.length, 0);
+    const header = JSON.parse(buffer.subarray(0, size).toString("utf8").split("\n")[0] ?? "") as { type?: unknown; id?: unknown };
+    return header.type === "session" && typeof header.id === "string" ? header.id : null;
+  } catch {
+    return null; // no header, or a header longer than the read
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const IMAGE_REF = /^([0-9a-f-]{8,64}):(\d{1,3})$/i;
