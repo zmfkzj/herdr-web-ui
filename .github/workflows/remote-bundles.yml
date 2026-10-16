@@ -121,13 +121,18 @@ jobs:
           import glob, json, os
           version = os.environ['RELEASE_TAG'].removeprefix('remote-v')
           result = {'version': version, 'assets': {}}
+          # a feature every platform's bundle carries (server/remote-bundle.ts checks it before installing)
+          features = None
           for path in glob.glob('bundles/manifest-*.json'):
               data = json.load(open(path))
               assert data['version'] == version
+              features = set(data.get('features', [])) if features is None else features & set(data.get('features', []))
               for platform, asset in data['assets'].items():
                   asset['url'] = 'https://github.com/' + os.environ['REPOSITORY'] + '/releases/download/' + os.environ['RELEASE_TAG'] + '/' + asset['url']
                   result['assets'][platform] = asset
           assert len(result['assets']) == 5
+          if features:
+              result['features'] = sorted(features)
           json.dump(result, open('bundles/manifest.json', 'w'), indent=2)
           PY
       - name: Publish versioned bundles

@@ -101,4 +101,54 @@ describe("private desktop boundary",()=>{
     for(const char of wire)parser.write(char);expect(got).toEqual([["name","한글🙂;comma,"],["sync","123"]]);
     for(const bad of ["-1.x;","a.x;","99999999.x;"])expect(()=>new InstructionParser(()=>{}).write(bad)).toThrow();
   });
+  it("opens a /gui view desktop only for the browser that ran the command, the viewer it names, on HTTPS or localhost",async()=>{
+    const previous=process.env["HERDR_PI_GUACD_ENABLED"];process.env["HERDR_PI_GUACD_ENABLED"]="1";close.push(()=>{if(previous===undefined)delete process.env["HERDR_PI_GUACD_ENABLED"];else process.env["HERDR_PI_GUACD_ENABLED"]=previous;});
+    const now=Date.now();
+    const viewer={worker:"W1",port:3390,display:"wayland-virtual-1",pid:77,startedAt:now-60_000,fingerprint:"ab".repeat(32),password:"from-the-viewer",piStartedAt:now-120_000};
+    // a distinct desktop whose name differs only in case: pi-gui keeps them apart
+    const lower={...viewer,worker:"w1",pid:79,password:"from-w1"};
+    const svc=new PiVisualService(temp(),{identity:async(_pane,expected)=>{if(expected&&expected!==session)throw new Error("changed");return identity;},viewers:async()=>[viewer,lower],discovery:()=>true,probe:async()=>"ready"});close.push(()=>svc.close());
+    const url=new URL("http://localhost/api/pane/pi-visual/desktop?pane_id=p1");
+    let consumed=0;
+    type Command={worker:string|null;at:number}|undefined;
+    const ask=(body:Record<string,unknown>,command:Command,at=url)=>svc.handle(new Request(at,{method:"POST",body:JSON.stringify({session,worker:"W1",viewerPid:77,readOnly:true,width:1024,height:768,...body})}),at,false,undefined,{relayed:false,command:()=>command&&{...command,consume:()=>{consumed++;}}});
+    const code=async(response:Response)=>((await response.json()) as {error?:{code:string}}).error?.code;
+    const typed={worker:"W1",at:now-1000};
+    expect(await code(await ask({},undefined))).toBe("gui_view_required");
+    expect(await code(await ask({viewerPid:78},typed))).toBe("viewer_changed");
+    expect(await code(await ask({worker:"W9"},{worker:"W9",at:now}))).toBe("viewer_missing");
+    expect(await code(await ask({worker:"../x"},typed))).toBe("invalid_worker");
+    // `/gui view W1` names W1, never the w1 a browser asks for with it
+    expect(await code(await ask({worker:"w1",viewerPid:79},typed))).toBe("viewer_mismatch");
+    // a browser cannot bring its own command; only a connection server's relayed request carries one
+    expect(await code(await ask({command:{worker:"W1",ageMs:0}},undefined))).toBe("gui_view_required");
+    // the Pi that runs the viewer started after the command: a pane reused by another Pi
+    expect(await code(await ask({},{worker:"W1",at:now-200_000}))).toBe("gui_view_required");
+    // without a name: only a viewer started since the command, and neither here is
+    expect(await code(await ask({},{worker:null,at:now}))).toBe("viewer_missing");
+    const lan=new URL("http://192.168.1.20/api/pane/pi-visual/desktop?pane_id=p1");
+    expect(await code(await ask({},typed,lan))).toBe("https_required");
+    expect(consumed).toBe(0);
+    const opened=await ask({},typed);expect(opened.status).toBe(200);
+    const text=await opened.text();expect(text).not.toContain("from-the-viewer");
+    expect(consumed).toBe(1);
+    const exact=await ask({worker:"w1",viewerPid:79},{worker:"w1",at:now});expect(exact.status).toBe(200);
+    const list=await svc.handle(new Request("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),new URL("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),false);
+    const listed=await list.json() as {viewers:{worker:string}[];desktop:{state:string};discovery:string};
+    expect(listed.viewers.map(v=>v.worker)).toEqual(["W1","w1"]);expect(JSON.stringify(listed)).not.toContain("from-the-viewer");expect(JSON.stringify(listed)).not.toContain("piStartedAt");expect(listed.desktop.state).toBe("ready");expect(listed.discovery).toBe("available");
+    // a watching device never reaches it
+    expect((await svc.handle(new Request(url,{method:"POST",body:"{}"}),url,true)).status).toBe(403);
+    // a connection server's request: its command, checked on this PC's clock
+    const relayed=(body:Record<string,unknown>)=>svc.handle(new Request(url,{method:"POST",body:JSON.stringify({session,worker:"W1",viewerPid:77,readOnly:true,width:1024,height:768,...body})}),url,false,undefined,{relayed:true});
+    expect(await code(await relayed({}))).toBe("gui_view_required");
+    expect(await code(await relayed({command:{worker:"w1",ageMs:1000}}))).toBe("viewer_mismatch");
+    expect((await relayed({command:{worker:"W1",ageMs:1000}})).status).toBe(200);
+    process.env["HERDR_PI_GUACD_ENABLED"]="0";
+    expect(await code(await ask({},typed))).toBe("desktop_disabled");
+    // a bridge is off unless started with it on: no default for a connection server either
+    delete process.env["HERDR_PI_GUACD_ENABLED"];
+    expect(await code(await relayed({command:{worker:"W1",ageMs:1000}}))).toBe("desktop_disabled");
+    const off=await (await svc.handle(new Request("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),new URL("http://localhost/api/pane/pi-visual/viewers?pane_id=p1"),false,undefined,{relayed:true})).json() as {desktop:{state:string;action?:string}};
+    expect(off.desktop).toMatchObject({state:"disabled",action:"enable_pc"});
+  });
 });

@@ -38,7 +38,9 @@ import { FindBar } from "./FindBar.tsx";
 import { TerminalViewportTools, type TerminalSearchState } from "./TerminalViewportTools.tsx";
 import { SecretInput } from "./SecretInput.tsx";
 import { secretPrompt } from "../../shared/secret-prompt.ts";
+import { guiViewCommand, type TypedGuiView } from "../../shared/pi-visual.ts";
 import { ChatView } from "./ChatView.tsx";
+import { DesktopViewer } from "./pi-visual/DesktopViewer.tsx";
 import { RenderBoundary } from "./RenderBoundary.tsx";
 import { Composer } from "./Composer.tsx";
 import { ComposerNotices, type ComposerNoticeRow } from "./ComposerNotices.tsx";
@@ -322,6 +324,18 @@ export function PaneTerminal({
   // the modifyOtherKeys level the pane's program asked for, as this pane's stream last said it
   const modifyOtherKeysRef = useRef(0);
   const [observing, setObserving] = useState(false);
+  // `/gui view <worker>` this browser just ran in an original Pi pane, typed into its terminal or sent
+  // from a message box: that worker's desktop opens here at once (components/pi-visual/DesktopViewer.tsx),
+  // on the PC this pane belongs to. `completing`: Pi's completion list may have taken another name.
+  const [guiView, setGuiView] = useState<{ pane: string; worker: string | null; completing: boolean; serial: number } | null>(null);
+  const agentRef = useRef(agent); agentRef.current = agent;
+  const openGuiViewRef = useRef((pane: string, view: TypedGuiView) => {
+    if (agentRef.current === "pi") setGuiView({ pane, worker: view.worker, completing: view.completing, serial: Date.now() });
+  });
+  const openGuiView = useCallback((pane: string, text: string) => {
+    const command = guiViewCommand(text);
+    if (command) openGuiViewRef.current(pane, { worker: command.worker, completing: false });
+  }, []);
   const [secret, setSecret] = useState<{ pane: string; prompt: string } | null>(null);
   const secretRef = useRef<string | null>(null);
   const secretActive = secret !== null && secret.pane === paneId;
@@ -1102,6 +1116,8 @@ export function PaneTerminal({
     pendingScopeRef.current = session.scope;
     pendingEpochRef.current = session.epoch;
     socketRef.current = socket;
+    // `/gui view <worker>` typed straight into this pane's terminal: its desktop opens here
+    const offGuiView = socket.onGuiView((pane, view) => { if (pane === paneRef.current) openGuiViewRef.current(pane, view); });
     let outputGeneration = 0;
     let deferredAttach = false;
     const off = session.on((message, sent) => {
@@ -2010,6 +2026,7 @@ export function PaneTerminal({
       disposeAfterPendingFrame(term);
       termRef.current = null;
       setTerminal((current) => current === term ? null : current);
+      offGuiView();
       socketRef.current = null;
       sessionRef.current = null;
     };
@@ -2340,6 +2357,8 @@ export function PaneTerminal({
           if (delivery !== "immediate") setChatSent((current) => current + 1);
           setChatRefresh((current) => current + 1);
         }
+        // typed into Pi now: a `/gui view` there is running
+        if (delivery === "immediate") openGuiView(pane, text);
       }
       return result;
     }, (error: unknown) => {
@@ -2351,7 +2370,7 @@ export function PaneTerminal({
       releaseSubmit?.();
       if (paneRef.current === pane && socketRef.current === socket && pendingEpochRef.current === epoch) releaseRef.current();
     });
-  }, [onChatSuggestion, machineId, submitRetention]);
+  }, [onChatSuggestion, machineId, submitRetention, openGuiView]);
 
   const sendComposerText = useCallback((text: string, delivery: "queue" | "immediate" = "immediate"): false | Promise<true | string> => {
     const result = submitComposerMessage(text, delivery);
@@ -2374,11 +2393,15 @@ export function PaneTerminal({
     if (sent === null) return false;
     const releaseSubmit = submitRetention?.retain(pane);
     term.scrollToBottom();
-    return sent.then((result) => (result.ok ? true : submitNote(result.code, result.message))).finally(() => {
+    return sent.then((result) => {
+      if (!result.ok) return submitNote(result.code, result.message);
+      openGuiView(pane, text);
+      return true as const;
+    }).finally(() => {
       releaseSubmit?.();
       if (paneRef.current === pane && socketRef.current === socket) releaseRef.current();
     });
-  }, [submitRetention]);
+  }, [submitRetention, openGuiView]);
 
   // a tap into the input line is the user here: the grid is theirs again before they type
   const reassertGrid = useCallback(() => { reassertIfStaleRef.current(); }, []);
@@ -2860,6 +2883,9 @@ export function PaneTerminal({
           onClose={() => { setFindOpen(false); if (activeRef.current && !coarse) termRef.current?.focus(); }} />
       )}
       {paneId !== null && agent === "pi" && chatView && !observing && <PiVisualTools key={`${machineId}:${paneId}`} paneId={paneId} machineId={machineId} enabled={presented && connected && !ended} />}
+      {paneId !== null && guiView !== null && guiView.pane === paneId && agent === "pi" && !observing && presented && (
+        <DesktopViewer key={guiView.serial} paneId={paneId} machineId={machineId} session={null} target={{ worker: guiView.worker, command: true, completing: guiView.completing }} onClose={() => setGuiView(null)} />
+      )}
       <div className="terminal-surface">
         {/* xterm hides its rendered rows from assistive technology, so the region around the
             visible grid carries the pane's name: a screen reader announces which pane

@@ -6,6 +6,8 @@ import { REMOTE_BUNDLE_VERSION } from "../shared/machines.ts";
 export interface BundleManifest {
   version: string;
   assets: Record<string, { url: string; sha256: string }>;
+  /** what the bundle carries beyond the upstream runtime (`pi-visual`: this branch's visual routes) */
+  features?: string[];
 }
 interface BundleSourceOptions { manifest?: string; directory?: string }
 export async function bundleManifestSource(platform: string, options: BundleSourceOptions = {}): Promise<string> {
@@ -23,6 +25,8 @@ export interface BundleFile { path: string; sha256: string; size: number }
 interface BundleFileOptions extends BundleSourceOptions {
   /** where downloaded bundles are kept by checksum (the state directory's bundles/) */
   cacheDir?: string;
+  /** a feature the bundle must carry, checked on its manifest before anything is downloaded or uploaded */
+  feature?: string;
   onProgress?(done: number, total: number | null): void;
 }
 
@@ -91,6 +95,9 @@ export async function bundleFile(platform: string, signal: AbortSignal, options:
     ? await fetch(source, { signal }).then(async (r) => { if (!r.ok) throw new Error(`Remote bundle for ${platform} is unavailable (HTTP ${r.status}). On the web server, run bun run build:remote ${platform}, or configure HERDR_WEB_BUNDLE_MANIFEST.`); return r.json() as Promise<BundleManifest>; })
     : JSON.parse(await readFile(source, { encoding: "utf8", signal }));
   if (manifest.version !== REMOTE_BUNDLE_VERSION) throw new Error("Remote bundle version mismatch");
+  if (options.feature && !(Array.isArray(manifest.features) && manifest.features.includes(options.feature))) {
+    throw new Error(`The bridge bundle this web server installs (${https ? "the published upstream release" : "its local manifest"}) does not include ${options.feature}. On this web server run bun run build:remote ${platform} from this branch, then try again.`);
+  }
   const asset = manifest.assets[platform];
   if (!asset || !/^[a-f0-9]{64}$/.test(asset.sha256)) throw new Error(`No verified bundle for ${platform}`);
   let path: string;

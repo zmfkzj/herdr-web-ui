@@ -7,6 +7,10 @@ import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { REMOTE_BUNDLE_VERSION } from "../shared/machines.ts";
+import { PI_VISUAL_BUNDLE_FEATURE } from "../shared/pi-visual.ts";
+
+/** What this branch's bundle carries beyond upstream's: its manifest says so, and setup checks it (server/remote-bundle.ts). */
+const FEATURES = [PI_VISUAL_BUNDLE_FEATURE];
 
 const root = resolve(import.meta.dir, "..");
 const hostPlatform = `${process.platform}-${process.arch}`;
@@ -76,7 +80,7 @@ async function archive(): Promise<void> {
   const sha256 = digest(readFileSync(temporaryArchive));
   renameSync(temporaryArchive, archive);
   const manifest = join(output, `manifest-${platform}.json`);
-  writeFileSync(manifest + ".tmp", JSON.stringify({ version: REMOTE_BUNDLE_VERSION, assets: { [platform]: { url: filename, sha256 } } }, null, 2));
+  writeFileSync(manifest + ".tmp", JSON.stringify({ version: REMOTE_BUNDLE_VERSION, features: FEATURES, assets: { [platform]: { url: filename, sha256 } } }, null, 2));
   renameSync(manifest + ".tmp", manifest);
   console.log(`${filename} sha256:${sha256}`);
 }
@@ -99,7 +103,7 @@ try {
     // package-manager symlinks: an account without the symlink privilege cannot extract them, and nothing runs them
     rmSync(join(stage, "node_modules/.bin"), { recursive: true, force: true });
     writeFileSync(join(stage, "package.json"), JSON.stringify({ type: "module", version: REMOTE_BUNDLE_VERSION }));
-    writeFileSync(join(stage, "bundle.json"), JSON.stringify({ version: REMOTE_BUNDLE_VERSION, platform, herdr: null, bun: "1.4.2", node: null, native_smoke_tested: false }));
+    writeFileSync(join(stage, "bundle.json"), JSON.stringify({ version: REMOTE_BUNDLE_VERSION, features: FEATURES, platform, herdr: null, bun: "1.4.2", node: null, native_smoke_tested: false }));
   } else {
     // Use a reproducible LTS runtime instead of the builder's Node: newer local
     // binaries can require extra system libraries absent on an otherwise supported PC.
@@ -137,7 +141,7 @@ try {
       if (mac) verifyMachO(join(stage, "bin", name));
     }
     writeFileSync(join(stage, "package.json"), JSON.stringify({ type: "module", version: REMOTE_BUNDLE_VERSION }));
-    writeFileSync(join(stage, "bundle.json"), JSON.stringify({ version: REMOTE_BUNDLE_VERSION, platform, herdr: "0.9.3", bun: bunVersion, node: nodeVersion, native_smoke_tested: platform === hostPlatform }));
+    writeFileSync(join(stage, "bundle.json"), JSON.stringify({ version: REMOTE_BUNDLE_VERSION, features: FEATURES, platform, herdr: "0.9.3", bun: bunVersion, node: nodeVersion, native_smoke_tested: platform === hostPlatform }));
     if (platform === hostPlatform) command([join(stage, "bin/node"), join(stage, "server/pty/smoke.mjs")], stage);
     else console.log(`${platform}: verified binary architecture and checksums; PTY execution is checked on the destination before activation`);
 

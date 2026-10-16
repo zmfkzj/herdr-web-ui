@@ -61,8 +61,13 @@ export interface HostInspection {
   runtimeDir: string;
   registryDir: string;
 }
-export interface StartOptions { session?: string; herdrPath: string; inspection: HostInspection }
-export interface InstallOptions { cacheDir?: string; onProgress?(stage: InstallStage, done: number, total: number | null): void }
+/**
+ * `desktop`: start the bridge with Pi desktop viewing on (HERDR_PI_GUACD_ENABLED=1) or off (=0),
+ * always said explicitly: a bridge never takes it from whatever environment its SSH login has.
+ */
+export interface StartOptions { session?: string; herdrPath: string; inspection: HostInspection; desktop?: boolean }
+/** `feature`: the bundle must carry it (its manifest says so), or nothing is uploaded */
+export interface InstallOptions { cacheDir?: string; feature?: string; onProgress?(stage: InstallStage, done: number, total: number | null): void }
 
 export interface RemoteHost {
   readonly kind: "posix" | "windows";
@@ -88,7 +93,7 @@ function parseDescriptors(lines: string[]): BridgeDescriptor[] {
 /** sha256 asset upload, both-sides verification, extraction, atomic activation: shared by both hosts. */
 async function fetchBundle(platform: string, signal: AbortSignal, options: InstallOptions) {
   const report = options.onProgress ?? (() => {});
-  const asset = await bundleFile(platform, signal, { cacheDir: options.cacheDir, onProgress: (done, total) => report("download", done, total) });
+  const asset = await bundleFile(platform, signal, { cacheDir: options.cacheDir, ...(options.feature ? { feature: options.feature } : {}), onProgress: (done, total) => report("download", done, total) });
   report("upload", 0, asset.size);
   return { asset, input: { path: asset.path, onProgress: (done: number) => report("upload", done, asset.size), onUploaded: () => report("install", 0, null) } };
 }
@@ -126,8 +131,8 @@ export const posixHost: RemoteHost = {
     await ssh.run(`set -eu; umask 077; base="$HOME/.local/share/herdr-web-ui"; mkdir -p "$base"; ${POSIX_INSTALL_LOCK} tmp=$(mktemp -d "$base/install.XXXXXX"); trap 'rm -rf "$tmp"; ${POSIX_INSTALL_RELEASE}' EXIT HUP INT TERM; if command -v timeout >/dev/null; then timeout ${INSTALL_UPLOAD_TIMEOUT_S} cat > "$tmp/bundle.tgz"; else cat > "$tmp/bundle.tgz"; fi; if command -v sha256sum >/dev/null; then actual=$(sha256sum "$tmp/bundle.tgz" | cut -d ' ' -f 1); else actual=$(shasum -a 256 "$tmp/bundle.tgz" | cut -d ' ' -f 1); fi; test "$actual" = ${shellQuote(asset.sha256)}; mkdir "$tmp/runtime"; tar xzf "$tmp/bundle.tgz" -C "$tmp/runtime"; test -x "$tmp/runtime/bin/bun"; test -x "$tmp/runtime/bin/node"; test -x "$tmp/runtime/bin/herdr"; "$tmp/runtime/bin/bun" --version; "$tmp/runtime/bin/herdr" --version; "$tmp/runtime/bin/node" "$tmp/runtime/server/pty/smoke.mjs"; release="$HOME/${BUNDLE_DIR}-${asset.sha256.slice(0, 16)}"; if test ! -d "$release"; then mv "$tmp/runtime" "$release"; fi; ln -s "$release" "$tmp/current"; if test -d "$HOME/${BUNDLE_DIR}" && test ! -L "$HOME/${BUNDLE_DIR}"; then mv "$HOME/${BUNDLE_DIR}" "$HOME/${BUNDLE_DIR}-legacy-$(date +%s)"; fi; "$release/bin/bun" -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$tmp/current" "$HOME/${BUNDLE_DIR}"`, input, 30 * 60_000);
   },
   stop: async (ssh, pid) => { await ssh.run(`kill -TERM ${pid}`); },
-  async start(ssh, { session, herdrPath, inspection }) {
-    await ssh.run(REMOTE_PATH + `umask 077; mkdir -p "$HOME/.config/herdr-web-ui/bridges"; HERDR_REMOTE_SESSION=${shellQuote(session ?? "")} HERDR_WEB_HERDR_BIN=${shellQuote(herdrPath || `${inspection.home}/${BUNDLE_DIR}/bin/herdr`)} nohup "$HOME/${BUNDLE_DIR}/bin/bun" "$HOME/${BUNDLE_DIR}/server/remote-entry.ts" </dev/null >>"$HOME/.config/herdr-web-ui/bridges/bridge.log" 2>&1 &`);
+  async start(ssh, { session, herdrPath, inspection, desktop }) {
+    await ssh.run(REMOTE_PATH + `umask 077; mkdir -p "$HOME/.config/herdr-web-ui/bridges"; HERDR_REMOTE_SESSION=${shellQuote(session ?? "")} HERDR_PI_GUACD_ENABLED=${desktop ? "1" : "0"} HERDR_WEB_HERDR_BIN=${shellQuote(herdrPath || `${inspection.home}/${BUNDLE_DIR}/bin/herdr`)} nohup "$HOME/${BUNDLE_DIR}/bin/bun" "$HOME/${BUNDLE_DIR}/server/remote-entry.ts" </dev/null >>"$HOME/.config/herdr-web-ui/bridges/bridge.log" 2>&1 &`);
   },
   async descriptors(ssh) {
     return parseDescriptors((await ssh.run(`for f in "$HOME/.config/herdr-web-ui/bridges/"*.json; do test ! -f "$f" || cat "$f"; printf '\\n'; done`)).split("\n"));
@@ -279,7 +284,7 @@ export const windowsHost: RemoteHost = {
       "Write-Output ''",
     ].join("\n"));
   },
-  async start(ssh, { session, herdrPath, inspection }) {
+  async start(ssh, { session, herdrPath, inspection, desktop }) {
     if (!herdrPath) throw new Error("herdr is not installed on this PC");
     const files = windowsBridgeFiles(session);
     // a launcher script: cmd can set the environment and redirect the log without any
@@ -289,6 +294,7 @@ export const windowsHost: RemoteHost = {
       // the paths below are UTF-8: a profile such as C:\Users\홍길동 is lost in an ANSI batch file
       "chcp 65001 >nul",
       `set "HERDR_REMOTE_SESSION=${cmdValue(session ?? "")}"`,
+      `set "HERDR_PI_GUACD_ENABLED=${desktop ? "1" : "0"}"`,
       `set "HERDR_WEB_HERDR_BIN=${cmdValue(herdrPath)}"`,
       `"${cmdValue(`${inspection.runtimeDir}\\bin\\bun.exe`)}" "${cmdValue(`${inspection.runtimeDir}\\server\\remote-entry.ts`)}" >> "${cmdValue(`${inspection.registryDir}\\${files.log}`)}" 2>&1`,
     ];

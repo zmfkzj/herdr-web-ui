@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { BRIDGE_PROTOCOL, REMOTE_BUNDLE_VERSION, type BridgeIdentity } from "../shared/machines.ts";
+import { PI_VISUAL_PROTOCOL } from "../shared/pi-visual.ts";
 import { HerdrError, herdrSocketPath, ping } from "./herdr/client.ts";
 import { attachableIdentity, sidecarAvailable } from "./pty/sidecar.ts";
 
@@ -24,7 +25,9 @@ export async function bridgeIdentity(sidecar = sidecarAvailable()): Promise<Brid
     throw error;
   }
   const info = attachableIdentity(await ping(), sidecar);
-  return { pid: process.pid, managed_remote: process.env["HERDR_WEB_REMOTE"] === "1", bridge_protocol: BRIDGE_PROTOCOL, bundle_version: REMOTE_BUNDLE_VERSION, socket_path: socket, socket_id: `${stat.dev}:${stat.ino}`, herdr: info };
+  // pi_visual: this branch's routes, which the connection server needs to relay worker lists, reviews and
+  // desktops, and whether this bridge was started with desktop viewing on
+  return { pid: process.pid, managed_remote: process.env["HERDR_WEB_REMOTE"] === "1", bridge_protocol: BRIDGE_PROTOCOL, bundle_version: REMOTE_BUNDLE_VERSION, socket_path: socket, socket_id: `${stat.dev}:${stat.ino}`, herdr: info, pi_visual: { protocol: PI_VISUAL_PROTOCOL, desktop: process.env["HERDR_PI_GUACD_ENABLED"] === "1" } };
 }
 export function registerBridge(port: number, token = randomBytes(32).toString("hex")): { token: string; close(): void } {
   const dir = bridgeRegistry();

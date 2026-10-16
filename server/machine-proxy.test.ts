@@ -12,7 +12,11 @@ const remote = Bun.serve({
   port: 0,
   fetch(request) {
     const path = new URL(request.url).pathname;
-    if (path === "/api/pane/conversation/image") return new Response(new Uint8Array([137, 80, 78, 71]), { headers: { "content-type": "image/png" } });
+    if (path === "/api/pane/conversation/image") {
+      // a bridge of this branch echoes the pi session it checked; an older one does not
+      const session = new URL(request.url).searchParams.get("session");
+      return new Response(new Uint8Array([137, 80, 78, 71]), { headers: { "content-type": "image/png", ...(session ? { "x-herdr-pi-session": session } : {}) } });
+    }
     if (path === "/api/pane/conversation/tool-output") return new Response("complete remote output", { headers: { "content-type": "text/plain; charset=utf-8" } });
     if (path === "/api/fs/file") return new Response("%PDF-1.7", { headers: { "content-type": "application/pdf" } });
     if (path === "/api/pane/prompt") {
@@ -66,6 +70,15 @@ it("forwards conversation images and complete output, while rejecting arbitrary 
   expect(output.status).toBe(200);
   expect(await output.text()).toBe("complete remote output");
   expect((await handleMachineRequest(new Request(`${base}/unknown`), manager)).status).toBe(404);
+});
+
+it("keeps a PC's session check on a terminal image: the query goes up, the echo comes back", async () => {
+  const bound = await handleMachineRequest(new Request("http://127.0.0.1/api/machines/pc1/pane/conversation/image?pane_id=w1:p1&ref=pi%3Acall-1%3A0&session=0190-a"), manager);
+  expect(bound.status).toBe(200);
+  expect(bound.headers.get("x-herdr-pi-session")).toBe("0190-a");
+  expect(bound.headers.get("cache-control")).toBe("no-store");
+  const unbound = await handleMachineRequest(new Request("http://127.0.0.1/api/machines/pc1/pane/conversation/image?pane_id=w1:p1&ref=pi%3Acall-1%3A0"), manager);
+  expect(unbound.headers.get("x-herdr-pi-session")).toBeNull();
 });
 
 it("opens a PC's file from a navigation another site started, and keeps every other route to this app", async () => {

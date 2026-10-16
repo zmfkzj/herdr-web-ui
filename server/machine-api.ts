@@ -5,9 +5,14 @@ import { MachineManager } from "./machines.ts";
 import { canSendSecret, sameOrigin } from "./machine-security.ts";
 import { isJsonObject, jsonResponse } from "./http.ts";
 import { crossSiteFileRead } from "./file-view.ts";
+import type { PiGuiViewers } from "../shared/pi-visual.ts";
+import { PI_SESSION_HEADER } from "../shared/terminal-images.ts";
+import { bridgeProblem, relayedViewers, type RemoteDesktops } from "./pi-visual/relay.ts";
 
 const fail = (code: string, message: string, status: number) => jsonResponse({ error: { code, message } }, status);
-export const MACHINE_PROXY_PATH = /^(?:session|agents|integrations|pane\/(?:read|scroll|find|selection|conversation(?:\/image|\/tool-output)?|commands|files|omo-tasks|plan|prompt|prompt\/answer|input|keys|close|rename|image|split|zoom|swap|resize|clear|focus)|workspace\/(?:create|rename|move|close|directories|diff\/files|diff\/file)|worktree\/(?:create|list|open|remove)|tab\/(?:create|rename|close|move)|layout\/ratio|agent\/rename|plugins\/actions|plugin\/action|fs\/(?:stat|file))$/;
+export const MACHINE_PROXY_PATH = /^(?:session|agents|integrations|pane\/(?:read|scroll|find|selection|conversation(?:\/image|\/tool-output)?|commands|files|omo-tasks|plan|prompt|prompt\/answer|input|keys|close|rename|image|split|zoom|swap|resize|clear|focus|pi-visual\/(?:workers|viewers|review|review\/open|review\/image))|workspace\/(?:create|rename|move|close|directories|diff\/files|diff\/file)|worktree\/(?:create|list|open|remove)|tab\/(?:create|rename|close|move)|layout\/ratio|agent\/rename|plugins\/actions|plugin\/action|fs\/(?:stat|file))$/;
+/** Answer headers a PC's response keeps: a review image's sandbox and nosniff must not be lost on the way. */
+const KEPT_HEADERS = ["content-security-policy", "x-content-type-options", PI_SESSION_HEADER];
 
 
 /**
@@ -25,7 +30,8 @@ function transportFailure(id: string, path: string, error: unknown): Response {
 }
 
 export async function handleMachineRequest(request: Request, manager: MachineManager, onRevoke?: (close: () => void) => () => void,
-  preferences?: { get(): SharedPreferences; subscribe(listener: (preferences: SharedPreferences) => void): () => void }, readOnly = false): Promise<Response> {
+  preferences?: { get(): SharedPreferences; subscribe(listener: (preferences: SharedPreferences) => void): () => void }, readOnly = false,
+  visual?: { desktops: RemoteDesktops; deviceId?: string }): Promise<Response> {
   const url = new URL(request.url);
   // A PC's file opens as this PC's /api/fs/file does, from any navigation: reading it changes
   // nothing, and Chrome on Android shows a PDF in the viewer's frame as an "Open" button whose
@@ -96,7 +102,22 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
       return jsonResponse(manager.updateSettings(patch));
     }
     const id = parts[0]!;
-    if (parts.length === 2 && parts[1] === "update-bridge" && request.method === "POST") return jsonResponse(manager.updateBridge(id), 202);
+    if (parts.length === 2 && parts[1] === "update-bridge" && request.method === "POST") {
+      // `?feature=pi-visual`: the PC's bridge is replaced by this server's bundle even at the same
+      // version when the running one lacks the pi-visual routes (MachineManager.updateBridge)
+      const feature = url.searchParams.get("feature");
+      if (feature !== null && feature !== "pi-visual") return fail("invalid_feature", "Unknown bridge feature", 400);
+      return jsonResponse(manager.updateBridge(id, false, feature ?? undefined), 202);
+    }
+    if (parts.length === 2 && parts[1] === "pi-desktop" && request.method === "POST") {
+      // Pi desktop viewing for this PC, turned on or off by its user (a watch device never gets here)
+      const choice = await request.json().catch(() => null) as { enabled?: unknown } | null;
+      if (!isJsonObject(choice) || typeof choice.enabled !== "boolean") return fail("invalid_body", "Expected { enabled: boolean }", 400);
+      const outcome = manager.setDesktop(id, choice.enabled);
+      // nothing more streams from a PC whose desktop viewing was just turned off
+      if (!choice.enabled) visual?.desktops.closeMachine(id, "Desktop viewing was turned off for this PC");
+      return jsonResponse(outcome, "job" in outcome ? 202 : 200);
+    }
     if (parts.length === 1 && request.method === "PATCH") {
       const patch = await request.json();
       if (!isJsonObject(patch)) return fail("invalid_body", "Expected a PC update", 400);
@@ -104,6 +125,17 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
     }
     if (parts.length === 1 && request.method === "DELETE") { manager.remove(id); return jsonResponse({ ok: true }); }
     const path = parts.slice(1).join("/");
+    if (path.startsWith("pane/pi-visual/")) {
+      if (!manager.endpoint(id)) return fail("machine_offline", "This PC is disconnected", 503);
+      // an upstream bridge has no such routes: say what to do instead of a bare 404, and never
+      // let this gate reach the PC's terminals or chats
+      const problem = bridgeProblem(manager.piVisual(id));
+      if (problem) return fail("pi_visual_bridge_required", problem, 409);
+      if (path === "pane/pi-visual/desktop") {
+        if (request.method !== "POST" || !visual) return fail("not_found", "Unknown PC endpoint", 404);
+        return visual.desktops.issue(request, id, url, visual.deviceId);
+      }
+    }
     if (MACHINE_PROXY_PATH.test(path)) {
       const endpoint = manager.endpoint(id);
       if (!endpoint) return fail("machine_offline", "This PC is disconnected", 503);
@@ -150,8 +182,14 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
             body = new TextEncoder().encode(JSON.stringify({ ...answer, prompt: { ...card, body: null } })).buffer as ArrayBuffer;
           }
         }
+        if (path === "pane/pi-visual/viewers" && response.ok && body) {
+          // this server's own desktop switch decides for the PCs it relays to
+          body = new TextEncoder().encode(JSON.stringify(relayedViewers(JSON.parse(new TextDecoder().decode(body)) as PiGuiViewers, manager.piDesktop(id)))).buffer as ArrayBuffer;
+        }
+        const kept: Record<string, string> = {};
+        for (const name of KEPT_HEADERS) { const value = response.headers.get(name); if (value) kept[name] = value; }
         return new Response(body, { status: response.status, headers: {
-          "content-type": response.headers.get("content-type") ?? "application/json", "cache-control": "no-store", ...(etag ? { etag } : {}),
+          "content-type": response.headers.get("content-type") ?? "application/json", "cache-control": "no-store", ...(etag ? { etag } : {}), ...kept,
         } });
       } catch (error) { return transportFailure(id, path, error); }
       finally { untrack(); }

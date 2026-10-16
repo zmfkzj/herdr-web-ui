@@ -1,5 +1,5 @@
 import { machinePath, paneStorageId } from "../../../shared/machines.ts";
-import type { ImageAnnotation, ImageReviewDocument, PiVisualWorkers, ReviewSource } from "../../../shared/pi-visual.ts";
+import type { ImageAnnotation, ImageReviewDocument, PiGuiViewers, PiVisualWorkers, ReviewSource } from "../../../shared/pi-visual.ts";
 import { composerDrafts } from "../composerDraft.ts";
 import { appendQuote } from "../terminalQuote.ts";
 import { MAX_COMPOSER_CHARS } from "../compose.ts";
@@ -7,11 +7,33 @@ import { MAX_COMPOSER_CHARS } from "../compose.ts";
 export function visualUrl(machine: string,pane: string,route: string,query: Record<string,string>={}): string {
   return machinePath(machine,`pane/pi-visual/${route}?${new URLSearchParams({pane_id:pane,...query})}`);
 }
+/** A refused Pi visual request: `code` decides what the panel offers next (a password, a bridge install). */
+export class VisualRequestError extends Error {
+  constructor(message: string, readonly code: string, readonly status: number) { super(message); }
+}
 export async function visualRequest<T>(url: string,method="GET",body?: unknown,signal?: AbortSignal): Promise<T> {
   const response=await fetch(url,{method,credentials:"same-origin",cache:"no-store",headers:{"content-type":"application/json","x-herdr-machine":"1"},...(body===undefined?{}:{body:JSON.stringify(body)}),signal});
-  const result=await response.json();
-  if(!response.ok) throw new Error(typeof result?.error?.message==="string" ? result.error.message : "Pi visual request failed");
+  const result=await response.json().catch(()=>null);
+  if(!response.ok) throw new VisualRequestError(typeof result?.error?.message==="string" ? result.error.message : "Pi visual request failed",typeof result?.error?.code==="string" ? result.error.code : "pi_visual_unavailable",response.status);
   return result as T;
+}
+/** The pi-gui viewers this pane's Pi runs on its PC, and whether that PC can stream a desktop now. */
+export function fetchViewers(machine: string,pane: string,session: string|null,signal?: AbortSignal): Promise<PiGuiViewers> {
+  return visualRequest<PiGuiViewers>(visualUrl(machine,pane,"viewers",session?{session}:{}),"GET",undefined,signal);
+}
+/**
+ * Replaces a PC's bridge with this server's bundle, which carries the Pi visual routes (a bridge of
+ * the same version from upstream's bundle does not). It runs like Update bridge: the PC list shows it.
+ */
+/**
+ * Turns Pi desktop viewing on or off for one remote PC: on restarts its bridge with it when it runs
+ * without (a job the PC list shows), off stops this server relaying its desktops at once.
+ */
+export function setPcDesktop(machine: string,enabled: boolean): Promise<{job: unknown}|{enabled: boolean}> {
+  return visualRequest(`/api/machines/${encodeURIComponent(machine)}/pi-desktop`,"POST",{enabled});
+}
+export async function installPiVisualBridge(machine: string): Promise<void> {
+  await visualRequest<unknown>(`/api/machines/${encodeURIComponent(machine)}/update-bridge?feature=pi-visual`,"POST");
 }
 export function sourceFromImage(src: string,machine: string,pane: string,origin: string): ReviewSource {
   const url=new URL(src,origin);

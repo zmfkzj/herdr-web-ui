@@ -120,11 +120,11 @@ it names what is missing instead of installing or building it. It refuses to run
 - It is an on-demand launcher, not a boot service: nothing starts it again after a reboot or a
   crash.
 
-In Pi, run `/gui view W1` (or `/gui view main`). The existing Pi terminal prints
-the address, user, one-time password and SHA-256 certificate fingerprint.
-In the worker panel, select **Open private desktop** and enter the port,
-password and fingerprint. The destination is fixed to loopback and user `pi`.
-No arbitrary host or guacd/RDP option can be supplied by the browser.
+In Pi, run `/gui view W1` (or `/gui view main`) in the pane this web UI shows: the desktop opens
+here at once (next section). The **Open private desktop** form in the worker panel stays for a
+viewer this browser did not start: enter the port, one-time password and fingerprint the Pi
+terminal printed. The destination is fixed to loopback and user `pi`. No arbitrary host or
+guacd/RDP option can be supplied by the browser.
 
 **Observe only is the default.** To type or click, stop assigning work to that
 worker, uncheck Observe only, and explicitly connect. This is not a mutual
@@ -146,11 +146,73 @@ private desktop stay under `pi-gui` ownership. Device revocation, a ended pane,
 or a detected Pi session change disconnects the web viewer. The Pi session is
 rechecked periodically while connected.
 
-**Direct-host access:** this first version's desktop websocket is local to the
-selected web backend. For a Pi host listed through the multi-PC aggregator,
-open that host's web UI directly. Worker reads and image reviews use the existing
-machine API routes when the remote backend also runs this branch. Old upstream
-remote bundles do not contain these routes.
+## `/gui view <WORKER>` opens the desktop at once
+
+Run `/gui view W1` (or `main`, `W3-2`, or a bare `/gui view`) in an original Pi pane of this web UI:
+typed straight into its terminal, sent from the chat message box, or sent from the terminal's input
+box. The desktop opens in this browser, on the PC the pane belongs to (this PC or a remote one),
+observe-only by default, without asking for the password pi-gui printed.
+
+- **Names** resolve the way pi-gui resolves them: the exact name first, then a case-insensitive
+  one. Two case-insensitive matches, an unknown name, or no viewer within 45 s end with a message;
+  nothing falls back to another worker or another PC. A bare `/gui view` opens only a viewer that
+  started after the command.
+- **Pi's completion list.** While a slash command is typed, Pi lists completions and Enter takes
+  the highlighted one. When another desktop's name starts with the typed one (`W1` and `W10`,
+  `W1` and `W1-2`), Pi may have opened that one instead, so the viewer stops with a message.
+  Press Esc before Enter, or send the command from the message box.
+- **What counts as the command.** The server that passed the keys on follows the line typed into
+  that pane (printable keys, Backspace, Delete, ←, →, Home, End, one-line pastes; Ctrl+C or Ctrl+U at
+  the end of the line empties it; mouse and focus reports change nothing). A key it cannot follow
+  (↑/↓ history or completion choice, Tab, word motions, a modified Enter, a multi-line paste) makes
+  that line's Enter open nothing. Output on the screen, `gui.log` and text such as
+  `echo /gui view W1` never count.
+- **Who may open it.** Only the browser that ran the command, on that PC's pane and through the same
+  bridge connection, once, within 2 minutes (`server/pi-visual/grants.ts`). Typing the pane did not
+  take (observe mode, a held or unready terminal, a refused submit) grants nothing, and a revoked
+  device's grants go with it. Watch devices cannot open desktops at all. Every other open (another
+  browser, the panel's buttons, a second open) asks for the one-time password.
+- **Which viewer.** The PC that runs Pi finds it from pi-gui's `gui.log` line plus `/proc` checks:
+  same uid, krdp is a child of that Pi process, loopback port, a private
+  `computer-use-mcp-isolated-*` runtime directory with the certificate inside it, start times near the
+  log line, and a Pi process that was already running when the command was typed (a reused pane
+  ID with another Pi opens nothing). It then uses krdp's one-time password itself; the password
+  never reaches the browser. Viewer discovery needs Linux (`/proc`); elsewhere the password form stays.
+
+## Remote PCs (SSH bridges)
+
+Worker reads, image reviews and desktops of a remote PC go through this web server and that PC's
+existing SSH forward, with its bridge bearer. Remote guacd and krdp stay on that PC's loopback: the
+browser holds only this server's one-use, 30-second ticket, bound to its device, that PC and the
+current bridge connection; it never sees the bridge's bearer or ticket. A PC disconnect, a bridge
+reconnect, desktop viewing turned off, a device revoke or a normal close ends that PC's desktop
+relays only; terminals and chats of every PC keep working.
+
+**On the remote PC** (Linux; pi-gui's KRDP desktops need it): pi-gui with its `/gui doctor`
+prerequisites, and an H.264-capable guacd 1.6+ on `127.0.0.1:4822`, installed by you as for this
+PC (nothing installs or starts it for you). **On this web server:** `HERDR_PI_GUACD_ENABLED=1`, as for
+its own desktops; it also decides for every PC it relays to.
+
+1. **Bridge with the Pi visual routes.** Upstream and older bridges report no `pi_visual` in
+   `/api/bridge`; their panel says so and offers **Install Pi visual bridge** instead of controls
+   that cannot work. Build this branch's bundle on this web server first, for the remote PC's
+   platform: `bun run build:remote linux-x64` (or `linux-arm64`). It writes
+   `remote-bundles/manifest-linux-x64.json` and its archive beside the server, which the server then
+   installs instead of the published upstream release (see [Remote PCs](remote-pcs.md#building-and-distributing-runtimes)).
+   The install refuses a manifest without the `pi-visual` feature before anything is uploaded, and
+   reports a failure when the new bridge still lacks the routes.
+2. **Turn desktop viewing on for that PC.** It is off for every PC until its user turns it on:
+   **Turn on desktop viewing for this PC** in the worker panel or the desktop viewer (an
+   interactive device only). A managed bridge started without it restarts with
+   `HERDR_PI_GUACD_ENABLED=1` (herdr sessions keep running), and the choice is recorded only once
+   the new bridge reports it. It is kept for that PC and SSH target in `pi-desktop.json` in the state
+   directory, survives server restarts, reconnects and bridge updates (every bridge start says
+   `HERDR_PI_GUACD_ENABLED=1` or `=0` explicitly, never inheriting the SSH login's environment), and
+   is dropped when the PC is removed or its SSH target changes. A bridge managed elsewhere is never
+   restarted: start it with `HERDR_PI_GUACD_ENABLED=1` on that PC, then turn it on here.
+   **Turn off desktop viewing for this PC** stops relaying at once; the bridge keeps its startup
+   value until it next restarts.
+3. Run `/gui view W1` in that PC's Pi pane, as on this PC.
 
 Protocol references:
 - https://guacamole.apache.org/doc/gug/configuring-guacamole.html (TLS, `cert-fingerprints`, GFX)
@@ -206,9 +268,15 @@ No claims are made that arbitrary future private extension formats are stable.
 ```sh
 bun run typecheck
 bun run build
-bun test server/pi-visual/visual.test.ts server/pi-visual/tunnel.test.ts src/lib/pi-visual/visual.test.ts
+bun test shared/pi-visual.test.ts server/pi-visual/ server/machine-pi-visual-update.test.ts src/lib/pi-visual/visual.test.ts
 CHROME_PATH=/path/to/chrome bun scripts/pi-visual-browser-qa.ts
+CHROME_PATH=/path/to/chrome bun run check run bun scripts/pi-visual-gui-view-qa.ts
 ```
+
+`pi-visual-gui-view-qa.ts` types `/gui view` into a real terminal of an isolated herdr pane and
+checks the painted desktop for this PC and for a remote PC reached through a fake SSH forward to a
+second server; its Pi, krdp and guacd are stand-ins. Real KRDP over a real SSH host, and H.264
+decoding by a real guacd, are not covered by these checks.
 
 The tests cover original-Pi record shapes, persisted branches, foreign-session
 and symlink refusal, content versions, optimistic concurrency, observer

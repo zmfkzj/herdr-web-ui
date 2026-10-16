@@ -39,7 +39,11 @@ export class MachineRelay {
   private stall = new RelayStallClock();
   readonly ready: Promise<void>;
 
-  constructor(manager: MachineManager, id: string, private readonly readOnly = false) {
+  /**
+   * `frames`: each frame the browser sent, once it went to the PC, and each the PC sent back (the
+   * `/gui view` grants read typing, submits and refusals there: pi-visual/grants.ts)
+   */
+  constructor(manager: MachineManager, id: string, private readonly readOnly = false, private readonly frames?: { client(text: string): void; server(text: string): void }) {
     const endpoint = manager.endpoint(id);
     if (!endpoint) throw new Error("This PC is disconnected");
     this.upstream = authenticatedWebSocket(endpoint.url.replace("http:", "ws:") + "/ws", endpoint.token);
@@ -56,6 +60,7 @@ export class MachineRelay {
     this.upstream.onmessage = (event) => {
       const raw = String(event.data);
       if (this.closed) return;
+      this.frames?.server(raw);
       if (!this.client) {
         this.bytes += Buffer.byteLength(raw);
         if (this.bytes > OUTPUT_HARD_BYTES) this.close(OUTPUT_STALLED_CLOSE_CODE, "output overflow");
@@ -96,6 +101,7 @@ export class MachineRelay {
     }
     if (this.upstream.bufferedAmount + Buffer.byteLength(text) > OUTPUT_HARD_BYTES) { this.close(OUTPUT_STALLED_CLOSE_CODE, "input overflow"); return; }
     this.upstream.send(text);
+    if (!this.readOnly) this.frames?.client(text);
   }
   close(code = 1000, reason = "Closed"): void {
     if (this.closed) return;

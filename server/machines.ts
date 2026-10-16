@@ -5,6 +5,7 @@ import { createServer as tcpServer } from "node:net";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { BRIDGE_PROTOCOL, LOCAL_MACHINE, REMOTE_BUNDLE_VERSION, type BridgeIdentity, type Machine, type MachineAction, type MachineEvent, type MachineSettings, type SetupAction, type SetupJob, type SetupProgress, type SetupRequest, type SshTarget } from "../shared/machines.ts";
+import { PI_VISUAL_PROTOCOL, type PI_VISUAL_BUNDLE_FEATURE, type PiVisualBridge } from "../shared/pi-visual.ts";
 import type { ServerMessage, SessionSnapshot, HerdrPane } from "../shared/protocol.ts";
 import type { PushService } from "./push.ts";
 import { alertStatus } from "../shared/notify-policy.ts";
@@ -38,6 +39,16 @@ interface Runtime {
 }
 interface JobState {
   update: boolean;
+  /**
+   * a bundle feature the update is for (`pi-visual`): a running bridge of the same version without
+   * it is replaced too, the bundle to install must carry it, and the new bridge must report it
+   */
+  feature?: typeof PI_VISUAL_BUNDLE_FEATURE;
+  /**
+   * Turning Pi desktop viewing on (or off) for this PC: the bridge is (re)started with that value,
+   * and only a bridge that then reports it records the user's choice (MachineManager.setDesktop)
+   */
+  desktop?: boolean;
   installationApproved?: boolean;
   /** started by the server for a PC whose bridge is out of date: key-only SSH, approval already given */
   auto: boolean;
@@ -89,6 +100,7 @@ function newerBundle(version: unknown): boolean {
  */
 const SSH_REFUSED = /Permission denied \(|Host key verification failed|IDENTIFICATION HAS CHANGED|Too many authentication failures/i;
 const newerBridge = (version: string): string => `This PC uses a newer bridge (v${version}); this app requires v${REMOTE_BUNDLE_VERSION}. Update this app, then reconnect. The remote bridge was left running.`;
+const INDEPENDENT_DESKTOP = "This socket uses an independently managed web server, which this app does not restart. Start it with HERDR_PI_GUACD_ENABLED=1 on that PC, reconnect, then turn desktop viewing on again; it was left running.";
 const INDEPENDENT_BRIDGE = "This socket uses an independently managed web server. Update it through its own Settings, then reconnect; it was left running.";
 
 /** A connection that retrying cannot fix: the PC waits for the user instead of reconnecting. */
@@ -385,7 +397,7 @@ export class MachineManager {
    * and SSH uses the PC's saved key only. A PC that needs a password fails with the reason,
    * and its dialog stays the way in.
    */
-  updateBridge(id: string, scheduled = false): SetupJob {
+  updateBridge(id: string, scheduled = false, feature?: typeof PI_VISUAL_BUNDLE_FEATURE, desktop?: boolean): SetupJob {
     const runtime = this.machines.get(id);
     if (!runtime) throw new Error("PC not found");
     if (!this.mayConnect(runtime)) throw new MachineActionRequired("Connect this machine first", "connect");
@@ -394,9 +406,58 @@ export class MachineManager {
     if (!this.mayManageBridge(runtime)) throw new MachineActionRequired("Review the bridge update for this machine", "update_bridge");
     // the user's own Update bridge takes back an earlier Cancel; a scheduled one does not
     if (!scheduled) runtime.updateCancelled = false;
-    return this.setup({ ...runtime.machine.target!, machine_id: id, update_remote: true }, { auto: true });
+    return this.setup({ ...runtime.machine.target!, machine_id: id, update_remote: true }, { auto: true, ...(feature ? { feature } : {}), ...(desktop !== undefined ? { desktop } : {}) });
   }
-  setup(request: SetupRequest, options: { auto?: boolean } = {}): SetupJob {
+  /**
+   * Pi desktop viewing for one PC, on only when its user turns it on here: the choice is kept for
+   * that PC and SSH target (pi-desktop.json; a changed target or a removed PC drops it, a PC without
+   * one is off) and every bridge start says it to the bridge. Turning it on restarts a managed
+   * bridge that runs without it (installing this server's Pi visual bundle first when the bridge
+   * lacks the routes) and records the choice only once the new bridge reports it. A bridge managed
+   * elsewhere is never restarted: one already started with it on is taken as it is, any other
+   * fails with what to do. Turning it off takes effect here at once; the bridge keeps its startup
+   * value until it next restarts, and this server relays no desktop meanwhile.
+   */
+  setDesktop(id: string, enabled: boolean): { job: SetupJob } | { enabled: boolean } {
+    const runtime = this.machines.get(id);
+    if (!runtime || runtime.machine.kind !== "ssh") throw new Error("PC not found");
+    if (!enabled) { this.setConsent(runtime, false); this.emit(); return { enabled: false }; }
+    const bridge = runtime.machine.state === "connected" && runtime.endpoint ? runtime.machine.pi_visual : undefined;
+    if (bridge === undefined) throw new MachineActionRequired("Connect this PC first", "connect");
+    if (bridge?.protocol === PI_VISUAL_PROTOCOL && bridge.desktop === true) { this.setConsent(runtime, true); this.emit(); return { enabled: true }; }
+    return { job: this.updateBridge(id, false, "pi-visual", true) };
+  }
+  /** Whether this server may relay Pi desktops to this PC now: turned on here, and its connected bridge started so. */
+  piDesktop(id: string): boolean {
+    const runtime = this.machines.get(id);
+    const bridge = this.piVisual(id);
+    return !!runtime && this.consented(runtime) && bridge?.protocol === PI_VISUAL_PROTOCOL && bridge.desktop === true;
+  }
+  private consentKey(runtime: Runtime): string | null {
+    const target = runtime.machine.target;
+    return target ? JSON.stringify([target.destination, target.port ?? null, target.session ?? null]) : null;
+  }
+  private readConsent(): Record<string, string> {
+    try {
+      const saved: unknown = JSON.parse(readFileSync(join(this.stateDir, "pi-desktop.json"), "utf8"));
+      return saved && typeof saved === "object" && !Array.isArray(saved) ? Object.fromEntries(Object.entries(saved).filter(([, value]) => typeof value === "string")) as Record<string, string> : {};
+    } catch { return {}; }
+  }
+  private consented(runtime: Runtime): boolean {
+    const key = this.consentKey(runtime);
+    return key !== null && this.readConsent()[runtime.machine.id] === key;
+  }
+  private setConsent(runtime: Runtime, enabled: boolean): void {
+    const consent = this.readConsent();
+    const key = this.consentKey(runtime);
+    if (enabled && key) consent[runtime.machine.id] = key; else delete consent[runtime.machine.id];
+    mkdirSync(this.stateDir, { recursive: true, mode: 0o700 });
+    const path = join(this.stateDir, "pi-desktop.json"), tmp = path + ".tmp";
+    writeFileSync(tmp, JSON.stringify(consent), { mode: 0o600 });
+    chmodSync(tmp, 0o600); renameSync(tmp, path);
+    runtime.machine.pi_desktop = enabled && key !== null;
+  }
+  setup(request: SetupRequest, options: { auto?: boolean; feature?: typeof PI_VISUAL_BUNDLE_FEATURE; desktop?: boolean } = {}): SetupJob {
     if (this.stopped) throw new Error("Server stopping");
     let target = validateTarget(request);
     const existing = request.machine_id ? this.machines.get(request.machine_id) : undefined;
@@ -414,7 +475,7 @@ export class MachineManager {
       target = { ...existing.machine.target! };
     }
     const auto = options.auto === true && request.update_remote === true && !!existing;
-    const job: JobState = { update: request.update_remote === true, auto, public: { id, machine_id: machineId, target, phase: "connecting", step: "Connecting with SSH keys and ssh-agent…", challenge: null, installations: [], error: null, ssh_output: null, progress: null }, abort: new AbortController(), timer: setTimeout(() => this.cancelJob(id), 600_000), stageStartedAt: Date.now(), finished: Promise.resolve() };
+    const job: JobState = { update: request.update_remote === true, ...(options.feature && request.update_remote === true ? { feature: options.feature } : {}), ...(options.desktop !== undefined && request.update_remote === true ? { desktop: options.desktop } : {}), auto, public: { id, machine_id: machineId, target, phase: "connecting", step: "Connecting with SSH keys and ssh-agent…", challenge: null, installations: [], error: null, ssh_output: null, progress: null }, abort: new AbortController(), timer: setTimeout(() => this.cancelJob(id), 600_000), stageStartedAt: Date.now(), finished: Promise.resolve() };
     if (job.update && existing) job.runtime = existing;
     if (job.update && existing && !auto) existing.updateCancelled = false;
     job.timer.unref();
@@ -570,6 +631,7 @@ export class MachineManager {
     // Update is idempotent: another app may have finished it while this dialog was open.
     // Prove the live endpoint is compatible; a descriptor or installed directory alone is not enough.
     let update = job?.update === true;
+    let restartOnly = false;
     let currentBridge: Awaited<ReturnType<MachineManager["verify"]>> | undefined;
     if (descriptor && update && descriptor.bridge_protocol === BRIDGE_PROTOCOL && descriptor.bundle_version === REMOTE_BUNDLE_VERSION) {
       try { currentBridge = await this.verify(ssh, descriptor, expectedSocket); }
@@ -579,20 +641,27 @@ export class MachineManager {
         }
         throw error;
       }
-      update = false;
+      // the same version already runs; an update for a feature replaces it only when it lacks that
+      // feature (another protocol counts as lacking it), and turning desktop viewing on restarts it
+      // only when it was started otherwise: the bundle it has serves the routes already
+      const served = currentBridge.identity.pi_visual;
+      if (job?.feature === "pi-visual" && served?.protocol !== PI_VISUAL_PROTOCOL) currentBridge = undefined;
+      else if (job?.desktop !== undefined && (served?.desktop === true) !== job.desktop) { currentBridge = undefined; restartOnly = true; }
+      else update = false;
     }
     // an independently managed web server is not this app's to update or to wait for: it keeps
     // its own message below, whatever its version
     if (descriptor && descriptor.managed_remote && newerBundle(descriptor.bundle_version)) throw new MachineActionRequired(newerBridge(descriptor.bundle_version), "bridge_conflict");
     if (descriptor && (update || descriptor.bridge_protocol !== BRIDGE_PROTOCOL || descriptor.bundle_version !== REMOTE_BUNDLE_VERSION)) {
-      if (!descriptor.managed_remote) throw new MachineActionRequired(INDEPENDENT_BRIDGE, "setup");
+      if (!descriptor.managed_remote) throw new MachineActionRequired(job?.desktop ? INDEPENDENT_DESKTOP : INDEPENDENT_BRIDGE, "setup");
       if (!update) throw new MachineActionRequired("This PC runs a bridge from a different version. Update the bridge to reconnect; herdr sessions keep running.", "update_bridge");
     }
     const hasBundle = inspection.bundleReady;
     // a runtime from another bundle version and no bridge running (the PC rebooted since): an update
     if (!descriptor && !hasBundle && inspection.bundleOlder && !job) throw new MachineActionRequired("This PC has the bridge runtime of a different version. Update the bridge to reconnect; herdr sessions keep running.", "update_bridge");
     const installs: string[] = [];
-    if (update) installs.push("Download and verify the bridge runtime, then restart this bridge (herdr sessions keep running)");
+    if (update && restartOnly) installs.push(`Restart this bridge with Pi desktop viewing ${job?.desktop ? "on" : "off"} (herdr sessions keep running)`);
+    else if (update) installs.push("Download and verify the bridge runtime, then restart this bridge (herdr sessions keep running)");
     if (!descriptor && !hasBundle) installs.push(host.bundleDescription);
     if (!descriptor && !herdrPath) installs.push(host.installHerdr ? `herdr 0.9.3 through its own installer (${HERDR_INSTALL_CMD})` : "Bundled herdr 0.9.3 (existing installations are preserved)");
     if (!descriptor && job) installs.push("Start the loopback bridge and, only if absent, the herdr daemon");
@@ -606,7 +675,7 @@ export class MachineManager {
         await this.wait(job);
       }
       job.installationApproved = update || !descriptor;
-      if (update || !descriptor && !hasBundle) { this.stage(job, "installing", `Installing verified ${platform} bundle…`); await host.installBundle(ssh, platform, job.abort.signal, { cacheDir: join(this.stateDir, "bundles"), onProgress: (stage, done, total) => this.progress(job, stage, done, total) }); }
+      if (update && !restartOnly || !descriptor && !hasBundle) { this.stage(job, "installing", `Installing verified ${platform} bundle…`); await host.installBundle(ssh, platform, job.abort.signal, { cacheDir: join(this.stateDir, "bundles"), onProgress: (stage, done, total) => this.progress(job, stage, done, total), ...(job.feature ? { feature: job.feature } : {}) }); }
       if (!descriptor && !herdrPath && host.installHerdr) { this.stage(job, "installing", "Installing herdr with its own installer…"); herdrPath = await host.installHerdr(ssh); }
       if (ssh.usedSecret) {
         this.stage(job, "installing", "Registering the app SSH key…");
@@ -656,7 +725,8 @@ export class MachineManager {
     if (!descriptor) {
       if (job?.abort.signal.aborted || runtime.generation !== generation || this.stopped) throw new Error("Setup cancelled");
       if (job) this.stage(job, "starting", "Starting the remote bridge…");
-      await host.start(ssh, { session, herdrPath, inspection });
+      // desktop viewing as this job turns it, else as the user left it for this PC: said either way
+      await host.start(ssh, { session, herdrPath, inspection, desktop: job?.desktop ?? this.consented(runtime) });
       for (let i = 0; i < 40; i++) {
         if (job?.abort.signal.aborted || this.stopped) throw new Error("Setup cancelled");
         descriptor = (await host.descriptors(ssh)).find((d) => d.socket_path === expectedSocket && d.pid !== stalePid);
@@ -666,9 +736,18 @@ export class MachineManager {
       if (!descriptor) throw new Error(`Bridge did not start. Check ${host.logHint} on the PC.`);
     }
     const verified = currentBridge ?? await this.verify(ssh, descriptor, expectedSocket);
+    // a bundle whose manifest claimed the feature but whose bridge does not serve it is no success
+    if (job?.feature === "pi-visual" && verified.identity.pi_visual?.protocol !== PI_VISUAL_PROTOCOL) throw new Error(`The bridge does not serve this server's Pi visual tools (protocol ${PI_VISUAL_PROTOCOL}): its bundle was not built from this branch. Build one on this web server (bun run build:remote <platform>), then install the Pi visual bridge again.`);
+    if (job?.desktop !== undefined && (verified.identity.pi_visual?.desktop === true) !== job.desktop) throw new Error(job.desktop
+      ? "The bridge still runs with Pi desktop viewing off. A bridge started outside this app keeps its own setting: start it with HERDR_PI_GUACD_ENABLED=1 there, then turn desktop viewing on again."
+      : "The bridge still runs with Pi desktop viewing on.");
     if (runtime.generation !== generation || this.stopped || job?.abort.signal.aborted) throw new Error("Setup cancelled");
     runtime.endpoint = verified.endpoint;
     runtime.machine.herdr = verified.identity.herdr;
+    runtime.machine.pi_visual = verified.identity.pi_visual ?? null;
+    // the user's choice, recorded now that the bridge serves it
+    if (job?.desktop !== undefined) this.setConsent(runtime, job.desktop);
+    else runtime.machine.pi_desktop = this.consented(runtime);
   }
   private async verify(ssh: SshConnection, descriptor: BridgeDescriptor, expectedSocket: string, forReplacement = false): Promise<{ endpoint: { url: string; token: string }; identity: BridgeIdentity }> {
     if (!Number.isInteger(descriptor.port) || descriptor.port < 1 || descriptor.port > 65535 || typeof descriptor.token !== "string" || !/^[a-f0-9]{64}$/.test(descriptor.token)) throw new Error("Invalid bridge credentials");
@@ -689,6 +768,11 @@ export class MachineManager {
     }
     if (identity.socket_path !== expectedSocket || typeof identity.socket_id !== "string" || !identity.socket_id || !Number.isInteger(identity.herdr?.protocol) || identity.herdr.protocol < 22) throw new Error("Remote bridge/socket is incompatible; update it explicitly");
     return { endpoint, identity };
+  }
+  /** the pi-visual routes the connected bridge of this PC serves; null when it has none */
+  piVisual(id: string): PiVisualBridge | null | undefined {
+    const runtime = this.machines.get(id);
+    return runtime?.machine.enabled && runtime.machine.state === "connected" && runtime.endpoint ? runtime.machine.pi_visual : undefined;
   }
   endpoint(id: string): { url: string; token: string } | undefined {
     const runtime = this.machines.get(id);
@@ -844,6 +928,7 @@ export class MachineManager {
     runtime.machine.enabled = false; this.disconnect(runtime);
     for (const [jobId, job] of this.jobs) if (job.public.machine_id === id) this.cancelJob(jobId);
     this.machines.delete(id); this.persist();
+    this.setConsent(runtime, false);
     for (const suffix of ["", ".pub"]) try { unlinkSync(join(this.sshDir, id + suffix)); } catch {}
     this.emit();
   }

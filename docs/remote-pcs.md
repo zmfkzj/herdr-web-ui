@@ -68,6 +68,9 @@ The current server keeps one status-only WebSocket per remote PC without attachi
 | `DELETE /api/machines/:id` | Forget the PC and remove its local private key |
 | `/api/machines/:id/{session,agents,pane/*,workspace/*}` | Allowlisted target API routes |
 | `/ws?machine_id=…` | Immutable terminal destination |
+| `POST /api/machines/:id/update-bridge?feature=pi-visual` | Install this server's bundle with the Pi visual routes, even over a bridge of the same version |
+| `POST /api/machines/:id/pi-desktop` | Turn Pi desktop viewing on or off for that PC (`{ "enabled": true }`) |
+| `/api/machines/:id/pane/pi-visual/*` | Pi worker list, image reviews, viewers and desktop tickets of that PC ([below](#pi-visual-tools-on-remote-pcs)) |
 
 Legacy HTTP paths, `/ws` without a machine, and old stored preferences/notification links mean **local**. Machine mutations require `X-Herdr-Machine: 1`, the existing token gate and same-origin browser requests. The proxy passes a bridge credential read through SSH; browser cookies, bearer tokens, forwarded headers and remote cookies are not forwarded. Authentication, push devices, VAPID keys and app updates belong to the current connection server.
 
@@ -110,6 +113,43 @@ does not enter the automatic bridge-update queue. Update its app through its own
 reconnect the PC here. On Windows, extraction always uses `%SystemRoot%\System32\tar.exe`, so Git
 or MSYS tools earlier on PATH cannot reinterpret the archive's drive-letter path.
 
+## Pi visual tools on remote PCs
+
+The Pi worker panel, image reviews and `/gui view` private desktops ([Pi visual tools](pi-visual-tools.md))
+work for a remote PC's original Pi panes through its bridge, with the browser connected to this
+connection server only:
+
+```
+Browser → connection server (ticket, grant, PC switch) → SSH forward → bridge → loopback guacd → loopback krdp
+```
+
+- **A bridge from this branch.** `GET /api/bridge` of such a bridge says `pi_visual: { protocol, desktop }`.
+  An upstream or older bridge says nothing; its Pi visual routes answer `409 pi_visual_bridge_required`
+  and the panel offers **Install Pi visual bridge**, which runs Update bridge with
+  `feature=pi-visual`. Terminals and chats of that PC keep working meanwhile. The default manifest
+  (the upstream release) has no such feature, so build this branch's bundle on the connection
+  server first: `bun run build:remote linux-x64` writes `remote-bundles/manifest-linux-x64.json`
+  with `"features": ["pi-visual"]` and the archive it names beside it, which the server picks up
+  ([below](#building-and-distributing-runtimes)). A manifest without the feature is refused before
+  anything is downloaded, uploaded or stopped, and a new bridge that still lacks the routes is
+  reported as a failure, not a success.
+- **Desktop viewing is off until turned on for that PC.** **Turn on desktop viewing for this PC**
+  (an interactive device; watch devices are refused) restarts a managed bridge that runs without it
+  with `HERDR_PI_GUACD_ENABLED=1`, installing the Pi visual bundle first if needed, and records the
+  choice only once the new bridge reports `desktop: true`. The choice lives in
+  `<stateDir>/pi-desktop.json`, keyed by the PC and its SSH target: it survives server restarts,
+  reconnects and bridge updates, and is dropped with the PC or a changed target. Every bridge start
+  passes `HERDR_PI_GUACD_ENABLED=1` or `=0` explicitly. An independently managed bridge is never
+  restarted: one already started with `HERDR_PI_GUACD_ENABLED=1` is taken as it is, any other fails
+  with that instruction. Turning it off stops relaying at once and ends that PC's open desktops.
+- **Prerequisites on the PC:** Linux, pi-gui with KDE/KRDP, and an H.264-capable guacd 1.6+ on
+  `127.0.0.1:4822`, installed by you. Nothing here installs guacd or host packages.
+- **Isolation.** Desktop tickets given to the browser are this server's own: 30 seconds, one use,
+  bound to the browser, the PC and the bridge connection they were issued on. The bridge's bearer
+  and its own ticket never leave this server. A `/gui view` grants only the browser that ran it, on
+  that PC's pane and bridge connection. A disconnect or reconnect of one PC ends that PC's desktop
+  relays only.
+
 ## Building and distributing runtimes
 
 `bun run build:remote` builds for the host OS and CPU after `bun run build`. Linux and macOS bundles use checksum-pinned Node 22.23.2. Linux bundles copy the installed Bun, so they must be built on the target OS/CPU. macOS bundles use checksum-pinned Bun 1.4.2 plus that platform's prebuilt PTY package (`@lydell/node-pty-<platform>`, fetched checksum-pinned from the npm registry when it is not the host's); they can also be assembled on Linux. The Windows bundle (`win32-x64`) is checksum-pinned Bun 1.4.2 alone, with no Node, PTY package or herdr, and is assembled on any OS:
@@ -122,7 +162,7 @@ bun run build:remote darwin-x64    # Intel Mac
 
 The builder verifies herdr 0.9.3, all downloaded runtime checksums, macOS executable architectures and PTY helper permissions. Native builds run an actual PTY smoke test. Cross-platform assembly records `native_smoke_tested: false`; the destination runs bundled Bun/herdr and a Node PTY smoke test **before activating** the installed runtime. macOS runtime execution still needs native CI or a real Mac to verify it. No build tools are required on the remote PC.
 
-The connection server first honors an explicit `HERDR_WEB_BUNDLE_MANIFEST`, then automatically uses `remote-bundles/manifest-<target OS>-<target CPU>.json` beside the server checkout, and otherwise downloads the versioned release. Local discovery follows the **remote** architecture, independently of the server OS and launch directory. Invalid local/configured manifests fail closed; they do not fall back to a different runtime.
+The connection server first honors an explicit `HERDR_WEB_BUNDLE_MANIFEST`, then automatically uses `remote-bundles/manifest-<target OS>-<target CPU>.json` beside the server checkout, and otherwise downloads the versioned release. A local manifest names its archive by a file name next to it; an HTTPS manifest must name absolute HTTPS asset URLs. Bundles built from this branch carry `"features": ["pi-visual"]` in the manifest and in the archive's `bundle.json` (`HERDR_BUNDLE_OUTPUT` writes them elsewhere than `remote-bundles/`); the published upstream release does not, so **Install Pi visual bridge** needs a locally built one. Local discovery follows the **remote** architecture, independently of the server OS and launch directory. Invalid local/configured manifests fail closed; they do not fall back to a different runtime.
 
 `.github/workflows/remote-bundles.yml` builds and smoke-tests Linux/macOS × x64/arm64 and Windows x64 (assembled on Linux, started on a Windows runner against herdr's own installer), plus a real SSH password-authentication job on Linux. `scripts/windows-host-qa.ts` runs the whole Add PC flow against a real Windows PC (`WINDOWS_QA_HOST`, `WINDOWS_QA_PASSWORD`). Dispatching the workflow produces artifacts; pushing a `remote-vN` tag, where N is `REMOTE_BUNDLE_VERSION` in `shared/machines.ts`, publishes all five archives and the combined `manifest.json` after the checks pass. Raising `REMOTE_BUNDLE_VERSION` makes every connected PC's bridge incompatible until it is updated (**Update bridge…**), so publish the `remote-vN` release before the app release that carries the new number. Locally built bundles and manifests under `remote-bundles/` must be rebuilt too, since an older manifest there fails closed.
 

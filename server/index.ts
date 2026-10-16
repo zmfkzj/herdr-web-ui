@@ -1,5 +1,8 @@
-import { PiVisualService, visualResponse } from "./pi-visual/service.ts";
-import type { DesktopTunnel } from "./pi-visual/guacamole.ts";
+import { PiVisualService, visualResponse, type VisualDependencies } from "./pi-visual/service.ts";
+import { desktopBinding, type DesktopTunnel, type DesktopWebSocket } from "./pi-visual/guacamole.ts";
+import { GuiViewGrants, GuiViewTyping, RelayedGuiViews } from "./pi-visual/grants.ts";
+import { RemoteDesktops } from "./pi-visual/relay.ts";
+import { VisualError } from "./pi-visual/identity.ts";
 import { readHerdrProfiles, type HerdrMachineProfile } from "./herdr-profiles.ts";
 import { randomBytes } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
@@ -339,7 +342,14 @@ async function agentLaunch(paneId: string, agent: AgentPayload): Promise<{ agent
 }
 
 interface SocketData {
-  desktop?: DesktopTunnel;
+  /** a private desktop socket: this PC's guacd tunnel, or a relay to another PC's bridge */
+  desktop?: { bind(web: DesktopWebSocket): void; message(raw: string): void };
+  /** ends `desktop` and frees its place */
+  desktopRelease?: () => void;
+  /** the browser's cookie/device binding (desktopBinding), for its `/gui view` grants */
+  binding?: string;
+  /** the keys this connection typed into its panes, for `/gui view` typed into a terminal */
+  guiTyping?: GuiViewTyping;
   deviceId?: string;
   readOnly?: boolean;
   revoked?: boolean;
@@ -506,10 +516,12 @@ export function createServer(
     terminalAttach?: boolean | (() => Promise<boolean>);
     /** whether this runtime can run the PTY sidecar; unset, server/pty/sidecar.ts says. Tests give a runtime without Node or node-pty, while herdr keeps its own answer. */
     sidecar?: boolean;
+    /** the Pi visual tools' guacd port and Pi lookups; tests point them at fixtures, never at the PC's own guacd */
+    piVisual?: Partial<VisualDependencies>;
   } = {},
 ): ServerInstance {
   const attachments = new Map<string, PaneAttachment>();
-  const piVisual = new PiVisualService(options.stateDir ?? defaultStateDir());
+  const piVisual = new PiVisualService(options.stateDir ?? defaultStateDir(), options.piVisual);
   /** whether this bridge can `terminal attach`: herdr is asked once, and the PTY sidecar has to be runnable here (server/pty/sidecar.ts) */
   /** whether the sidecar can run, settled as the server starts so that attach, /api/health and /api/bridge tell one answer; a forced answer (tests) stands in for it */
   const sidecar = options.sidecar ?? (options.terminalAttach === undefined ? sidecarAvailable() : options.terminalAttach !== false);
@@ -1199,6 +1211,14 @@ export function createServer(
   const machines = options.machines === false ? null : new MachineManager(options.stateDir ?? defaultStateDir(), push, completions, clientSnapshot);
   if (machines && options.herdrProfiles) machines.watchHerdrProfiles(options.herdrProfiles);
   const bridgeToken = randomBytes(32).toString("hex");
+  /** `/gui view <worker>` run from a browser here: that browser may then open the desktop it named (server/pi-visual/grants.ts) */
+  const guiViewGrants = new GuiViewGrants();
+  /** who runs a command on this server's own panes: an interactive browser connection only */
+  const guiOrigin = (client: ServerWebSocket<SocketData>) => client.data.binding && !client.data.readOnly && client.data.mode === "interact" && !client.data.revoked
+    ? { binding: client.data.binding, ...(client.data.deviceId ? { deviceId: client.data.deviceId } : {}), machine: "local" } : null;
+  const typingOf = (client: ServerWebSocket<SocketData>) => client.data.guiTyping ??= new GuiViewTyping(guiViewGrants, () => guiOrigin(client));
+  /** other PCs' private desktops, through their bridges (server/pi-visual/relay.ts) */
+  const remoteDesktops = machines ? new RemoteDesktops(machines, guiViewGrants) : null;
 
   function broadcast(paneId: string, message: ServerMessage): void {
     const attachment = attachments.get(paneId);
@@ -1929,7 +1949,7 @@ export function createServer(
           // a worktree made with an agent waits on git and then agent.start, up to 150 s on the PC
           bunServer.timeout(request, pathname === "/api/machines/events" ? 0 : pathname.endsWith("/worktree/create") ? 180 : 80);
           const deviceId = access.level === "full" ? access.device?.id : undefined;
-          const response = await handleMachineRequest(request, machines, deviceId ? (close) => devices.onRevoke(deviceId, close) : undefined, preferences, readOnly);
+          const response = await handleMachineRequest(request, machines, deviceId ? (close) => devices.onRevoke(deviceId, close) : undefined, preferences, readOnly, remoteDesktops ? { desktops: remoteDesktops, ...(deviceId ? { deviceId } : {}) } : undefined);
           response.headers.set("cache-control", "no-store");
           return response;
         }
@@ -1937,16 +1957,43 @@ export function createServer(
       // Chat reads can chain several valid 10 s RPCs. Leave the 15/30 s client deadline
       // in charge rather than Bun's default 10 s idle cutoff. PC proxies have their own budget above.
       if (pathname === "/api/pane/read" || pathname === "/api/pane/conversation") bunServer.timeout(request, 60);
-      if (pathname.startsWith("/api/pane/pi-visual/")) return piVisual.handle(request, url, readOnly, access.level === "full" ? access.device?.id : undefined);
+      if (pathname.startsWith("/api/pane/pi-visual/")) {
+        const deviceId = access.level === "full" ? access.device?.id : undefined;
+        // a connection server asking for its own browser (a bridge's bearer, no browser cookie or
+        // device): it checked that browser, its desktop switch and its /gui view grant already
+        const relayed = pairedDevice === null && !request.headers.get("cookie") && /^bearer /i.test(request.headers.get("authorization") ?? "")
+          && (bridgeAuthorized || (machines === null && token !== "" && tokenMatched));
+        const origin = { binding: desktopBinding(request, deviceId), machine: "local" };
+        return piVisual.handle(request, url, readOnly, deviceId, relayed ? { relayed } : { relayed, command: (paneId, worker) => {
+          const grant = guiViewGrants.find(origin, paneId, worker);
+          return grant && { worker: grant.worker, at: grant.at, consume: () => guiViewGrants.take(grant) };
+        } });
+      }
       if (pathname === "/ws") {
         if (!sameOrigin(request)) return new Response("invalid origin", { status: 403 });
         const deviceId = access.level === "full" ? access.device?.id : undefined;
         if (url.searchParams.has("pi_desktop_ticket")) {
-          if (readOnly || (url.searchParams.get("machine_id") && url.searchParams.get("machine_id") !== "local")) return new Response("Private desktop requires this host and an interactive device", { status: 403 });
+          if (readOnly) return new Response("Private desktop requires an interactive device", { status: 403 });
+          const ticketId = url.searchParams.get("pi_desktop_ticket") ?? "";
+          const claimed = url.searchParams.get("machine_id");
+          const data = (desktop: { bind(web: DesktopWebSocket): void; message(raw: string): void }, desktopRelease: () => void): SocketData => ({ attached: new Map(), watches: new Map(), conversationInterests: new Set(), mode: "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly: false, desktop, desktopRelease });
+          try {
+            // another PC's desktop: this server's own ticket, relayed through that PC's bridge
+            const relayed = remoteDesktops?.take(ticketId, desktopBinding(request, deviceId));
+            if (relayed) {
+              if (claimed && claimed !== relayed.machine) throw new VisualError("desktop_ticket_expired", "Desktop ticket expired; reconnect", 403);
+              const relay = await remoteDesktops!.open(relayed);
+              if (bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: data(relay, () => relay.close()) })) return undefined as unknown as Response;
+              relay.close();
+              return new Response("websocket upgrade required", { status: 426 });
+            }
+            if (claimed && claimed !== "local") throw new VisualError("desktop_ticket_expired", "Desktop ticket expired; reconnect", 403);
+          } catch (error) { return visualResponse(error); }
           let desktop: DesktopTunnel | undefined;
           try {
             desktop = await piVisual.take(request, deviceId);
-            const upgraded = bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: { attached: new Map(), watches: new Map(), conversationInterests: new Set(), mode: "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly: false, desktop } });
+            const tunnel = desktop;
+            const upgraded = bunServer.upgrade(request, { headers: { "sec-websocket-protocol": "guacamole" }, data: data(tunnel, () => piVisual.release(tunnel)) });
             if (upgraded) return undefined as unknown as Response;
             piVisual.release(desktop);
           } catch (error) { if (desktop) piVisual.release(desktop); return visualResponse(error); }
@@ -1958,15 +2005,19 @@ export function createServer(
           if (!machines?.endpoint(machineId)) return jsonResponse({ error: { code: "machine_offline", message: "This PC is disconnected" } }, 503);
           let relay: MachineRelay | undefined;
           try {
-            relay = new MachineRelay(machines, machineId, readOnly);
+            const binding = desktopBinding(request, deviceId);
+            // a `/gui view <worker>` on its way to that PC: this browser may open what it named (grants.ts)
+            // bound to this bridge connection: one made after a reconnect is another
+            const connection = machines.endpoint(machineId);
+            relay = new MachineRelay(machines, machineId, readOnly, new RelayedGuiViews(guiViewGrants, { binding, ...(deviceId ? { deviceId } : {}), machine: machineId, ...(connection ? { connection } : {}) }, readOnly));
             await relay.ready;
-            const upgraded = bunServer.upgrade(request, { data: { attached: new Map<string, { keepSize: boolean }>(), watches: new Map<string, PaneWatch>(), conversationInterests: new Set<string>(), mode: readOnly ? "observe" : "interact", output: new Map(), closing: false, roles: 0, relay, deviceId, readOnly } });
+            const upgraded = bunServer.upgrade(request, { data: { attached: new Map<string, { keepSize: boolean }>(), watches: new Map<string, PaneWatch>(), conversationInterests: new Set<string>(), mode: readOnly ? "observe" : "interact", output: new Map(), closing: false, roles: 0, relay, deviceId, readOnly, binding } });
             if (upgraded) return undefined as unknown as Response;
             relay.close();
           } catch { relay?.close(); return new Response("remote websocket unavailable", { status: 502 }); }
           return new Response("websocket upgrade required", { status: 426 });
         }
-        const upgraded = bunServer.upgrade(request, { data: { attached: new Map<string, { keepSize: boolean }>(), watches: new Map<string, PaneWatch>(), conversationInterests: new Set<string>(), mode: readOnly ? "observe" : "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly } });
+        const upgraded = bunServer.upgrade(request, { data: { attached: new Map<string, { keepSize: boolean }>(), watches: new Map<string, PaneWatch>(), conversationInterests: new Set<string>(), mode: readOnly ? "observe" : "interact", output: new Map(), closing: false, roles: 0, deviceId, readOnly, binding: desktopBinding(request, deviceId) } });
         if (upgraded) return undefined as unknown as Response;
         return new Response("websocket upgrade required", { status: 426 });
       }
@@ -2907,7 +2958,9 @@ export function createServer(
         if (client.data.deviceId) {
           client.data.unwatchDevice = devices.onRevoke(client.data.deviceId, () => {
             client.data.revoked = true;
-            if (client.data.desktop) piVisual.release(client.data.desktop);
+            client.data.desktopRelease?.();
+            // what this device ran opens nothing any more
+            guiViewGrants.forget((grant) => grant.deviceId === client.data.deviceId);
             client.data.closing = true;
             killWatches(client);
             clients.delete(client);
@@ -3079,6 +3132,7 @@ export function createServer(
             }
             case "detach": {
               client.data.attached.delete(message.pane_id);
+              client.data.guiTyping?.reset(message.pane_id);
               detach(message.pane_id, client);
               break;
             }
@@ -3156,6 +3210,7 @@ export function createServer(
                   if (!clients.has(client)) return;
                   authorizeSocket(client);
                   await paneSendText(message.pane_id, shaped, undefined, allowed);
+                  typingOf(client).input(message.pane_id, text);
                   // the echo is read at once, not at the mirror's next idle read
                   attachments.get(message.pane_id)?.mirror?.poke();
                 }).catch(inputFailed);
@@ -3201,9 +3256,11 @@ export function createServer(
                   if (mouse) {
                     if (!allowed() || !pty.write(text)) { inputFailed(); return; }
                     typedIntoPty(text);
+                    typingOf(client).input(message.pane_id, text);
                     return;
                   }
                   await paneSendText(message.pane_id, text, undefined, allowed);
+                  typingOf(client).input(message.pane_id, text);
                   // herdr still holds a lone ESC a moment: a message after the Stop waits out the same
                   // settling gap as after a typed one, and checks again for a question before pasting
                   if (stop) typedIntoPty(text);
@@ -3211,6 +3268,7 @@ export function createServer(
               } else {
                 if (!attachment.pty.write(message.text)) { inputFailed(); break; }
                 typedIntoPty(message.text);
+                typingOf(client).input(message.pane_id, message.text);
               }
               break;
             }
@@ -3263,6 +3321,8 @@ export function createServer(
                 send(client, { type: "error", code: "read_only", message: "this connection is in observe mode" });
                 break;
               }
+              // a named key (an arrow, a chord) edits the line in ways typing cannot follow
+              client.data.guiTyping?.keys(message.pane_id);
               const attachment = attachments.get(message.pane_id);
               // Terminal chords belong to the attachment that accepted them, just like input.
               // Unattached RPC keys retain their existing path (including native Windows).
@@ -3512,6 +3572,9 @@ export function createServer(
                 }
                 await serialize(message.pane_id, dispatch);
                 if (message.clear_draft !== undefined || message.send_anyway) draftConfirmations.get(client)?.delete(message.pane_id);
+                // `/gui view <worker>` typed into the pane from this browser: it may open that desktop (grants.ts)
+                const origin = guiOrigin(client);
+                if (origin) guiViewGrants.observe(origin, message.pane_id, message.text);
                 result(true);
               } catch (error) {
                 if (message.clear_draft !== undefined || message.send_anyway) draftConfirmations.get(client)?.delete(message.pane_id);
@@ -3576,7 +3639,7 @@ export function createServer(
               }
               if (client.data.readOnly) message.mode = "observe";
               if (message.mode === "observe") holdPending(client);
-              if (client.data.mode !== message.mode) client.data.roles++;
+              if (client.data.mode !== message.mode) { client.data.roles++; client.data.guiTyping?.reset(); }
               client.data.mode = message.mode;
               send(client, { type: "role-ack", mode: message.mode });
               if (message.mode === "observe") {
@@ -3601,7 +3664,7 @@ export function createServer(
       },
 
       close(client) {
-        if (client.data.desktop) { client.data.unwatchDevice?.(); piVisual.release(client.data.desktop); return; }
+        if (client.data.desktop) { client.data.unwatchDevice?.(); client.data.desktopRelease?.(); return; }
         client.data.unwatchDevice?.();
         client.data.closing = true;
         present.delete(client);
@@ -3650,6 +3713,7 @@ export function createServer(
       stopped = true;
       settlePortalStartup({ ok: false, error: new Error("Server stopped before Portal startup cleanup completed") });
       piVisual.close();
+      remoteDesktops?.close();
       conversations.stop();
       clearInterval(outputTimer);
       collector.stop();

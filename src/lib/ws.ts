@@ -1,5 +1,6 @@
 import type { ClientMessage, ClientRole, PendingMessage, ServerFeature, ServerMessage } from "../../shared/protocol.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../../shared/terminal-flow.ts";
+import { TypedLine, type TypedGuiView } from "../../shared/pi-visual.ts";
 
 type Handler = (message: ServerMessage) => void;
 
@@ -106,6 +107,9 @@ export class HerdrSocket {
   private snapshotKnown = false;
   private readonly outputSeen = new Set<string>();
   private readonly inputReady = new Set<string>();
+  /** the line typed into each pane's terminal from here, for `/gui view` (onGuiView) */
+  private readonly typedLines = new Map<string, TypedLine>();
+  private readonly guiViewListeners = new Set<(paneId: string, view: TypedGuiView) => void>();
   private readonly attached = new Map<string, AttachState>();
   /** panes this tab views read-only while out of use (feature "watch"), at the grid it asked for; replayed after each snapshot */
   private readonly watched = new Map<string, { cols: number; rows: number }>();
@@ -258,6 +262,7 @@ export class HerdrSocket {
     this.connectionState = "connecting";
     this.features = new Set();
     this.inputReady.clear();
+    this.typedLines.clear();
     this.outputSeen.clear();
     this.snapshotKnown = false;
     this.snapshotSeen = new Promise((resolve) => { this.markSnapshot = resolve; });
@@ -347,7 +352,7 @@ export class HerdrSocket {
       if ((message.type === "input-ready" && message.ready !== false) || (message.type === "pty-data" && this.snapshotKnown && !this.features.has("input-ready"))) {
         if (this.attached.has(message.pane_id)) this.inputReady.add(message.pane_id);
       }
-      if ((message.type === "input-ready" && message.ready === false) || message.type === "pty-exit" || (message.type === "error" && message.pane_id && ["attach_held", "input_not_ready"].includes(message.code))) this.inputReady.delete(message.pane_id!);
+      if ((message.type === "input-ready" && message.ready === false) || message.type === "pty-exit" || (message.type === "error" && message.pane_id && ["attach_held", "input_not_ready"].includes(message.code))) { this.inputReady.delete(message.pane_id!); this.typedLines.delete(message.pane_id!); }
       if (message.type === "submit-result" && this.matchesRequest(message.id, "submit", message.pane_id)) {
         this.resolveRequest(message.id, message.ok ? { ok: true, ...(message.pending ? { pending: message.pending } : {}) }
           : { ok: false, code: message.code ?? "submit_failed", message: message.message ?? "the pane did not take the message", ...(message.draft ? { draft: message.draft } : {}),
@@ -642,6 +647,7 @@ export class HerdrSocket {
   attach(paneId: string, cols: number, rows: number, keepSize = false): void {
     this.outputSeen.delete(paneId);
     this.inputReady.delete(paneId);
+    this.typedLines.delete(paneId);
     this.attached.set(paneId, { cols, rows, keepSize, releaseSizeOwed: !keepSize });
     this.send({ type: "attach", pane_id: paneId, cols, rows, flow_control: "ack", ...(keepSize ? { keep_size: true } : {}) });
     if (this.conversationWanted.has(paneId) && this.features.has("conversation-watch")) {
@@ -688,6 +694,7 @@ export class HerdrSocket {
   detach(paneId: string): void {
     this.outputSeen.delete(paneId);
     this.inputReady.delete(paneId);
+    this.typedLines.delete(paneId);
     this.attached.delete(paneId);
     this.send({ type: "detach", pane_id: paneId });
   }
@@ -771,6 +778,7 @@ export class HerdrSocket {
 
   /** Sets the connection's role. Not queued: the role replays before the attaches on reconnect. */
   setMode(mode: ClientRole): void {
+    if (mode !== this.mode) this.typedLines.clear();
     this.mode = mode;
     if (this.connected) this.rawSend({ type: "role", mode });
   }
@@ -793,7 +801,23 @@ export class HerdrSocket {
   /** `stop`: the composer's Stop, a lone ESC the bridge keeps ahead of the next message. */
   sendInput(paneId: string, text: string, stop = false): boolean {
     if (!this.canInput(paneId)) return false;
-    try { this.rawSend(stop ? { type: "input", pane_id: paneId, text, stop: true } : { type: "input", pane_id: paneId, text }); return true; } catch { return false; }
+    try { this.rawSend(stop ? { type: "input", pane_id: paneId, text, stop: true } : { type: "input", pane_id: paneId, text }); } catch { return false; }
+    this.typed(paneId, text);
+    return true;
+  }
+
+  /**
+   * `/gui view` typed straight into a pane's terminal from this socket and submitted with Enter, as
+   * the bridge follows the same keys (shared TypedLine, server/pi-visual/grants.ts).
+   */
+  onGuiView(listener: (paneId: string, view: TypedGuiView) => void): () => void {
+    this.guiViewListeners.add(listener);
+    return () => { this.guiViewListeners.delete(listener); };
+  }
+  private typed(paneId: string, text: string): void {
+    let line = this.typedLines.get(paneId);
+    if (!line) { line = new TypedLine(); this.typedLines.set(paneId, line); }
+    for (const view of line.feed(text)) for (const listener of this.guiViewListeners) listener(paneId, view);
   }
 
   /**
@@ -914,7 +938,10 @@ export class HerdrSocket {
 
   sendKeys(paneId: string, keys: string[]): boolean {
     if (!this.canInput(paneId)) return false;
-    try { this.rawSend({ type: "keys", pane_id: paneId, keys }); return true; } catch { return false; }
+    try { this.rawSend({ type: "keys", pane_id: paneId, keys }); } catch { return false; }
+    // a named key edits the line in ways typing cannot follow
+    this.typedLines.get(paneId)?.lose();
+    return true;
   }
 
   close(): void {

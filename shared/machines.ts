@@ -1,4 +1,5 @@
 import type { SharedPreferences } from "./preferences.ts";
+import type { PiVisualBridge } from "./pi-visual.ts";
 import type { HealthAuth, ServerMessage, SessionSnapshot } from "./protocol.ts";
 
 export const LOCAL_MACHINE = "local";
@@ -28,6 +29,13 @@ export interface Machine {
   updating?: MachineUpdate | null;
   snapshot: SessionSnapshot | null;
   herdr?: HerdrIdentity;
+  /**
+   * The pi-visual routes the PC's bridge serves (a bridge built from this branch); null when the
+   * connected bridge has none (an upstream or older bundle), absent while it is not connected.
+   */
+  pi_visual?: PiVisualBridge | null;
+  /** Pi desktop viewing turned on for this PC by its user here (off unless they did) */
+  pi_desktop?: boolean;
 }
 /**
  * The herdr behind a PC, as its bridge can serve it. terminal_attach is false on a Windows
@@ -91,6 +99,8 @@ export interface BridgeIdentity {
   socket_path: string;
   socket_id: string;
   herdr: HerdrIdentity;
+  /** set by bridges whose bundle carries the pi-visual routes; upstream bridges leave it out */
+  pi_visual?: PiVisualBridge;
 }
 
 /** Local storage keeps its historical keys; remote IDs occupy a separate namespace. */

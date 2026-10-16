@@ -61,6 +61,15 @@ describe("remote bundle sources", () => {
     await expect(bundleFile("darwin-arm64", controller.signal, options)).rejects.toThrow("test cancelled");
   });
 
+  it("installs a bundle for the Pi visual bridge only when its manifest carries the feature", async () => {
+    const { directory, manifest, sha256 } = fixture("linux-x64");
+    const options = { directory, manifest: "", feature: "pi-visual" };
+    // upstream's manifests name no features: nothing is uploaded for a feature they lack
+    await expect(bundleFile("linux-x64", new AbortController().signal, options)).rejects.toThrow("does not include pi-visual");
+    writeFileSync(manifest, JSON.stringify({ version: REMOTE_BUNDLE_VERSION, features: ["pi-visual"], assets: { "linux-x64": { url: "bundle.tgz", sha256 } } }));
+    expect((await bundleFile("linux-x64", new AbortController().signal, options)).sha256).toBe(sha256);
+  });
+
   it("reuses a cached release bundle by checksum and never trusts a changed one", async () => {
     const { directory, manifest, bytes, sha256 } = fixture("linux-x64");
     // an unreachable release URL: only the cache can answer
