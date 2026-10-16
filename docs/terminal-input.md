@@ -90,6 +90,24 @@ stream because Herdr's RPC key parser lacks those names. Paste, IME commits and 
 The input line and chat composer send their text as typed. Changing panes, leaving the
 terminal view or disconnecting clears the held modifiers.
 
+Enter in direct typing goes as xterm.js types it, except for the modified Enters it cannot encode
+for the pane's program. Shift+Enter sends ESC CR, the Alt+Enter newline chord (Claude Code's new
+line; pi reads it as Shift+Enter under the Kitty keyboard protocol herdr gives it). Ctrl+Enter sends
+CSI 27;5;13~ once the program asked for modifyOtherKeys, and plain Enter otherwise. Alt+Enter
+alone (Option+Enter on a Mac) goes as herdr's `alt+enter` key, which herdr encodes in the program's
+own mode: CSI 13;3u under Kitty, so pi gets its own Alt+Enter (`app.message.followUp`: queue a
+follow-up while it answers, submit while it is idle), and ESC CR in the legacy mode, as before.
+xterm.js's ESC CR alone is the same bytes as Shift+Enter, which pi took for a new line. A program
+that asked for modifyOtherKeys keeps that ESC CR, the Alt+Enter it has always read; a mirrored pane,
+which never shows the browser that request, leaves the encoding to herdr. Only this exact chord
+changes: Alt+Shift+Enter, Ctrl+Alt+Enter, Cmd+Enter, Option letters and an IME's own Enter keep
+xterm's behavior, and pending IME text is sent first. Like every key sent by name, it is never held
+in a draft or sent later: beside held text, while the terminal is not ready, or offline it is
+refused with a notice, and a view-only terminal sends nothing. It also leaves a typed `/gui view`
+line unrecognized until the next Enter, as other named keys do. The input line and the chat
+composer keep their own Enter: there Option+Enter acts as Enter does in that box, not as pi's
+follow-up (the composer's Send while an agent works already keeps its message pending).
+
 On macOS, Cmd+Left and Cmd+Right in direct typing send Ctrl+A and Ctrl+E, moving to the
 beginning and end of the input line in shells and agents that use those bindings.
 Pending IME text is sent first. Additional modifiers retain xterm's behavior; the input line
@@ -133,6 +151,15 @@ The new readiness frame is also implemented in the website demo transport.
   movement, exact bytes and real readline cursor positions, IME ordering, repeat, modifier,
   unchanged Ctrl+arrows, Windows and Linux checks.
   Uses Chromium with a simulated Mac platform, not native macOS Safari or an OS IME.
+- `bun run build && bun scripts/terminal-alt-enter-regression.ts`: Alt+Enter (Option+Enter) as
+  one `alt+enter` key and the exact bytes a raw-mode program reads under the legacy, Kitty and
+  modifyOtherKeys modes; the other Enters and an Option letter unchanged; IME order; refusals not
+  ready, beside a held draft, view only and offline, never sent later. Mac and Linux platforms in
+  Chromium. Also included in `bun run test:ui`.
+- `bun run check run --build bun scripts/pi-alt-enter-regression.ts`: real pi 1.3 with its default
+  keys, on this PC and through a remote PC's bridge (loopback SSH): Option+Enter submits an idle
+  line once, queues a follow-up while pi answers (sent once, after the answer), and Shift+Enter
+  still breaks the line. The model is a loopback fixture; the Mac is Chromium with a Mac platform.
 - `bun scripts/file-viewer-regression.ts`: existing navigation and touch regressions.
 
 Synthetic composition events exercise event handling, not a real Samsung/Gboard/iOS IME.

@@ -13,7 +13,7 @@ import { useMachineSessions } from "../lib/machineSessionContext.tsx";
 import { ViewportIntentGate } from "../lib/viewportIntent.ts";
 import { PaneCachedContext, PanePresentedContext, PaneFollowContext, PaneShownContext, PaneSubmitContext } from "../lib/paneSubmitContext.ts";
 import { disposeAfterPendingFrame } from "../lib/terminalDispose.ts";
-import { clipboardKey, hasModifiers, physicalKey, terminalChord, navigationSequence, keyFromData, ctrlEnterSequence, mirroredCtrlEnterKey, modifyOtherKeysLevel, NO_STICKY_MODIFIERS, type StickyModifiers } from "../lib/keys.ts";
+import { clipboardKey, hasModifiers, physicalKey, terminalChord, navigationSequence, keyFromData, ctrlEnterSequence, mirroredCtrlEnterKey, altEnterKey, modifyOtherKeysLevel, NO_STICKY_MODIFIERS, type StickyModifiers } from "../lib/keys.ts";
 import { keyBarInputSequence, type KeyBarKeyItem } from "../lib/keyBar.ts";
 import { EMPTY_DRAFT, applyToDraft, draftIsEmpty, restoreDraft, type InputDraft } from "../lib/draft.ts";
 import { messageQueues } from "../lib/messageQueue.ts";
@@ -1325,13 +1325,24 @@ export function PaneTerminal({
     // newline chord, Ctrl+Enter what modifyOtherKeys makes it (Claude Code's "send now") while
     // the program has asked for that, and stays Enter otherwise. A mirrored pane never hears that
     // request, so its Ctrl+Enter goes as herdr's key, which herdr encodes as the program asked.
+    // Alt+Enter alone (Option+Enter) xterm.js types as ESC CR for every program, the same bytes as
+    // that newline chord: it goes as herdr's key (altEnterKey), which a Kitty-protocol program such
+    // as pi reads as Alt+Enter (its follow-up), not as Shift+Enter.
+    let enterData = "\r";
     let enterAs: string | null = null;
     let enterKey: string | null = null;
     const onModifiedEnter = term.onKey(({ key, domEvent: event }) => {
+      enterData = key;
       enterAs = null;
       enterKey = null;
-      if (term.options.disableStdin || key !== "\r" || event.key !== "Enter" || event.altKey || event.metaKey
+      if (term.options.disableStdin || event.key !== "Enter" || event.metaKey
         || event.isComposing || event.keyCode === 229) return;
+      if (key === "\x1b\r" && event.altKey && !event.ctrlKey && !event.shiftKey) {
+        enterKey = altEnterKey(fixedGridRef.current, modifyOtherKeysRef.current);
+        if (enterKey !== null) enterAs = key;
+        return;
+      }
+      if (key !== "\r" || event.altKey) return;
       if (event.shiftKey && !event.ctrlKey) enterAs = "\x1b\r";
       else if (event.ctrlKey && !event.shiftKey) {
         enterKey = mirroredCtrlEnterKey(fixedGridRef.current, modifyOtherKeysRef.current);
@@ -1380,11 +1391,12 @@ export function PaneTerminal({
       stopKeyRef.current = false;
       const physicalChord = typedChord;
       typedChord = null;
-      // a modified Enter (Shift+Enter's newline, Ctrl+Enter's "send now") is decided on before its
-      // rewrite: its sequence may carry no line break at all
-      const modifiedEnter = enterAs !== null && data === "\r";
+      // a modified Enter (Shift+Enter's newline, Ctrl+Enter's "send now", Alt+Enter's herdr key) is
+      // decided on before its rewrite: its sequence may carry no line break at all
+      const modifiedEnter = enterAs !== null && data === enterData;
       const enterChord = modifiedEnter ? enterKey : null;
       if (modifiedEnter) data = enterAs!;
+      enterData = "\r";
       enterAs = null;
       enterKey = null;
       if (commandBackspace && data === "\x7f") data = "\x15";

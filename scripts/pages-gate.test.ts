@@ -279,7 +279,7 @@ describe("Extracted UI checks", () => {
     expect(contexts.filter((name) => moved.includes(name))).toEqual(moved);
     expect(core.filter((name) => moved.includes(name))).toEqual([]);
     for (const name of ["checkTerminalInput", "checkSafariIme", "checkHeldDraftPaneSwitch",
-      "checkCommandBackspace", "checkCtrlEnter", "checkCommandArrows"]) {
+      "checkCommandBackspace", "checkCtrlEnter", "checkAltEnter", "checkCommandArrows"]) {
       expect(core.filter((call) => call === name)).toHaveLength(1);
     }
   });

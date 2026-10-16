@@ -103,9 +103,11 @@ process.stdin.on("data", (data) => {
     let since = reads().length;
     await press("Control+Enter", ctrlEnter(true));
     await read(MODIFIED_CTRL_ENTER, since);
-    for (const [shortcut, expected] of [["Enter", "\r"], ["Shift+Enter", "\x1b\r"], ["Alt+Enter", "\x1b\r"]]) {
+    for (const [shortcut, expected] of [["Enter", "\r"], ["Shift+Enter", "\x1b\r"]]) {
       await press(shortcut!, typed(expected!));
     }
+    // under modifyOtherKeys Alt+Enter keeps xterm's ESC CR; a mirror sends herdr's key (checkAltEnter)
+    await press("Alt+Enter", mirrored ? { type: "keys", pane_id: paneId, keys: ["alt+enter"] } : typed("\x1b\r"));
     // a composition's Enter belongs to the IME
     for (const composition of [{ isComposing: true, keyCode: 13 }, { isComposing: false, keyCode: 229 }]) {
       const before = inputs.length;

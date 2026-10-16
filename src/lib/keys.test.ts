@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { altSequence, clipboardKey, physicalKey, controlCode, ctrlEnterSequence, mirroredCtrlEnterKey, isPrintable, keySequence, modifyOtherKeysLevel, sanitizeKeyBarExtras, navigationSequence, terminalChord, keyFromData } from "./keys.ts";
+import { altEnterKey, altSequence, clipboardKey, physicalKey, controlCode, ctrlEnterSequence, mirroredCtrlEnterKey, isPrintable, keySequence, modifyOtherKeysLevel, sanitizeKeyBarExtras, navigationSequence, terminalChord, keyFromData } from "./keys.ts";
 
 describe("clipboardKey", () => {
   it("recognizes native Ctrl+C/V on Korean and Russian layouts without replacing Latin layout letters", () => {
@@ -217,5 +217,20 @@ describe("mirroredCtrlEnterKey", () => {
     // control: unchanged on an attached pane, with or without modifyOtherKeys
     expect(mirroredCtrlEnterKey(false, 0)).toBeNull();
     expect(mirroredCtrlEnterKey(false, 2)).toBeNull();
+  });
+});
+
+describe("altEnterKey", () => {
+  it("sends Alt+Enter as herdr's key, which a Kitty-protocol program reads as Alt+Enter, not ESC CR's Shift+Enter", () => {
+    // regression (fails on main): pi under herdr's Kitty protocol took Option+Enter's ESC CR for Shift+Enter
+    expect(altEnterKey(false, 0)).toBe("alt+enter");
+    // a mirror never shows the browser the program's modes: herdr, which knows them, encodes the key
+    expect(altEnterKey(true, 0)).toBe("alt+enter");
+  });
+
+  it("keeps xterm.js's ESC CR for an attached program that asked for modifyOtherKeys", () => {
+    // control: Claude Code asks for level 2 and reads ESC CR as its Alt+Enter new line
+    expect(altEnterKey(false, 1)).toBeNull();
+    expect(altEnterKey(false, 2)).toBeNull();
   });
 });

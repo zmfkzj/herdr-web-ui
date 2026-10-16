@@ -203,3 +203,17 @@ export function ctrlEnterSequence(modifyOtherKeys: number): string | null {
 export function mirroredCtrlEnterKey(mirrored: boolean, modifyOtherKeys: number): string | null {
   return mirrored && modifyOtherKeys === 0 ? "ctrl+enter" : null;
 }
+
+/**
+ * Alt+Enter (Option+Enter on a Mac) as a herdr key, or null to keep xterm.js's own ESC CR.
+ * xterm.js 5.5 types Alt+Enter as ESC CR whatever the program asked for, and herdr passes typed
+ * bytes on as they are, but on the Kitty keyboard protocol ESC CR is Shift+Enter: pi read Option+Enter
+ * as a new line, never as its follow-up (`app.message.followUp`, `alt+enter`). herdr encodes the key
+ * in the program's own mode: CSI 13;3u under Kitty, ESC CR in the legacy mode (herdr 0.9.5).
+ * A program that asked for modifyOtherKeys keeps ESC CR, the Alt+Enter it has always read (Claude
+ * Code's new line, which Shift+Enter's chord relies on), where herdr would send CSI 27;3;13~.
+ * A mirrored pane never tells the browser that request: its key goes to herdr, which knows it.
+ */
+export function altEnterKey(mirrored: boolean, modifyOtherKeys: number): string | null {
+  return mirrored || modifyOtherKeys === 0 ? "alt+enter" : null;
+}
