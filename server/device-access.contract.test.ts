@@ -189,6 +189,14 @@ it("watch credentials cannot mutate HTTP state, read credential files, or elevat
       expect(response.status).toBe(403);
       if (method === "GET") expect(await response.json()).toMatchObject({ error: { code: "read_only" } });
     }
+    // a terminal image marker's `file:` ref reads a file: refused like one, here and through a PC (a tool image is not)
+    for (const prefix of ["", "machines/pc1/"]) {
+      const query = new URLSearchParams({ pane_id: "w1:p1", ref: `file:${join(root, "devices.json")}`, session: "s", digest: "0".repeat(32) });
+      const response = await fetch(`${base}/api/${prefix}pane/conversation/image?${query}`, { headers });
+      expect([prefix, response.status]).toEqual([prefix, 403]);
+      expect(await response.json()).toMatchObject({ error: { code: "read_only" } });
+    }
+    expect((await fetch(`${base}/api/pane/conversation/image?pane_id=w1%3Ap1&ref=pi%3Acall%3A0`, { headers })).status).not.toBe(403);
     // a repository's changes are file contents: refused like a file read, on this PC and through a PC's route
     for (const path of ["workspace/diff/files", "workspace/diff/file", "machines/pc1/workspace/diff/files", "machines/pc1/workspace/diff/file", "machines/local/workspace/diff/file"]) {
       const response = await fetch(`${base}/api/${path}?directory=${encodeURIComponent(root)}&path=devices.json`, { headers });

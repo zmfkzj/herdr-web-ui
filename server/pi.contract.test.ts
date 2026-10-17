@@ -233,6 +233,56 @@ it("serves provider-composite tool call ids (call_…|fc_…) to the chat and to
   }
 });
 
+it("serves a pasted picture's file to a terminal marker only, bound to the pi session and the digest of its bytes", async () => {
+  writeFileSync(transcript, turns("Check chat", "Answer one"));
+  const folder = join(root, ".herdr-web-ui");
+  mkdirSync(folder, { recursive: true });
+  // what herdr-web-ui's upload names a paste, plus Korean, spaces, `#` and `%` the marker percent-encodes
+  const pasted = join(folder, "붙여넣기 #1 100%.png");
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+  const bytes = Buffer.concat([PNG, Buffer.from("pasted")]);
+  writeFileSync(pasted, bytes);
+  const digestOf = (value: Buffer) => new Bun.CryptoHasher("sha256").update(value).digest("hex").slice(0, 32);
+  const get = (query: Record<string, string>) => fetch(`http://127.0.0.1:${server.port}/api/pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ...query })}`);
+  const bound = (path: string, digest = digestOf(bytes), session = "session") => get({ ref: `file:${path}`, session, digest });
+  try {
+    const response = await bound(pasted);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("x-herdr-pi-session")).toBe("session");
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    expect(Buffer.from(await response.arrayBuffer()).equals(bytes)).toBe(true);
+    // never by ref alone (the chat's reads), nor for another session or other bytes
+    expect((await get({ ref: `file:${pasted}` })).status).toBe(404);
+    expect((await bound(pasted, digestOf(bytes), "session-two")).status).toBe(404);
+    expect((await bound(pasted, digestOf(PNG))).status).toBe(404);
+    // the file changed since pi drew it: the old marker shows nothing, not the new bytes
+    writeFileSync(pasted, Buffer.concat([PNG, Buffer.from("edited")]));
+    expect((await bound(pasted)).status).toBe(404);
+    // typed by its bytes, not its name
+    const misnamed = join(folder, "photo.png");
+    writeFileSync(misnamed, JPEG);
+    const typed = await bound(misnamed, digestOf(JPEG));
+    expect(typed.status).toBe(200);
+    expect(typed.headers.get("content-type")).toBe("image/jpeg");
+    // no image, no file, a folder, a relative or dotted path
+    const text = join(folder, "notes.txt");
+    writeFileSync(text, "secret");
+    expect((await bound(text, digestOf(Buffer.from("secret")))).status).toBe(404);
+    expect((await bound(join(folder, "gone.png"))).status).toBe(404);
+    expect((await bound(folder)).status).toBe(404);
+    expect((await get({ ref: "file:shot.png", session: "session", digest: digestOf(bytes) })).status).toBe(404);
+    expect((await bound(`${folder}/../.herdr-web-ui/photo.png`, digestOf(JPEG))).status).toBe(404);
+    // past the browser's own bound
+    const large = join(folder, "large.png");
+    const big = Buffer.concat([PNG, Buffer.alloc(8 * 1024 * 1024)]);
+    writeFileSync(large, big);
+    expect((await bound(large, digestOf(big))).status).toBe(404);
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+});
+
 it("resolves pi's context window from the agent dir pi reads its models from", async () => {
   writeFileSync(transcript, turns("Check chat", "Answer one"));
   expect((await read()).metadata?.context?.window).toBeNull();

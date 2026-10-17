@@ -365,8 +365,9 @@
 
 /* pi images over the rows the images extension marks (docs/terminal-images.md). The layer is
    clipped to the grid, below xterm's helpers (the IME composition stays on top), and takes no
-   pointer events: selection, links and input reach the terminal as before. Each image keeps its
-   whole footprint inside a box of the rows that are visible, aspect kept, from the top left as
+   pointer events: selection, links and input reach the terminal as before, except on an image
+   itself, whose click opens it in the image viewer (enlarge, download, comments). Each image keeps
+   its whole footprint inside a box of the rows that are visible, aspect kept, from the top left as
    the native image is. */
 .pane-terminal .terminal-image-layer {
   position: absolute;
@@ -378,6 +379,8 @@
 .pane-terminal .terminal-image {
   position: absolute;
   overflow: hidden;
+  pointer-events: auto;
+  cursor: zoom-in;
 }
 .pane-terminal .terminal-image img {
   position: absolute;

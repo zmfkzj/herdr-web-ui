@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { isPiToolCallId, parsePiImageRef, parseTerminalImageMarker, PI_TOOL_CALL_ID_MAX, terminalImagePlacements, TERMINAL_IMAGE_URI_MAX, type MarkerCell } from "./terminal-images.ts";
+import { isPiToolCallId, parsePiFileRef, parsePiImageRef, parseTerminalImageMarker, PI_FILE_REF_PATH_MAX, PI_TOOL_CALL_ID_MAX, terminalImagePlacements, TERMINAL_IMAGE_URI_MAX, type MarkerCell } from "./terminal-images.ts";
 
 const DIGEST = "0123456789abcdef0123456789abcdef";
 const uri = (fields: Record<string, string | number>) => `x-pi-image:v1?${Object.entries(fields).map(([key, value]) => `${key}=${value}`).join("&")}`;
@@ -39,6 +39,26 @@ describe("terminal image markers", () => {
       uri(base).replace("&h=", "&h=%0A"),
     ];
     for (const value of refused) expect(parseTerminalImageMarker(value)).toBeNull();
+  });
+});
+
+describe("pasted pictures' file refs in markers", () => {
+  it("reads `file:<absolute path>` as the extension encodes it, Korean, spaces, `#` and `%` included", () => {
+    const path = "/home/u/.herdr-web-ui/붙여넣기 #1 100%.png";
+    expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(`file:${path}`) }))?.ref).toBe(`file:${path}`);
+    expect(parsePiFileRef(`file:${path}`)).toEqual({ path });
+    expect(parsePiFileRef("file:C:\\Users\\a.png")).toEqual({ path: "C:\\Users\\a.png" });
+  });
+
+  it("refuses relative, dotted, control-character and oversized paths, and anything past the URI cap", () => {
+    for (const ref of ["file:", "file:/", "file:shot.png", "file:~/shot.png", "file:/tmp/../etc/a.png", "file:/tmp/./a.png", "file:/tmp/a\nb.png",
+      "file:/tmp/a\u0000.png", `file:/${"a".repeat(PI_FILE_REF_PATH_MAX)}`, "FILE:/tmp/a.png", "file://host/a.png"]) {
+      expect([ref, parsePiFileRef(ref)]).toEqual([ref, ref === "file://host/a.png" ? { path: "//host/a.png" } : null]);
+      if (ref !== "file://host/a.png") expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(ref) }))).toBeNull();
+    }
+    expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(`file:/${"한".repeat(60)}.png`) }))).toBeNull();
+    // the image endpoint's tool refs are unchanged
+    expect(parsePiImageRef("file:/tmp/a.png")).toBeNull();
   });
 });
 

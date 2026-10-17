@@ -59,7 +59,10 @@ import { fileUriPath, hyperlinkFilter, isWebLink, terminalFileLinkProvider } fro
 import { adjustTerminalGlyphs } from "../lib/terminalGlyphs.ts";
 import { terminalLabel } from "../lib/terminalLabel.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
-import { TerminalImageLayer, terminalImageSource } from "../lib/terminalImages.ts";
+import { TerminalImageLayer, terminalImageGallery, terminalImageSource } from "../lib/terminalImages.ts";
+import type { GalleryImage } from "../lib/imageViewer.ts";
+import { ImageLightbox } from "./ImageLightbox.tsx";
+import { ImageReview } from "./pi-visual/ImageReview.tsx";
 import { modalOpen } from "../lib/focus.ts";
 import { pinchFontSize } from "../lib/pinchFontSize.ts";
 import { narrowPaneFontSize } from "../lib/narrowPaneFont.ts";
@@ -332,6 +335,11 @@ export function PaneTerminal({
   // name stays as it is; another name is the one Pi opened.
   const [guiView, setGuiView] = useState<{ pane: string; worker: string | null; completing: boolean; serial: number } | null>(null);
   const agentRef = useRef(agent); agentRef.current = agent;
+  // A picture clicked in the terminal opens over the page as the chat's do: the image viewer
+  // (enlarge, download), and from it pi's image comments. Held here, keyed to the pane and PC it
+  // was opened on, so another pane or PC never shows it.
+  const [terminalImage, setTerminalImage] = useState<{ owner: string; ref: string; type: string } | null>(null);
+  const [terminalReview, setTerminalReview] = useState<{ owner: string; image: GalleryImage } | null>(null);
   const openGuiViewRef = useRef((pane: string, view: TypedGuiView) => {
     if (agentRef.current !== "pi") return;
     setGuiView((open) => view.confirmed && open !== null && open.pane === pane
@@ -614,6 +622,10 @@ export function PaneTerminal({
     // pane left behind that is parsed late names a session this pane does not run: no image.
     const images = new TerminalImageLayer(term, (placement) => terminalImageSource(machineId, paneRef.current, placement));
     imagesRef.current = images;
+    images.onOpen = (placement, image) => {
+      const pane = paneRef.current;
+      if (pane !== null) setTerminalImage({ owner: paneStorageId(machineId, pane), ref: placement.ref, type: image.type });
+    };
     const onImagesParsed = term.onWriteParsed(() => images.schedule());
     // a resized grid is redrawn whole by herdr; until then a marker's cell may have moved
     const onImagesResize = term.onResize(() => images.clear());
@@ -2549,6 +2561,11 @@ export function PaneTerminal({
   });
   // an empty chat: one greeting line over the composer, which a mouse-driven window centres
   const folder = greetingFolder(cwd);
+  const imageOwner = paneId === null ? null : paneStorageId(machineId, paneId);
+  const terminalGallery = terminalImage !== null && paneId !== null && terminalImage.owner === imageOwner && !chatView
+    ? terminalImageGallery(machineId, paneId, terminalImage, terminalImage.type, t("Attached image")) : null;
+  // another pane or PC closes what the terminal opened
+  useEffect(() => { setTerminalImage(null); setTerminalReview(null); }, [imageOwner]);
   const greetingDue = chatView && paneId !== null && agent !== null && !secretActive && !observing && !ended
     && showsGreeting({ memory: greetingMemory(paneStorageId(machineId, paneId)), agentStatus, queued: queued.length + pending.length, folder });
   // a stack too short for the composer and the greeting keeps the chat's own empty line
@@ -2899,6 +2916,11 @@ export function PaneTerminal({
       {presented && findOpen && !chatView && paneId !== null && (
         <FindBar key={paneId} paneId={paneId} viewportIntent={viewportIntent} onResult={setSearchState} activePane={active} focusRequest={findRequest} disabled={!connected || held || ended || released || !outputReady}
           onClose={() => { setFindOpen(false); if (activeRef.current && !coarse) termRef.current?.focus(); }} />
+      )}
+      {terminalGallery !== null && <ImageLightbox images={[terminalGallery]} index={0} onClose={() => setTerminalImage(null)}
+        onReview={agent === "pi" && !observing ? (image) => { setTerminalImage(null); setTerminalReview({ owner: imageOwner!, image }); } : undefined} />}
+      {paneId !== null && terminalReview !== null && terminalReview.owner === imageOwner && agent === "pi" && !observing && (
+        <ImageReview key={`${machineId}:${paneId}:${terminalReview.image.src}`} paneId={paneId} machineId={machineId} image={terminalReview.image} onClose={() => setTerminalReview(null)} />
       )}
       {paneId !== null && agent === "pi" && chatView && !observing && <PiVisualTools key={`${machineId}:${paneId}`} paneId={paneId} machineId={machineId} enabled={presented && connected && !ended} />}
       {paneId !== null && guiView !== null && guiView.pane === paneId && agent === "pi" && !observing && presented && (

@@ -9,9 +9,13 @@ Pictures that pi draws inline in its TUI — the images of **tool results** (`re
 terminal, at the same cells, on this PC and on remote PCs. This needs the pi images extension's
 terminal references (below); without them the terminal behaves as before.
 
-Not covered: images of other programs (any Kitty/SIXEL/iTerm2 output that is not pi's), pi's
-pasted-image preview and the images extension's `pasted-images` entries (they are files, not part
-of the session), images of nested tool calls, and other agents (omp, Claude, Codex...).
+Pictures the user pastes (the images extension's preview above the editor, and its `pasted-images`
+entry once the message is sent) appear the same way: the extension draws them natively and names
+them by their file (`file:` refs, below). A click on any of these pictures opens it in the image
+viewer the chat uses (ImageLightbox): enlarge, download, and pi's image comments (ImageReview).
+
+Not covered: images of other programs (any Kitty/SIXEL/iTerm2 output that is not pi's), images of
+nested tool calls, and other agents (omp, Claude, Codex...).
 
 ## Why it needs a marker
 
@@ -45,8 +49,17 @@ taken (no control character, no non-ASCII); `n` is the digits after the last col
 hold colons. `n` counts the tool result's image blocks with base64 data and type
 png/jpeg/gif/webp; `h` is the first 32 hex digits of the SHA-256 of those decoded bytes. The URI is
 at most 512 characters, which bounds a marker's id further: an id too long to fit gets no marker
-(and no image in the terminal), though the chat still serves it. The marker holds no path, URL or
-pixels. Native Kitty output is otherwise unchanged; the first image row carries no marker because
+(and no image in the terminal), though the chat still serves it. The marker holds no URL or pixels.
+
+A picture pi drew from a file rather than a tool result (a pasted image) is named
+`ref=<pct("file:<absolute path>")>` instead (`parsePiFileRef`): a POSIX or Windows-drive absolute path
+of at most 1024 characters, no control character and no `.`/`..` segment; `h` is the digest of the
+bytes the extension drew. The image endpoint serves a `file:` ref only for a marker's session- and
+digest-bound read (never by ref alone, as the chat's reads are): the pane must run pi on that session
+now, the file must be a regular file of at most 8 MiB whose bytes are PNG, JPEG, GIF or WebP (typed by
+those bytes), and its bytes must have digest `h`, so a file changed or removed since pi drew it shows
+nothing. A watching device is refused it like any file read. A path whose marker would pass 512
+characters gets no marker; the extension then draws the text-cell preview instead. Native Kitty output is otherwise unchanged; the first image row carries no marker because
 pi's fullscreen mode puts a cropped image line there.
 
 `shared/terminal-images.ts` parses it strictly (six keys once each, pi's session-id rule, the ref
@@ -93,7 +106,16 @@ chat's tool images and a pi tool's whole output take the same id rule (`parsePiI
   never evicting one on screen. A missing image is asked again after 1, 4 and 15 s (pi may draw a
   result before writing it); a refused one is not, so a forged marker costs one request.
 - Images are drawn in a layer inside `.xterm-screen`, clipped to it, below xterm's IME helpers, with
-  `pointer-events: none`; each keeps its aspect ratio from the top left of its `c × r` cells. The
+  `pointer-events: none` except on the drawn pictures; each keeps its aspect ratio from the top left
+  of its `c × r` cells.
+- **Opening a picture.** A click on a drawn picture (any visible row of it, the image line and a
+  one-row image included) opens it in the image viewer over the page; a press there starts no
+  terminal selection, and the wheel still scrolls the terminal. The viewer is named by the server
+  URL the chat uses, never the terminal's decoded copy: a tool image by
+  `pane/conversation/image?pane_id&ref` (comments take it as a conversation source), a pasted
+  picture by `fs/file?path&pane_id` (as an `@path` mention; comments take it as a file source). The
+  comment button shows for a pi pane on an interactive device; feedback goes to the message draft,
+  never sent automatically. Another pane or PC closes what was open. The
   attach stream stays the only source of the screen: `scrollback: 0`, no `pane.read` rebuild, no
   file or URL reads, and ACKs are never held for an image.
 
@@ -119,6 +141,8 @@ not show stale ones).
    its commit d264707). It writes markers only when pi uses Kitty images inside a herdr pane
    (`TERM_PROGRAM=herdr`); `PI_IMAGES_TERMINAL_REFS=0` turns it off, `=1` forces it on (still Kitty
    only). A pi session started before the extension was installed loads it on restart or `/reload`.
+   Pasted pictures need a version of the extension that names them by `file:` refs (`markFileImage`);
+   an older one keeps its text-cell previews, which do not open on click.
    herdr's pi integration (installed by herdr) must report the session, as it does for Chat. That
    extension already escapes `|`; an id with `!'()*` gets a marker only from a version that escapes
    those too (RFC 3986). Ids such as `call_…|fc_…` need no extension update and no pi restart:

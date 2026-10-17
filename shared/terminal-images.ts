@@ -49,6 +49,24 @@ export function parsePiImageRef(ref: string): { toolCallId: string; index: numbe
   return { toolCallId, index: Number(index) };
 }
 
+/** The longest image file path a `file:` ref names. */
+export const PI_FILE_REF_PATH_MAX = 1024;
+
+/**
+ * The image endpoint's file ref, `file:<absolute path>`: an image pi drew from a file rather than a
+ * tool result (a picture the user pasted, before and after it is sent). Absolute (POSIX `/…` or a
+ * Windows drive `C:\…`), at most 1024 characters, no control character and no `.`/`..` segment.
+ * Served only for a terminal marker's session-and-digest-bound read, never by ref alone.
+ */
+export function parsePiFileRef(ref: string): { path: string } | null {
+  if (!ref.startsWith("file:")) return null;
+  const path = ref.slice(5);
+  if (path.length < 2 || path.length > PI_FILE_REF_PATH_MAX || /[\u0000-\u001f\u007f]/.test(path)) return null;
+  if (!path.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(path)) return null;
+  if (path.split(/[\\/]/).some((segment) => segment === "." || segment === "..")) return null;
+  return { path };
+}
+
 const DIGEST = /^[0-9a-f]{32}$/;
 const COUNT = /^(?:0|[1-9]\d{0,3})$/;
 const KEYS = ["s", "ref", "h", "c", "r", "y"] as const;
@@ -56,7 +74,7 @@ const KEYS = ["s", "ref", "h", "c", "r", "y"] as const;
 export interface TerminalImageMarker {
   /** pi session id that drew the image */
   session: string;
-  /** the image endpoint's ref */
+  /** the image endpoint's ref: `pi:<tool call id>:<n>`, or `file:<absolute path>` */
   ref: string;
   /** first 32 hex digits of the SHA-256 of the image's bytes */
   digest: string;
@@ -88,7 +106,7 @@ export function parseTerminalImageMarker(uri: string): TerminalImageMarker | nul
   }
   if (values.size !== KEYS.length) return null;
   const [session, ref, digest, c, r, y] = KEYS.map((key) => values.get(key)!);
-  if (!PI_SESSION_ID.test(session!) || parsePiImageRef(ref!) === null || !DIGEST.test(digest!)) return null;
+  if (!PI_SESSION_ID.test(session!) || (parsePiImageRef(ref!) === null && parsePiFileRef(ref!) === null) || !DIGEST.test(digest!)) return null;
   if (!COUNT.test(c!) || !COUNT.test(r!) || !COUNT.test(y!)) return null;
   const cols = Number(c), rows = Number(r), row = Number(y);
   if (cols < 1 || rows < 1 || cols > TERMINAL_IMAGE_MAX_CELLS || rows > TERMINAL_IMAGE_MAX_CELLS || row >= rows) return null;

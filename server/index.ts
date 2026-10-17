@@ -1959,7 +1959,9 @@ export function createServer(
       const ownPreferences = pathname === "/api/auth" || pathname === "/api/push/subscribe";
       // a repository's changes are file contents too: the patch of a credential file is that file
       const repositoryDiff = /^\/api\/(?:machines\/[^/]+\/)?workspace\/diff\//.test(pathname);
-      if (readOnly && (visualRead || fileRead || directoryListing || repositoryDiff || mutating && !ownPreferences)) {
+      // a terminal image marker's `file:` ref is a file read too (docs/terminal-images.md)
+      const fileImage = /^\/api\/(?:machines\/[^/]+\/)?pane\/conversation\/image$/.test(pathname) && (url.searchParams.get("ref") ?? "").startsWith("file:");
+      if (readOnly && (visualRead || fileRead || fileImage || directoryListing || repositoryDiff || mutating && !ownPreferences)) {
         return jsonResponse({ error: { code: "read_only", message: "this device can only watch" } }, 403);
       }
 

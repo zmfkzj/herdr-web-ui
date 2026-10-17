@@ -12,10 +12,13 @@
 import type { IBuffer, IDisposable, Terminal } from "@xterm/xterm";
 
 import { machinePath } from "../../shared/machines.ts";
+import { attachmentFileName, mentionFileName, type GalleryImage } from "./imageViewer.ts";
 import {
   PI_SESSION_HEADER,
   TERMINAL_IMAGE_MARKER_CHAR,
   TERMINAL_IMAGE_SCHEME,
+  parsePiFileRef,
+  parsePiImageRef,
   parseTerminalImageMarker,
   terminalImagePlacements,
   type MarkerCell,
@@ -218,7 +221,7 @@ export function imageDimensions(bytes: Uint8Array, type: string): { width: numbe
   return null;
 }
 
-export interface LoadedImage { url: string; width: number; height: number; bytes: number }
+export interface LoadedImage { url: string; width: number; height: number; bytes: number; type: string }
 type Entry =
   | { state: "ready"; image: LoadedImage }
   | { state: "loading" }
@@ -323,7 +326,7 @@ export class TerminalImageLoader {
       if (this.#disposed) return { retryable: false };
       try {
         const decoded = await this.decode(new Blob([bytes as Uint8Array<ArrayBuffer>], { type }));
-        return { image: { ...decoded, bytes: bytes.length } };
+        return { image: { ...decoded, bytes: bytes.length, type } };
       } catch { return this.#refuse(key, "decode"); }
     });
   }
@@ -410,10 +413,36 @@ export function terminalImageSource(machineId: string, paneId: string | null, pl
 }
 
 /**
+ * The picture a click on a terminal image opens in the image viewer (ImageLightbox, then
+ * ImageReview for comments), named by the same server URL the chat uses for it, never the
+ * terminal's decoded copy: a tool result's image by its `pi:` ref, as the chat's tool images are,
+ * and a pasted picture's file by its path, as an `@path` mention is (the file viewer's endpoint,
+ * which ImageReview takes as a file source). `label` captions a tool image.
+ */
+export function terminalImageGallery(machineId: string, paneId: string, placement: Pick<TerminalImagePlacement, "ref">, type: string, label: string): GalleryImage | null {
+  const file = parsePiFileRef(placement.ref);
+  if (file !== null) {
+    return {
+      src: machinePath(machineId, `fs/file?${new URLSearchParams({ path: file.path, pane_id: paneId }).toString()}`),
+      name: file.path,
+      file: mentionFileName(file.path),
+    };
+  }
+  if (parsePiImageRef(placement.ref) === null) return null;
+  return {
+    src: machinePath(machineId, `pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ref: placement.ref }).toString()}`),
+    name: label,
+    file: attachmentFileName(type, 0),
+  };
+}
+
+/**
  * The layer one terminal draws its images in: a box over `.xterm-screen`, clipped to it, that
- * takes no pointer events. Placements are recomputed after each parsed write; an image loading
- * for a placement that has since gone is not drawn. Without a way to follow the terminal's
- * writes (another xterm build), nothing is drawn.
+ * takes no pointer events but on the images themselves: a click on one runs `onOpen` with its
+ * placement (the pane opens it in the image viewer); a press there starts no terminal selection.
+ * Placements are recomputed after each parsed write; an image loading for a placement that has
+ * since gone is not drawn. Without a way to follow the terminal's writes (another xterm build),
+ * nothing is drawn.
  */
 export class TerminalImageLayer {
   readonly markers = new TerminalImageMarkers();
@@ -423,6 +452,10 @@ export class TerminalImageLayer {
   #follow: IDisposable | null;
   #layer: HTMLDivElement | null = null;
   #shown = new Map<string, HTMLDivElement>();
+  /** what each drawn box shows now, for its click */
+  #drawn = new WeakMap<HTMLDivElement, { placement: TerminalImagePlacement; image: LoadedImage }>();
+  /** runs when an image drawn in the terminal is clicked */
+  onOpen: ((placement: TerminalImagePlacement, image: LoadedImage) => void) | null = null;
   #placements: TerminalImagePlacement[] = [];
   #frame: number | null = null;
   #resize: ResizeObserver | null = null;
@@ -530,9 +563,20 @@ export class TerminalImageLayer {
         img.decoding = "async";
         img.src = image.url;
         box.appendChild(img);
+        // a press on the picture is the viewer's, not the start of a terminal selection
+        box.addEventListener("mousedown", (event) => { if (event.button === 0) event.stopPropagation(); });
+        const opened = box;
+        box.addEventListener("click", (event) => {
+          const drawn = this.#drawn.get(opened);
+          if (event.button !== 0 || !drawn || !this.onOpen) return;
+          event.preventDefault();
+          event.stopPropagation();
+          this.onOpen(drawn.placement, drawn.image);
+        });
         layer.appendChild(box);
         this.#shown.set(key, box);
       }
+      this.#drawn.set(box, { placement, image });
       box.dataset["ref"] = placement.ref;
       // cells: left, top, cols, rows, first and last visible row (tests and diagnostics read them)
       box.dataset["cells"] = [placement.left, placement.top, placement.cols, placement.rows, placement.firstRow, placement.lastRow].join(",");

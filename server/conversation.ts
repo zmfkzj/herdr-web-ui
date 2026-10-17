@@ -34,14 +34,14 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import nodePath, { type PlatformPath } from "node:path";
 
 import type { ConversationMetadata, ConversationPart, ConversationTurn, HerdrPane, SessionSnapshot } from "../shared/protocol.ts";
 import { herdrRpc, paneRead, sessionSnapshot } from "./herdr/client.ts";
 import { codexHistorySegments, createCodexTranscriptParser, codexOutputText, codexTranscriptPath, defaultCodexHome, forgetAllCodexState, forgetCodexStateFor, paneCodexHome, parseCodexTranscript, readRange } from "./codex.ts";
-import { CODEX_IMAGE_REF, codexTranscriptImage } from "./codex-images.ts";
-import { isPiToolCallId, parsePiImageRef, PI_SESSION_ID } from "../shared/terminal-images.ts";
+import { CODEX_IMAGE_REF, codexTranscriptImage, imageType } from "./codex-images.ts";
+import { isPiToolCallId, parsePiFileRef, parsePiImageRef, PI_SESSION_ID } from "../shared/terminal-images.ts";
 import { AmbiguousClaudeStore, claudeProcessSession, claudeTranscriptFile, defaultClaudeConfigDir, forgetClaudeSessionFile, forgetClaudeSessions, isClaudeProcess, processClaudeConfigDir } from "./claude-store.ts";
 import { forgetGjcState, gjcPidUnderShell, gjcTranscriptForPane, isGjcProcess, storeRelative } from "./gjc-runtime.ts";
 import { omoProcessIdentity, omoSessionForPane } from "./omo.ts";
@@ -1630,8 +1630,11 @@ function transcriptPageRead(source: StreamSource, path: string, page: Conversati
  */
 export async function conversationImage(paneId: string, ref: string, codexHome?: string, opencodeDb?: string, piBinding?: { session: string; digest: string }): Promise<{ mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null> {
   const piRef = parsePiImageRef(ref) !== null;
-  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !piRef && !OPENCODE_IMAGE_REF.test(ref)) return null;
-  if (piBinding !== undefined && (!piRef || !PI_SESSION_ID.test(piBinding.session) || !IMAGE_DIGEST.test(piBinding.digest))) return null;
+  const fileRef = parsePiFileRef(ref);
+  if (!IMAGE_REF.test(ref) && !CODEX_IMAGE_REF.test(ref) && !piRef && !OPENCODE_IMAGE_REF.test(ref) && fileRef === null) return null;
+  // a file is served only for a marker's session-and-digest-bound read (never by ref alone)
+  if (fileRef !== null && piBinding === undefined) return null;
+  if (piBinding !== undefined && ((!piRef && fileRef === null) || !PI_SESSION_ID.test(piBinding.session) || !IMAGE_DIGEST.test(piBinding.digest))) return null;
   const snapshot = await sessionSnapshot();
   const pane = snapshot.panes.find((candidate) => candidate.pane_id === paneId);
   if (pane === undefined || typeof pane.cwd !== "string" || pane.cwd.length === 0) return null;
@@ -1641,7 +1644,7 @@ export async function conversationImage(paneId: string, ref: string, codexHome?:
   if (piBinding !== undefined) {
     if (resolved.source !== "pi-transcript" || piTranscriptSessionId(resolved.path) !== piBinding.session) return null;
     rememberPaneRead(paneId, resolved.path);
-    const image = piTranscriptImage(resolved.path, ref);
+    const image = fileRef !== null ? piFileImage(fileRef.path) : piTranscriptImage(resolved.path, ref);
     return image !== null && imageDigest(image.bytes) === piBinding.digest ? image : null;
   }
   // OpenCode's store is read per request and keeps nothing for the pane to release
@@ -1656,6 +1659,30 @@ const IMAGE_DIGEST = /^[0-9a-f]{32}$/;
 /** A terminal image marker's digest: the first 32 hex digits of the bytes' SHA-256. */
 export function imageDigest(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex").slice(0, 32);
+}
+
+/** The bytes a terminal image marker's `file:` ref names may run to (the browser's own bound). */
+export const PI_FILE_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * An image file pi drew from a path (a pasted picture): a regular file of at most 8 MiB whose bytes
+ * are a PNG, JPEG, GIF or WebP, typed by those bytes, not the name. The caller checks the digest.
+ */
+export function piFileImage(path: string): { mediaType: string; bytes: Uint8Array<ArrayBuffer> } | null {
+  let fd: number;
+  try { fd = openSync(path, "r"); } catch { return null; }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size === 0 || stat.size > PI_FILE_IMAGE_MAX_BYTES) return null;
+    const bytes = Buffer.alloc(stat.size);
+    if (readSync(fd, bytes, 0, bytes.length, 0) !== stat.size) return null;
+    const mediaType = imageType(bytes);
+    return mediaType === null ? null : { mediaType, bytes: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.length) as Uint8Array<ArrayBuffer> };
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The id in a pi transcript's header record, read bounded; null when the file has none. */

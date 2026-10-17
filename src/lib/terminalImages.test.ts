@@ -2,7 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { Terminal } from "@xterm/xterm";
 
 import { hyperlinkFilter } from "./terminalFileLinks.ts";
-import { IMAGE_LIMITS, imageDimensions, MAX_MARKER_CELLS, TerminalImageLayer, TerminalImageLoader, TerminalImageMarkers, terminalImageSource } from "./terminalImages.ts";
+import { IMAGE_LIMITS, imageDimensions, MAX_MARKER_CELLS, TerminalImageLayer, TerminalImageLoader, TerminalImageMarkers, terminalImageGallery, terminalImageSource } from "./terminalImages.ts";
+import { sourceFromImage } from "./pi-visual/api.ts";
 
 const DIGEST = "0123456789abcdef0123456789abcdef";
 const SESSION = "0190abcd-0000-7000-8000-000000000001";
@@ -293,3 +294,42 @@ describe("terminalImageSource", () => {
     }
   });
 });
+
+describe("terminalImageGallery", () => {
+  const origin = "http://127.0.0.1:7391";
+
+  it("opens a tool image by the chat's own URL, which image comments take as a conversation source", () => {
+    const ref = "pi:call_E2E|fc_(x)*!'+/=:0";
+    for (const machine of ["local", "pc 2"]) {
+      const image = terminalImageGallery(machine, "w1:p1", { ref }, "image/jpeg", "Attached image")!;
+      const url = new URL(image.src, origin);
+      expect(url.pathname).toBe(machine === "local" ? "/api/pane/conversation/image" : "/api/machines/pc%202/pane/conversation/image");
+      expect(Object.fromEntries(url.searchParams)).toEqual({ pane_id: "w1:p1", ref });
+      expect(image).toMatchObject({ name: "Attached image", file: "image-1.jpg" });
+      expect(sourceFromImage(image.src, machine, "w1:p1", origin)).toEqual({ kind: "conversation", ref });
+    }
+  });
+
+  it("opens a pasted picture by its file, as an @path mention is, which image comments take as a file source", () => {
+    const path = "/home/u/.herdr-web-ui/붙여넣기 #1 100%.png";
+    for (const machine of ["local", "pc 2"]) {
+      const image = terminalImageGallery(machine, "w1:p1", { ref: `file:${path}` }, "image/png", "Attached image")!;
+      const url = new URL(image.src, origin);
+      expect(url.pathname).toBe(machine === "local" ? "/api/fs/file" : "/api/machines/pc%202/fs/file");
+      expect(Object.fromEntries(url.searchParams)).toEqual({ path, pane_id: "w1:p1" });
+      expect(image).toMatchObject({ name: path, file: "붙여넣기 #1 100%.png" });
+      expect(sourceFromImage(image.src, machine, "w1:p1", origin)).toEqual({ kind: "file", path });
+    }
+  });
+
+  it("opens nothing for a ref that is neither", () => {
+    expect(terminalImageGallery("local", "w1:p1", { ref: "0123abcd-0000-0000-0000-000000000000:0" }, "image/png", "x")).toBeNull();
+    expect(terminalImageGallery("local", "w1:p1", { ref: "file:relative.png" }, "image/png", "x")).toBeNull();
+  });
+
+  it("places a pasted picture's file-ref markers like a tool image's", async () => {
+    const { write } = terminal();
+    expect(await write(image("file:/home/u/.herdr-web-ui/paste 1.png"))).toEqual(["file:/home/u/.herdr-web-ui/paste 1.png 2,3 rows 3-8"]);
+  });
+});
+

@@ -16,12 +16,15 @@
  * Checked: images drawn at their markers over blank rows only, with their own pixels, locally and
  * through the remote PC; after a resize, a scroll, a reload; gone when pi leaves the screen;
  * forged markers draw nothing; a later session that reuses the same tool call id shows its own
- * picture. Evidence (screenshots, result.json) goes to TERMINAL_IMAGE_EVIDENCE_DIR or a temp dir.
+ * picture. A click on any drawn image (its first row, its last, a clipped one's first visible row,
+ * a one-row image; after a resize and a scroll) opens it in the image viewer with its own bytes to
+ * download; pasted pictures (transcript and draft) are drawn from their files, and image comments
+ * are saved, reopened, and added to the message draft only. Evidence (screenshots, result.json) goes to TERMINAL_IMAGE_EVIDENCE_DIR or a temp dir.
  * PI_TUI_MODE picks pi's TUI mode (fullscreen by default, or regular).
  */
 import "./test-herdr.ts";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { connect as tcpConnect, createServer as tcpServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -111,6 +114,10 @@ try {
       redBlue: draw(320, 160, "image/png", halves("rgb(224,32,32)", "rgb(32,64,224)", false)),
       greenYellow: draw(160, 160, "image/jpeg", halves("rgb(32,176,64)", "rgb(224,192,32)", true)),
       magenta: draw(96, 64, "image/png", (ctx) => { ctx.fillStyle = "rgb(192,32,192)"; ctx.fillRect(0, 0, 96, 64); }),
+      // the viewer step's pictures: two pasted files and a strip pi draws in one row
+      pasted: draw(200, 120, "image/png", halves("rgb(192,32,192)", "rgb(32,176,64)", false)),
+      draft: draw(120, 200, "image/png", halves("rgb(32,64,224)", "rgb(224,192,32)", true)),
+      strip: draw(640, 24, "image/png", (ctx) => { ctx.fillStyle = "rgb(224,192,32)"; ctx.fillRect(0, 0, 640, 24); }),
     };
   });
   const SESSION = "0190e2e0-0000-7000-8000-00000000e2e0";
@@ -176,7 +183,8 @@ try {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const imageRequests: string[] = [];
-  page.on("request", (request) => { if (request.url().includes("/conversation/image")) imageRequests.push(new URL(request.url()).pathname + new URL(request.url()).search); });
+  // the terminal layer's own reads (bound by a digest); the image viewer's are the chat's, checked apart
+  page.on("request", (request) => { if (request.url().includes("/conversation/image") && new URL(request.url()).searchParams.has("digest")) imageRequests.push(new URL(request.url()).pathname + new URL(request.url()).search); });
   await page.addInitScript((id) => {
     localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
     localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal");
@@ -292,6 +300,47 @@ try {
     }
     assert.ok(seen > 0, `${label}: some image's pixels are checked`);
   };
+  /** The bytes each drawn ref shows (a tool image's fixture picture, a pasted picture's file). */
+  const expectedBytes = new Map<string, Buffer>();
+  const lightbox = page.locator(".image-lightbox");
+  /**
+   * A click on one visible row of a drawn image (its first by default: the image line, which carries no
+   * marker, when it is on screen) opens that image in the image viewer, by the chat's URL for it: the
+   * picture loads, and Download serves the same bytes. The cell right of the image's marker is not the
+   * image. Returns the viewer's URL; the viewer is left open when `keepOpen`.
+   */
+  const opensOnClick = async (image: Drawn[number], label: string, row = 0, keepOpen = false): Promise<URL> => {
+    assert.ok(image.cell, `${label}: the cell size is known`);
+    const cell = image.cell!;
+    // the drawn box is the image's own columns: the cell right of it (its marker) and the next are the terminal's
+    const column = image.box.width / image.cols;
+    const x = image.box.x + Math.min(image.box.width, Math.max(2, image.picture.width)) / 2;
+    const y = image.box.y + (row + 0.5) * cell.height;
+    const at = (px: number, py: number) => page.evaluate(([px, py]) => document.elementFromPoint(px!, py!)?.closest<HTMLElement>(".terminal-image")?.dataset["ref"] ?? null, [px, py]);
+    assert.equal(await at(x, y), image.ref, `${label}: row ${image.firstRow + row} of ${image.ref} is the image under the pointer`);
+    for (const next of [0.5, 1.5]) assert.equal(await at(image.box.x + image.box.width + next * column, y), null, `${label}: the cell ${next + 0.5} right of ${image.ref} is the terminal's`);
+    await page.mouse.click(x, y);
+    await lightbox.waitFor();
+    await page.waitForFunction(() => { const img = document.querySelector<HTMLImageElement>(".image-lightbox img"); return img !== null && img.complete && img.naturalWidth > 0; }, undefined, { timeout: 10_000 });
+    const src = new URL((await lightbox.locator("img").first().getAttribute("src"))!, base);
+    const file = image.ref.startsWith("file:") ? image.ref.slice(5) : null;
+    if (file === null) assert.equal(src.searchParams.get("ref"), image.ref, `${label}: the viewer shows ${image.ref} by the chat's URL`);
+    else assert.equal(src.searchParams.get("path"), file, `${label}: the viewer shows the pasted file ${file}`);
+    const download = lightbox.locator("a[download]");
+    assert.equal(new URL((await download.getAttribute("href"))!, base).href, src.href, `${label}: Download is the shown picture`);
+    const bytes = Buffer.from(await (await page.request.get(src.href)).body());
+    const expected = expectedBytes.get(image.ref);
+    assert.ok(expected && bytes.equals(expected), `${label}: Download serves ${image.ref}'s own bytes`);
+    assert.equal(await lightbox.getByRole("button", { name: "Image comments" }).count(), 1, `${label}: the viewer offers image comments`);
+    if (!keepOpen) {
+      await lightbox.getByRole("button", { name: "Close", exact: true }).click();
+      await lightbox.waitFor({ state: "detached" });
+    }
+    return src;
+  };
+  expectedBytes.set("pi:call_e2e_a:0", Buffer.from(pictures.redBlue, "base64"));
+  expectedBytes.set("pi:call_e2e_b:0", Buffer.from(pictures.greenYellow, "base64"));
+  expectedBytes.set("pi:call_e2e_c:0", Buffer.from(pictures.redBlue, "base64"));
 
   // 1. this PC: pi resumes the session; its three images are drawn where pi drew them natively
   await startPi(first);
@@ -310,6 +359,12 @@ try {
   assert.ok(near((await sample(b, 0.5, 0.75))!, COLORS.yellow, 60), "and its bottom half yellow");
   assert.ok(near((await sample(c, 0.25, 0.5))!, COLORS.red), "the repeated picture is drawn again in its own place");
   assert.equal(b.ref, "pi:call_e2e_b:0");
+  // each opens in the image viewer from its first row (the image line, no marker) and its last
+  for (const image of [a, b, c]) {
+    assert.equal(image.firstRow, image.top, `${image.ref} shows its first row (the image line)`);
+    await opensOnClick(image, "local");
+    await opensOnClick(image, "local, last row", image.lastRow - image.firstRow);
+  }
   assert.ok(images.every((image, i) => images.slice(i + 1).every((other) => other.top !== image.top)), "each image in its own place");
   await page.screenshot({ path: join(evidence, "1-local.png") });
   assert.ok(imageRequests.every((path) => path.startsWith("/api/pane/conversation/image?") && path.includes(`session=${SESSION}`)), "images are asked of this PC, for the marker's session");
@@ -318,6 +373,10 @@ try {
   await page.setViewportSize({ width: 1000, height: 900 });
   images = await settled((list) => list.length > 0 && list.every((image) => image.markers.every(Boolean)) && JSON.stringify(list.map((i) => [i.left, i.top])) !== JSON.stringify((result["local"] as Drawn).map((i) => [i.left, i.top])), "images follow a resize");
   checkGeometry(images, "resize");
+  for (const image of images) {
+    await opensOnClick(image, "resize");
+    await opensOnClick(image, "resize, last row", image.lastRow - image.firstRow);
+  }
   record("resized", images);
   await page.screenshot({ path: join(evidence, "2-resized.png") });
 
@@ -331,10 +390,34 @@ try {
   images = await settled((list) => list.length > 0 && JSON.stringify(list.map((image) => [image.ref, image.top])) !== beforeScroll, "images move when pi scrolls");
   checkGeometry(images, "scroll");
   await allPicturesOk(images, "scroll");
+  // scrolled: each opens from its first visible row, a clipped one's included
+  for (const image of images) await opensOnClick(image, `scroll (rows ${image.firstRow}-${image.lastRow} of ${image.top}+${image.rows})`);
   record("scrolled", images);
   result["scrolledClipped"] = images.some((image) => image.firstRow > image.top || image.lastRow < image.top + image.rows - 1);
+  // scrolled until an image is cut at the screen's edge: it opens from its first and last visible rows
+  const clippedOf = (list: Drawn) => list.find((image) => image.firstRow > image.top || image.lastRow < image.top + image.rows - 1);
+  await page.locator(".pane-terminal .xterm-screen").first().hover();
+  for (let i = 0; i < 12 && !clippedOf(images); i++) {
+    const before = JSON.stringify(images.map((image) => [image.ref, image.top, image.firstRow, image.lastRow]));
+    await page.mouse.wheel(0, i % 2 === 0 ? -40 : -120);
+    images = await settled((list) => list.length > 0 && JSON.stringify(list.map((image) => [image.ref, image.top, image.firstRow, image.lastRow])) !== before, "images move when pi scrolls again").catch(() => images);
+  }
+  const clipped = clippedOf(images);
+  assert.ok(clipped, "some image is cut at the screen's edge after scrolling");
+  checkGeometry(images, "clipped");
+  await opensOnClick(clipped, `clipped (rows ${clipped.firstRow}-${clipped.lastRow} of ${clipped.top}+${clipped.rows})`);
+  await opensOnClick(clipped, "clipped, last visible row", clipped.lastRow - clipped.firstRow);
+  record("clipped", [clipped]);
+  await page.screenshot({ path: join(evidence, "3b-clipped.png") });
+  // the wheel over a picture still scrolls the terminal (the picture takes clicks, not the wheel)
+  const placed = (list: Drawn) => JSON.stringify(list.map((image) => [image.ref, image.top, image.firstRow, image.lastRow]));
+  const beforeWheel = placed(images);
+  await page.mouse.move(clipped.box.x + clipped.box.width / 2, clipped.box.y + Math.min(clipped.box.height, 4) / 2);
+  assert.equal(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest<HTMLElement>(".terminal-image")?.dataset["ref"] ?? null, { x: clipped.box.x + clipped.box.width / 2, y: clipped.box.y + Math.min(clipped.box.height, 4) / 2 }), clipped.ref, "the pointer is over the picture");
+  await page.mouse.wheel(0, 240);
+  images = await settled((list) => placed(list) !== beforeWheel, "a wheel over a picture scrolls the terminal");
   await page.screenshot({ path: join(evidence, "3-scrolled.png") });
-  for (let i = 0; i < 6; i++) await page.mouse.wheel(0, 240);
+  for (let i = 0; i < 20; i++) await page.mouse.wheel(0, 240);
   // back at the bottom: what is drawn once it holds still is what every later attach must draw
   let steady = "";
   for (let i = 0; i < 40; i++) {
@@ -371,6 +454,9 @@ try {
   checkGeometry(images, "remote");
   record("remote", images);
   await allPicturesOk(images, "remote");
+  // the remote PC's image opens in the viewer by that PC's URL
+  const remoteViewer = await opensOnClick(images[0]!, "remote");
+  assert.ok(remoteViewer.pathname.startsWith(`/api/machines/${encodeURIComponent(remoteId)}/pane/conversation/image`), "the remote image's viewer asks that PC");
   const remoteRequests = imageRequests.slice(remoteStart);
   assert.ok(remoteRequests.length > 0 && remoteRequests.every((path) => path.startsWith(`/api/machines/${encodeURIComponent(remoteId)}/pane/conversation/image?`)), "the remote PC's images are asked of that PC");
   await page.screenshot({ path: join(evidence, "4-remote.png") });
@@ -483,6 +569,108 @@ try {
   assert.equal(images[0]!.ref, "pi:call_e2e_a:0");
   assert.ok(near((await sample(images[0]!, 0.5, 0.5))!, COLORS.magenta), "the later session's own picture, not the first session's");
   await page.screenshot({ path: join(evidence, "7-later-session.png") });
+  await quitPi();
+
+  // 9. the image viewer for every kind of picture pi draws: a pasted picture in the transcript (the
+  // images extension's `pasted-images` entry, named by its file), a one-row tool image, and a picture
+  // pasted into the draft. Each opens on click (zoom, download); its comments are saved, there again
+  // when it is reopened, and go to the message draft (never sent) with that picture's SHA-256.
+  const pasteDir = join(project, ".herdr-web-ui");
+  mkdirSync(pasteDir, { recursive: true });
+  const pastedFile = join(pasteDir, "paste e2e #1.png"), draftFile = join(pasteDir, "paste-draft.png");
+  writeFileSync(pastedFile, Buffer.from(pictures.pasted, "base64"));
+  writeFileSync(draftFile, Buffer.from(pictures.draft, "base64"));
+  expectedBytes.set(`file:${pastedFile}`, Buffer.from(pictures.pasted, "base64"));
+  expectedBytes.set(`file:${draftFile}`, Buffer.from(pictures.draft, "base64"));
+  expectedBytes.set("pi:call_e2e_row:0", Buffer.from(pictures.strip, "base64"));
+  const VIEWER = "0190e2e0-0000-7000-8000-00000000e2e2";
+  const viewer = join(store, "viewer.jsonl");
+  {
+    const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+    const assistant = (content: unknown[], stopReason: string) => ({ role: "assistant", content, api: "fixture", provider: "fixture", model: "fixture", usage, stopReason, timestamp: 2 });
+    const entries: unknown[] = [{ type: "session", version: 3, id: VIEWER, timestamp: "2026-10-16T00:00:00.000Z", cwd: project }];
+    const push = (entry: Record<string, unknown>) => entries.push({ id: `v${entries.length}`, parentId: entries.length > 1 ? `v${entries.length - 1}` : null, timestamp: "2026-10-16T00:00:01.000Z", ...entry });
+    push({ type: "message", message: { role: "user", content: [{ type: "text", text: `'${pastedFile}' look at this` }, { type: "image", mimeType: "image/png", data: pictures.pasted }], timestamp: 1 } });
+    push({ type: "custom", customType: "pasted-images", data: { paths: [pastedFile] } });
+    push({ type: "message", message: assistant([{ type: "toolCall", id: "call_e2e_row", name: "read", arguments: { path: "strip.png" } }], "toolUse") });
+    push({ type: "message", message: { role: "toolResult", toolCallId: "call_e2e_row", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", mimeType: "image/png", data: pictures.strip }], isError: false, timestamp: 3 } });
+    push({ type: "message", message: assistant([{ type: "text", text: "TERMINAL_IMAGE_VIEWER_END" }], "stop") });
+    writeFileSync(viewer, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  }
+  await startPi(viewer);
+  await page.getByText("TERMINAL_IMAGE_VIEWER_END").first().waitFor();
+  // the draft: a bracketed paste of a picture's path, as a terminal paste brings it
+  await paneSendText(pane, `\x1b[200~'${draftFile}' \x1b[201~`);
+  const viewerRefs = [`file:${pastedFile}`, "pi:call_e2e_row:0", `file:${draftFile}`];
+  images = await settled((list) => viewerRefs.every((ref) => list.some((image) => image.ref === ref)), "the pasted pictures and the one-row image are drawn");
+  checkGeometry(images, "viewer");
+  record("viewer", images);
+  const byRef = (ref: string) => images.find((image) => image.ref === ref)!;
+  assert.equal(byRef("pi:call_e2e_row:0").rows, 1, "the strip is a one-row image");
+  assert.ok(near((await sample(byRef(`file:${pastedFile}`), 0.25, 0.5))!, COLORS.magenta, 60), "the pasted picture is drawn with its own pixels, not cells");
+  assert.ok(near((await sample(byRef(`file:${draftFile}`), 0.5, 0.25))!, COLORS.blue, 60), "and so is the draft's");
+  await page.screenshot({ path: join(evidence, "8-viewer.png") });
+  for (const ref of viewerRefs) await opensOnClick(byRef(ref), `viewer ${ref}`);
+
+  // comments: saved, back when reopened, and into the message draft with this picture's SHA-256
+  const review = page.locator(".pi-review");
+  const draftKey = `herdr-web-ui:composer-draft:${pane}`;
+  const openReview = async (image: Drawn[number], label: string) => {
+    await opensOnClick(image, label, 0, true);
+    await lightbox.getByRole("button", { name: "Image comments" }).click();
+    await lightbox.waitFor({ state: "detached" });
+    await review.waitFor();
+    await page.waitForFunction(() => { const img = document.querySelector<HTMLImageElement>(".pi-review-image img"); return img !== null && img.complete && img.naturalWidth > 0; }, undefined, { timeout: 10_000 });
+  };
+  const closeReview = async () => {
+    await review.locator("header").getByRole("button", { name: "Close" }).click();
+    await review.waitFor({ state: "detached" });
+  };
+  const commented: Record<string, string> = {};
+  for (const [ref, text] of [[`file:${pastedFile}`, "pasted: darken the green"], ["pi:call_e2e_row:0", "strip: make it taller"]] as const) {
+    await openReview(byRef(ref), `comment ${ref}`);
+    await review.getByRole("button", { name: "Add center comment" }).click();
+    await review.locator("textarea").last().fill(text);
+    await review.getByRole("button", { name: "Save", exact: true }).click();
+    await review.getByText("Saved", { exact: true }).waitFor();
+    await closeReview();
+    // a reload drops everything the page held: what comes back was saved
+    await page.reload();
+    await page.locator(".conn-live").first().waitFor();
+    images = await settled((list) => viewerRefs.every((one) => list.some((image) => image.ref === one)), `the viewer's pictures after a reload (${ref})`);
+    await openReview(byRef(ref), `reopen ${ref}`);
+    assert.deepEqual(await review.locator("textarea").evaluateAll((areas) => areas.map((area) => (area as HTMLTextAreaElement).value)), [text], `${ref}: the saved comment is there when reopened`);
+    await review.getByRole("button", { name: "Create feedback draft" }).click();
+    await review.getByText("Added to the message draft").waitFor();
+    await closeReview();
+    const sha = new Bun.CryptoHasher("sha256").update(expectedBytes.get(ref)!).digest("hex");
+    const draft = (await page.evaluate((key) => localStorage.getItem(key), draftKey)) ?? "";
+    assert.ok(draft.includes(`Image SHA-256: ${sha}`) && draft.includes(`1. [x,y,w,h normalized: 0.5000, 0.5000, 0.0000, 0.0000] ${text}`), `${ref}: the feedback draft names this picture (SHA-256 ${sha}) and its comment at its place`);
+    // the annotated copy it names is an upload in the pane's folder, the size of this picture
+    const attached = new RegExp(`\\n(".*")\\nImage SHA-256: ${sha}\\n`).exec(draft)?.[1];
+    const attachedPath = attached ? JSON.parse(attached) as string : "";
+    assert.ok(attachedPath.startsWith(pasteDir) && existsSync(attachedPath), `${ref}: the draft names the annotated upload (${attachedPath})`);
+    const size = (png: Buffer) => [png.readUInt32BE(16), png.readUInt32BE(20)];
+    assert.deepEqual(size(readFileSync(attachedPath)), size(expectedBytes.get(ref)!), `${ref}: the annotated upload is this picture's size`);
+    commented[ref] = sha;
+  }
+  const draftText = (await page.evaluate((key) => localStorage.getItem(key), draftKey)) ?? "";
+  result["feedbackDraft"] = { commented, text: draftText };
+  // each picture's comment is under its own SHA-256 only
+  const [pasteSha, stripSha] = [commented[`file:${pastedFile}`]!, commented["pi:call_e2e_row:0"]!];
+  assert.ok(draftText.indexOf(`Image SHA-256: ${pasteSha}`) < draftText.indexOf("pasted: darken the green") && draftText.indexOf("pasted: darken the green") < draftText.indexOf(`Image SHA-256: ${stripSha}`) && draftText.indexOf(`Image SHA-256: ${stripSha}`) < draftText.indexOf("strip: make it taller"), "the two pictures' comments are not mixed");
+  assert.ok(!readFileSync(viewer, "utf8").includes("Please revise"), "nothing reached pi's session");
+  assert.ok(!(await screenRows()).some((row) => row.join("").includes("Please revise")), "the feedback is never sent to pi");
+  await page.screenshot({ path: join(evidence, "9-commented.png") });
+
+  // a resize redraws the one-row image and the pasted pictures where pi puts them now; they still open
+  await page.setViewportSize({ width: 1400, height: 1000 });
+  const beforeResize = JSON.stringify(images.map((image) => [image.ref, image.left, image.top]));
+  images = await settled((list) => viewerRefs.every((ref) => list.some((image) => image.ref === ref)) && JSON.stringify(list.map((image) => [image.ref, image.left, image.top])) !== beforeResize, "the viewer's pictures follow a resize");
+  checkGeometry(images, "viewer resized");
+  record("viewerResized", images);
+  for (const ref of viewerRefs) await opensOnClick(byRef(ref), `viewer resized ${ref}`);
+  await paneSendKeys(pane, ["C-c"]);
   await quitPi();
 
   assert.deepEqual(errors, [], "no page errors");
