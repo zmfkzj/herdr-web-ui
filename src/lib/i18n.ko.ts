@@ -7,6 +7,7 @@
  */
 export const KO: Record<string, string> = {
   "Add a comment before creating feedback.": "피드백을 만들기 전에 코멘트를 추가하세요.",
+  "The message box is not available right now.": "지금은 메시지 입력창을 쓸 수 없습니다.",
   "Add center comment": "중앙에 코멘트 추가",
   "Cancelled": "취소됨",
   "Certificate SHA-256": "인증서 SHA-256",

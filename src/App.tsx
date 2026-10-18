@@ -1747,6 +1747,7 @@ export function App() {
                         worktreeRepo={worktreeRepoName(item === null ? undefined : slotSnapshot?.workspaces.find((workspace) => workspace.workspace_id === item.workspace_id))}
                         machineName={machine?.name ?? machineId}
                         view={item ? lensOf(item) : slotView}
+                        onView={item ? (next) => { if (active && item.pane_id === selectedPaneId) setView(next); else pickView(machineId, item.pane_id, next); } : undefined}
                         // the other half never takes the keyboard: a press in it makes it active first
                         active={active && itemActive}
                         // the paging shortcuts reach the selected pane of the active half only

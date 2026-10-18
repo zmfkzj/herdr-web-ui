@@ -9,6 +9,8 @@ interface InFlight { sent: string; at: number }
  */
 export const SEND_LEASE_MS = 120_000;
 const SENDING_PREFIX = "herdr-web-ui:composer-sending:";
+/** A reveal no composer took by then is dropped: a composer mounted later never takes the focus for it. */
+export const REVEAL_MS = 5_000;
 export class ComposerDraftStore {
   private drafts = new Map<string, Draft>();
   private saved = new Map<string, string | null>();
@@ -20,12 +22,22 @@ export class ComposerDraftStore {
   private own = new Set<string>();
   /** one wake-up per draft at the end of another tab's lease: an abandoned lease ends silently */
   private expiries = new Map<string, unknown>();
+  /** when something outside the composer last asked for each draft to be shown */
+  private reveals = new Map<string, number>();
   constructor(
     private storage: () => DraftStorage = () => window.localStorage,
     private schedule: (run: () => void, ms: number) => unknown = (run, ms) => setTimeout(run, ms),
   ) {}
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private notify(): void { for (const listener of this.listeners) listener(); }
+  /** Ask the draft's composer, mounted now or within REVEAL_MS (a lens switch), to show its end. */
+  reveal(key: string): void { this.reveals.set(key, Date.now()); this.notify(); }
+  /** Whether a recent reveal is waiting for this draft; it is answered once. */
+  takeReveal(key: string): boolean {
+    const at = this.reveals.get(key);
+    this.reveals.delete(key);
+    return at !== undefined && Date.now() - at <= REVEAL_MS;
+  }
   read(key: string): Draft {
     let draft = this.drafts.get(key);
     if (!draft) {

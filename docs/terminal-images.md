@@ -115,7 +115,7 @@ chat's tool images and a pi tool's whole output take the same id rule (`parsePiI
   `pane/conversation/image?pane_id&ref` (comments take it as a conversation source), a pasted
   picture by `fs/file?path&pane_id` (as an `@path` mention; comments take it as a file source). The
   comment button shows for a pi pane on an interactive device; feedback goes to the message draft,
-  never sent automatically. Another pane or PC closes what was open. The
+  never sent automatically, and the pane switches to its chat lens to show it in the message box. Another pane or PC closes what was open. The
   attach stream stays the only source of the screen: `scrollback: 0`, no `pane.read` rebuild, no
   file or URL reads, and ACKs are never held for an image.
 

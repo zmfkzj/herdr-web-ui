@@ -9,6 +9,7 @@
  */
 export const JA: Record<string, string> = {
   "Add a comment before creating feedback.": "フィードバックの作成前にコメントを追加してください。",
+  "The message box is not available right now.": "今はメッセージ入力欄を使えません。",
   "Add center comment": "中央にコメントを追加",
   "Cancelled": "キャンセル済み",
   "Certificate SHA-256": "証明書のSHA-256",

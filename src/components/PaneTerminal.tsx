@@ -128,6 +128,8 @@ export interface PaneTerminalProps {
   machineName?: string;
   /** the lens over the pane: the chat transcript, or the live xterm grid (App remembers it per pane) */
   view: PaneView;
+  /** switches this pane's lens (App remembers it); image feedback opens the chat lens to show its draft */
+  onView?: (view: PaneView) => void;
   findRequest?: number;
   controls?: { current: PaneControls | null };
   /** Only the selected tile may take keyboard focus after async work or a lens change. */
@@ -177,6 +179,7 @@ export function PaneTerminal({
   worktreeRepo = null,
   machineName = "",
   view,
+  onView,
   findRequest = 0,
   controls,
   active = true,
@@ -2642,7 +2645,9 @@ export function PaneTerminal({
   // card (view only, ended, a secret prompt) they stay pills. The ids carry the pane, so another
   // pane's dismissals never carry over; a dismissal goes with its notice, or when the notice says
   // something else (lib/composerNotices.ts)
-  const noticesDocked = presented && paneId !== null && chatView && !secretActive && !observing && !ended;
+  /** the chat lens draws the composer now (or would, switched to): where image feedback is shown */
+  const composerShown = presented && paneId !== null && !secretActive && !observing && !ended;
+  const noticesDocked = composerShown && chatView;
   const noticeItems: ComposerNoticeRow[] = [];
   if (paneId !== null) {
     const owner = paneStorageId(machineId, paneId);
@@ -2975,7 +2980,8 @@ export function PaneTerminal({
       {terminalGallery !== null && <ImageLightbox images={[terminalGallery]} index={0} onClose={() => setTerminalImage(null)}
         onReview={agent === "pi" && !observing ? (image) => { setTerminalImage(null); setTerminalReview({ owner: imageOwner!, image }); } : undefined} />}
       {paneId !== null && terminalReview !== null && terminalReview.owner === imageOwner && agent === "pi" && !observing && (
-        <ImageReview key={`${machineId}:${paneId}:${terminalReview.image.src}`} paneId={paneId} machineId={machineId} image={terminalReview.image} onClose={() => setTerminalReview(null)} />
+        <ImageReview key={`${machineId}:${paneId}:${terminalReview.image.src}`} paneId={paneId} machineId={machineId} image={terminalReview.image} onClose={() => setTerminalReview(null)}
+          onDraft={composerShown && onView ? () => { setTerminalReview(null); onView("chat"); } : null} />
       )}
       {paneId !== null && agent === "pi" && chatView && !observing && <PiVisualTools key={`${machineId}:${paneId}`} paneId={paneId} machineId={machineId} enabled={presented && connected && !ended} />}
       {paneId !== null && guiView !== null && guiView.pane === paneId && agent === "pi" && !observing && presented && (
@@ -3033,6 +3039,7 @@ export function PaneTerminal({
             promptDock={promptDock}
             onPromptAnswered={onPromptAnswered}
             title={title}
+            draftable={composerShown}
           />
           </RenderBoundary>
         )}

@@ -11,6 +11,7 @@
  */
 export const ZH: Record<string, string> = {
   "Add a comment before creating feedback.": "请先添加评论再创建反馈。",
+  "The message box is not available right now.": "当前无法使用消息输入框。",
   "Add center comment": "在中心添加评论",
   "Cancelled": "已取消",
   "Certificate SHA-256": "证书 SHA-256",

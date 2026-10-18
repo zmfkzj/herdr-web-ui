@@ -53,6 +53,8 @@ export function addDraft(machine: string,pane: string,text: string): void {
   const next=appendQuote(draft.text,text,MAX_COMPOSER_CHARS);
   if(next===null) throw new Error("Too long for the message draft");
   composerDrafts.set(key,next);
+  // the pane's composer shows it as soon as it is there (the chat lens), never sending it
+  composerDrafts.reveal(key);
 }
 /** Explicitly requested feedback, never automatically submitted to the agent. */
 export function feedbackText(doc: ImageReviewDocument,imagePath: string,notes: ImageAnnotation[],heading: string): string {

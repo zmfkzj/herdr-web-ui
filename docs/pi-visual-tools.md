@@ -322,9 +322,14 @@ returns a conflict and retains the unsaved text for copying/reconciliation.
 
 **Create feedback draft** saves pending comments, exports a marked PNG with
 numbered regions, uploads it using the existing pane attachment mechanism, and
-appends its path and unresolved comments to the existing chat draft. It does not
-send the message, overwrite existing draft text, change models, or call the
-image-generation provider directly. Review and send the draft yourself.
+appends its path and unresolved comments to the existing chat draft. The review
+then closes and the pane shows its chat lens (also when the review was opened
+from the terminal lens, which has no message box), with the draft in the message
+box and the caret after the feedback. While the pane has no message box (view
+only, ended, a password prompt), the button says so and adds nothing. It does not
+send the message, type into the terminal, overwrite existing draft text, change
+models, or call the image-generation provider directly. Review and send the draft
+yourself.
 
 Supported review inputs: PNG, JPEG, WebP, GIF, up to 16 MiB. Marked exports use a
 single raster frame and a maximum 4096-pixel edge; animated-image review is not a

@@ -19,7 +19,8 @@
  * picture. A click on any drawn image (its first row, its last, a clipped one's first visible row,
  * a one-row image; after a resize and a scroll) opens it in the image viewer with its own bytes to
  * download; pasted pictures (transcript and draft) are drawn from their files, and image comments
- * are saved, reopened, and added to the message draft only. Evidence (screenshots, result.json) goes to TERMINAL_IMAGE_EVIDENCE_DIR or a temp dir.
+ * are saved, reopened, and added to the message draft only, which the chat lens's message box
+ * then shows (from the terminal lens and the chat lens) without sending it. Evidence (screenshots, result.json) goes to TERMINAL_IMAGE_EVIDENCE_DIR or a temp dir.
  * PI_TUI_MODE picks pi's TUI mode (fullscreen by default, or regular).
  */
 import "./test-herdr.ts";
@@ -194,8 +195,12 @@ try {
   // and every terminal byte herdr sends is tallied: it should only place the cursor and write cells
   const moves: Record<string, number> = {};
   let ptyFrames = 0;
+  // a message, input or request from the page that carries image feedback: there must never be one
+  let sentFeedback = 0;
+  page.on("request", (request) => { if ((request.postData() ?? "").includes("Please revise")) sentFeedback++; });
   await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => {
     const server = socket.connectToServer();
+    socket.onMessage((message) => { if (String(message).includes("Please revise")) sentFeedback++; server.send(message); });
     server.onMessage((message) => {
       if (typeof message === "string" && message.includes('"pty-data"')) {
         const frame = JSON.parse(message) as { type?: string; data?: string };
@@ -626,6 +631,33 @@ try {
     await review.locator("header").getByRole("button", { name: "Close" }).click();
     await review.waitFor({ state: "detached" });
   };
+  const composer = page.locator(".composer-text");
+  const lens = (name: "Chat" | "Terminal") => page.locator(".view-switch button", { hasText: name });
+  /**
+   * Create feedback draft hands over to the chat lens's message box: the review closes on its own,
+   * the box holds the whole stored draft, editable, with the focus and the caret at its end (the
+   * appended feedback in view), and no later render takes them away. Nothing is sent meanwhile.
+   */
+  const draftShown = async (label: string) => {
+    await review.waitFor({ state: "detached" });
+    await composer.waitFor();
+    assert.equal(await lens("Chat").getAttribute("aria-pressed"), "true", `${label}: the pane shows its chat lens`);
+    const stored = (await page.evaluate((key) => localStorage.getItem(key), draftKey)) ?? "";
+    await page.waitForFunction((text) => { const box = document.querySelector<HTMLTextAreaElement>(".composer-text"); return box !== null && box.value === text && document.activeElement === box && box.selectionStart === text.length; }, stored, { timeout: 10_000 });
+    // fixed wait: proving that nothing after the hand-over moves the focus or the caret
+    await Bun.sleep(500);
+    assert.ok(await composer.evaluate((box) => { const area = box as HTMLTextAreaElement; return document.activeElement === area && area.selectionStart === area.value.length && area.scrollTop + area.clientHeight >= area.scrollHeight - 2 && !area.disabled && !area.readOnly; }), `${label}: the message box keeps the focus at the feedback's end, editable`);
+    assert.ok(stored.startsWith(`${KEPT}\n\n`), `${label}: what the draft held before stays at its start`);
+    assert.equal(sentFeedback, 0, `${label}: no feedback left the page`);
+  };
+  /** back to the terminal lens: its pictures are drawn again */
+  const backToTerminal = async (label: string) => {
+    await lens("Terminal").click();
+    images = await settled((list) => viewerRefs.every((one) => list.some((image) => image.ref === one)), `the viewer's pictures in the terminal again (${label})`);
+  };
+  // the message draft already holds text of the user's: feedback goes after it, never over it
+  const KEPT = "Keep this note of mine";
+  await page.evaluate(([key, text]) => localStorage.setItem(key!, text!), [draftKey, KEPT]);
   const commented: Record<string, string> = {};
   for (const [ref, text] of [[`file:${pastedFile}`, "pasted: darken the green"], ["pi:call_e2e_row:0", "strip: make it taller"]] as const) {
     await openReview(byRef(ref), `comment ${ref}`);
@@ -640,9 +672,10 @@ try {
     images = await settled((list) => viewerRefs.every((one) => list.some((image) => image.ref === one)), `the viewer's pictures after a reload (${ref})`);
     await openReview(byRef(ref), `reopen ${ref}`);
     assert.deepEqual(await review.locator("textarea").evaluateAll((areas) => areas.map((area) => (area as HTMLTextAreaElement).value)), [text], `${ref}: the saved comment is there when reopened`);
+    // the case the user hit: from the terminal lens, where no message box is drawn
     await review.getByRole("button", { name: "Create feedback draft" }).click();
-    await review.getByText("Added to the message draft").waitFor();
-    await closeReview();
+    await draftShown(`terminal lens ${ref}`);
+    await page.screenshot({ path: join(evidence, `9-draft-shown-${ref.startsWith("file:") ? "pasted" : "strip"}.png`) });
     const sha = new Bun.CryptoHasher("sha256").update(expectedBytes.get(ref)!).digest("hex");
     const draft = (await page.evaluate((key) => localStorage.getItem(key), draftKey)) ?? "";
     assert.ok(draft.includes(`Image SHA-256: ${sha}`) && draft.includes(`1. [x,y,w,h normalized: 0.5000, 0.5000, 0.0000, 0.0000] ${text}`), `${ref}: the feedback draft names this picture (SHA-256 ${sha}) and its comment at its place`);
@@ -653,7 +686,26 @@ try {
     const size = (png: Buffer) => [png.readUInt32BE(16), png.readUInt32BE(20)];
     assert.deepEqual(size(readFileSync(attachedPath)), size(expectedBytes.get(ref)!), `${ref}: the annotated upload is this picture's size`);
     commented[ref] = sha;
+    await backToTerminal(ref);
   }
+  // from the chat lens, whose message box is already there under the review
+  await lens("Chat").click();
+  await composer.waitFor();
+  // the strip pi read, under its turn's work block and its read row
+  await page.getByText(/^Worked for/).first().click();
+  await page.locator(".work-row-head").first().click();
+  await page.locator(".chat-tool-images .chat-user-image").first().click();
+  await lightbox.waitFor();
+  await lightbox.getByRole("button", { name: "Image comments" }).click();
+  await review.waitFor();
+  await page.waitForFunction(() => { const img = document.querySelector<HTMLImageElement>(".pi-review-image img"); return img !== null && img.complete && img.naturalWidth > 0; }, undefined, { timeout: 10_000 });
+  await review.getByRole("button", { name: "Add center comment" }).click();
+  await review.locator("textarea").last().fill("chat: from the chat lens");
+  await review.getByRole("button", { name: "Create feedback draft" }).click();
+  await draftShown("chat lens");
+  assert.ok(((await composer.inputValue()).trimEnd()).endsWith("chat: from the chat lens"), "the chat lens's feedback is at the draft's end");
+  await page.screenshot({ path: join(evidence, "9-draft-shown-chat.png") });
+  await backToTerminal("after the chat lens");
   const draftText = (await page.evaluate((key) => localStorage.getItem(key), draftKey)) ?? "";
   result["feedbackDraft"] = { commented, text: draftText };
   // each picture's comment is under its own SHA-256 only

@@ -165,6 +165,8 @@ export interface ChatViewProps {
   onPromptAnswered?: (toMessageBox: boolean) => void;
   /** the pane's own name, as App's header shows it: the log is named by it, never by the pane id */
   title?: string | null;
+  /** the composer under the chat shows now: image feedback goes into it, else it is refused */
+  draftable?: boolean;
 }
 
 interface ChatState {
@@ -805,7 +807,7 @@ function TerminalFallback({ paneId, visible }: { paneId: string; visible: boolea
 }
 
 // the app re-renders on every pane-status and poll; an unchanged transcript sits those out
-export const ChatView = memo(function ChatView({ paneId, active = true, visible: paneVisible = true, pageScroll, refreshKey, invalidationKey = 0, onConversationWatch, conversationPushes = false, onTerminalOutput, sentKey = 0, connected, ended, agent, agentStatus, onMetadata, onRead, greeted = false, onPrompt, onSuggestion, onRestored, promptRefreshKey = 0, pendingAnswer = null, onPendingAnswerDone, promptDock = null, onPromptAnswered, title = null }: ChatViewProps) {
+export const ChatView = memo(function ChatView({ paneId, active = true, visible: paneVisible = true, pageScroll, refreshKey, invalidationKey = 0, onConversationWatch, conversationPushes = false, onTerminalOutput, sentKey = 0, connected, ended, agent, agentStatus, onMetadata, onRead, greeted = false, onPrompt, onSuggestion, onRestored, promptRefreshKey = 0, pendingAnswer = null, onPendingAnswerDone, promptDock = null, onPromptAnswered, title = null, draftable = false }: ChatViewProps) {
   const t = useT();
   const { fetchPaneConversation, peekPaneConversation, fetchPanePromptState, fetchPaneTranscript } = useMachineApi();
   const { settings } = useSettings();
@@ -1554,7 +1556,7 @@ export const ChatView = memo(function ChatView({ paneId, active = true, visible:
       if (prompt.steps) setPromptPollKey((key) => key + 1);
       onPendingAnswerDone?.(paneId, prompt.id);
     }} />, promptDock)}
-  {reviewImage !== null && agent === "pi" && <ImageReview key={`${machineId}:${paneId}:${reviewImage.src}`} paneId={paneId} machineId={machineId} image={reviewImage} onClose={() => setReviewImage(null)} />}
+  {reviewImage !== null && agent === "pi" && <ImageReview key={`${machineId}:${paneId}:${reviewImage.src}`} paneId={paneId} machineId={machineId} image={reviewImage} onClose={() => setReviewImage(null)} onDraft={draftable ? () => setReviewImage(null) : null} />}
       {viewer !== null && <ImageLightbox images={viewer.images} index={viewer.index} onClose={closeViewer} onReview={agent === "pi" ? (image) => { setViewer(null); setReviewImage(image); } : undefined} />}
   </ImageViewerContext.Provider></ChatHistoryContext.Provider></ChatPaneContext.Provider>;
 });

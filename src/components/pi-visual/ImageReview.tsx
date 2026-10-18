@@ -10,8 +10,10 @@ import { uploadPaneImage } from "../../lib/api.ts";
 import { addDraft, checkSession, feedbackText, sourceFromImage, visualRequest, visualUrl } from "../../lib/pi-visual/api.ts";
 import "./PiVisual.css";
 
-export function ImageReview({paneId,machineId,image,onClose}:{paneId:string;machineId:string;image:GalleryImage;onClose:()=>void}) {
-  const commentId=useId();const t=useT();const surface=useFocusTrap<HTMLDivElement>(true);const picture=useRef<HTMLImageElement>(null);
+/** `onDraft` closes the review and shows the pane's message box, where the feedback went; null while no message box can show it. */
+export function ImageReview({paneId,machineId,image,onClose,onDraft}:{paneId:string;machineId:string;image:GalleryImage;onClose:()=>void;onDraft:(()=>void)|null}) {
+  const handedOff=useRef(false),draftTo=useRef(onDraft);draftTo.current=onDraft;
+  const commentId=useId();const t=useT();const surface=useFocusTrap<HTMLDivElement>(true,{shouldRestore:()=>!handedOff.current});const picture=useRef<HTMLImageElement>(null);
   const [doc,setDoc]=useState<ImageReviewDocument|null>(null),[notes,setNotes]=useState<ImageAnnotation[]>([]);
   const [selected,setSelected]=useState<string|null>(null),[zoom,setZoom]=useState(1),[dirty,setDirty]=useState(false);
   const [busy,setBusy]=useState(false),[error,setError]=useState(""),[notice,setNotice]=useState("");
@@ -62,6 +64,7 @@ export function ImageReview({paneId,machineId,image,onClose}:{paneId:string;mach
     if(lock.current||!doc)return;lock.current=true;setBusy(true);setError("");
     try {
       if(!notes.some(n=>!n.resolved&&n.text.trim()))throw new Error(t("Add a comment before creating feedback."));
+      if(!draftTo.current)throw new Error(t("The message box is not available right now."));
       const value=dirty?await persist():doc;const source=picture.current;
       if(!source?.complete||!source.naturalWidth||!source.naturalHeight)throw new Error(t("Image unavailable"));
       if(source.naturalWidth*source.naturalHeight>100_000_000)throw new Error(t("Image is too large to annotate."));
@@ -80,8 +83,10 @@ export function ImageReview({paneId,machineId,image,onClose}:{paneId:string;mach
       await checkSession(machineId,paneId,value.session);if(!alive.current)return;
       const path=await uploadPaneImage(paneId,new File([blob],`review-${value.id.slice(0,12)}.png`,{type:"image/png"}),machineId);
       await checkSession(machineId,paneId,value.session);if(!alive.current)return;
+      // the pane may have stopped taking input during the upload: nothing is added where it cannot be seen
+      const show=draftTo.current;if(!show)throw new Error(t("The message box is not available right now."));
       addDraft(machineId,paneId,feedbackText(value,path,notes,t("Please revise the marked image using these comments:")));
-      setNotice(t("Added to the message draft"));
+      handedOff.current=true;show();
     }catch(err){if(alive.current)setError(err instanceof Error?err.message:t("Save failed"));}
     finally{lock.current=false;if(alive.current)setBusy(false);}
   };

@@ -62,9 +62,20 @@ try {
     else assert.equal(await page.getByLabel("Comment 1",{exact:true}).inputValue(),"Move the marked part to the left (desktop).");
     await page.getByLabel("Comment 1",{exact:true}).fill(`Move the marked part to the left (${name}).`);
     await page.getByRole("button",{name:"Save",exact:true}).click();await page.getByText("Saved",{exact:true}).waitFor();
-    await page.getByRole("button",{name:"Create feedback draft"}).click();await page.getByText("Added to the message draft",{exact:true}).waitFor();
-    const draft=await page.evaluate(()=>localStorage.getItem("herdr-web-ui:composer-draft:p1"));assert.ok(draft?.includes("Move the marked part"));assert.ok(draft?.includes("review.png"));
-    await page.screenshot({path:join(outputs,`${name}-review.png`)});await page.getByRole("button",{name:"Close",exact:true}).click();
+    // no message box to show it in: refused where it is clicked, nothing uploaded or added, the review stays
+    const kept=`Keep this line (${name})`;await page.evaluate((text:string)=>localStorage.setItem("herdr-web-ui:composer-draft:p1",text),kept);
+    const box=page.getByLabel("Message box available",{exact:true});const before:number=uploads;
+    await box.evaluate(el=>(el as HTMLInputElement).click());
+    await page.getByRole("button",{name:"Create feedback draft"}).click();await page.getByRole("alert").getByText("The message box is not available right now.",{exact:true}).waitFor();
+    assert.equal(uploads,before,"nothing is uploaded for a refused draft");assert.equal(await page.evaluate(()=>localStorage.getItem("herdr-web-ui:composer-draft:p1")),kept);
+    assert.equal(await page.getByLabel("Comment 1",{exact:true}).inputValue(),`Move the marked part to the left (${name}).`);
+    await page.screenshot({path:join(outputs,`${name}-review-refused.png`)});
+    await box.evaluate(el=>(el as HTMLInputElement).click());
+    // with one: the review closes on its own and hands over to the message box, after what it held
+    await page.getByRole("button",{name:"Create feedback draft"}).click();await page.getByText("Message box shown 1",{exact:true}).waitFor();
+    await page.locator(".pi-review").waitFor({state:"detached"});
+    const draft=await page.evaluate(()=>localStorage.getItem("herdr-web-ui:composer-draft:p1"));assert.ok(draft?.startsWith(`${kept}\n\nPlease revise the marked image`));assert.ok(draft?.includes("Move the marked part"));assert.ok(draft?.includes('"/fixture/review.png"'));
+    await page.screenshot({path:join(outputs,`${name}-review.png`)});
     if(name==="desktop"){
       await page.getByRole("button",{name:"Open private desktop"}).click();await page.getByLabel("RDP port",{exact:true}).fill("3399");await page.getByLabel("One-time viewer password",{exact:true}).fill("fixture-secret");await page.getByLabel("Certificate SHA-256",{exact:true}).fill("ab".repeat(32));
       await page.getByRole("button",{name:"Connect",exact:true}).click();

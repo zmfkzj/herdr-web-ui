@@ -1,5 +1,5 @@
 import { expect, it, setSystemTime } from "bun:test";
-import { ComposerDraftStore, SEND_LEASE_MS, storageEventDraft } from "./composerDraft.ts";
+import { ComposerDraftStore, REVEAL_MS, SEND_LEASE_MS, storageEventDraft } from "./composerDraft.ts";
 function fixture() {
   const data = new Map<string, string>();
   const storage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => { data.set(key, value); }, removeItem: (key: string) => { data.delete(key); } };
@@ -151,6 +151,26 @@ it("lets a tab send again once another tab's abandoned lease runs out, and tells
     expect(other.read(key).sending).toBe(false);
     expect(told).toBe(1);
     expect(other.begin(key, "hello")).toBe(true);
+  } finally {
+    setSystemTime();
+  }
+});
+it("hands a reveal to its own draft's composer once, also one that mounts after it, and drops a stale one", () => {
+  const { store } = fixture();
+  let told = 0;
+  const stop = store.subscribe(() => { told++; });
+  store.reveal("a");
+  stop();
+  expect(told).toBe(1);
+  expect(store.takeReveal("b")).toBe(false);
+  // the chat lens's composer mounting after the switch: it takes the waiting reveal, once
+  expect(store.takeReveal("a")).toBe(true);
+  expect(store.takeReveal("a")).toBe(false);
+  try {
+    setSystemTime(new Date(1_000_000));
+    store.reveal("a");
+    setSystemTime(new Date(1_000_000 + REVEAL_MS + 1));
+    expect(store.takeReveal("a")).toBe(false);
   } finally {
     setSystemTime();
   }

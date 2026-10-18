@@ -278,6 +278,24 @@ export function Composer({
   const [caret, setCaret] = useState(text.length);
   const textRef = useRef(text);
   const caretRef = useRef(caret);
+  // text added from outside the box (image feedback) is shown where it went, once: its end in
+  // view, and the caret there with a keyboard (a phone's keyboard is not raised for it)
+  const [revealed, setRevealed] = useState(0);
+  useEffect(() => {
+    const take = (): void => { if (composerDrafts.takeReveal(draftKey)) setRevealed((count) => count + 1); };
+    take();
+    return composerDrafts.subscribe(take);
+  }, [draftKey]);
+  useEffect(() => {
+    const element = textareaRef.current;
+    if (revealed === 0 || !element) return;
+    const end = element.value.length;
+    element.scrollIntoView({ block: "nearest" });
+    if (!mobile && !modalOpen()) { element.focus({ preventScroll: true }); element.selectionStart = element.selectionEnd = end; }
+    element.scrollTop = element.scrollHeight;
+    caretRef.current = end;
+    setCaret(end);
+  }, [revealed]);
   /** the restored text the box was filled with: only that fill is ever cleared, never the user's own typing */
   const filledFrom = useRef<string | null>(null);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
