@@ -83,6 +83,18 @@ async function download(url: string, sha256: string, cacheDir: string, report: (
   }
 }
 
+/** Why a manifest of another version was refused, and how to fix it on this web server. */
+function versionMismatch(platform: string, source: string, found: unknown, configured: boolean): string {
+  const versions = `is version ${String(found).slice(0, 32)}, but this web server needs ${REMOTE_BUNDLE_VERSION}`;
+  const head = "Remote bundle version mismatch:";
+  const https = source.startsWith("https://");
+  // a configured URL may carry credentials: it is never repeated
+  if (configured && https) return `${head} the manifest HERDR_WEB_BUNDLE_MANIFEST names ${versions}. Point HERDR_WEB_BUNDLE_MANIFEST at a version ${REMOTE_BUNDLE_VERSION} manifest, or unset it, then update the bridge again.`;
+  if (configured) return `${head} the manifest HERDR_WEB_BUNDLE_MANIFEST names (${source}) ${versions}. Rebuild or replace that manifest, or unset HERDR_WEB_BUNDLE_MANIFEST so this server uses remote-bundles/ (bun run build:remote ${platform}), then update the bridge again.`;
+  if (https) return `${head} the published remote-v${REMOTE_BUNDLE_VERSION} release manifest ${versions}. On this web server run bun run build:remote ${platform}, or configure HERDR_WEB_BUNDLE_MANIFEST.`;
+  return `${head} this web server's bundle manifest (${source}) ${versions}: it was built for another app version. On this web server run bun run build:remote ${platform}, then update the bridge again.`;
+}
+
 /**
  * The verified bundle file for a platform: a local manifest's own file, or a release asset
  * downloaded once into cacheDir and reused while its checksum still matches.
@@ -94,7 +106,9 @@ export async function bundleFile(platform: string, signal: AbortSignal, options:
   const manifest: BundleManifest = https
     ? await fetch(source, { signal }).then(async (r) => { if (!r.ok) throw new Error(`Remote bundle for ${platform} is unavailable (HTTP ${r.status}). On the web server, run bun run build:remote ${platform}, or configure HERDR_WEB_BUNDLE_MANIFEST.`); return r.json() as Promise<BundleManifest>; })
     : JSON.parse(await readFile(source, { encoding: "utf8", signal }));
-  if (manifest.version !== REMOTE_BUNDLE_VERSION) throw new Error("Remote bundle version mismatch");
+  // fail closed, but say how to fix it: a local manifest built before REMOTE_BUNDLE_VERSION was raised
+  // (an app update) stays behind until it is rebuilt
+  if (manifest.version !== REMOTE_BUNDLE_VERSION) throw new Error(versionMismatch(platform, source, manifest.version, Boolean(options.manifest ?? process.env["HERDR_WEB_BUNDLE_MANIFEST"])));
   if (options.feature && !(Array.isArray(manifest.features) && manifest.features.includes(options.feature))) {
     throw new Error(`The bridge bundle this web server installs (${https ? "the published upstream release" : "its local manifest"}) does not include ${options.feature}. On this web server run bun run build:remote ${platform} from this branch, then try again.`);
   }

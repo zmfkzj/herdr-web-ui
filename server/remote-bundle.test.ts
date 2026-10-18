@@ -61,6 +61,54 @@ describe("remote bundle sources", () => {
     await expect(bundleFile("darwin-arm64", controller.signal, options)).rejects.toThrow("test cancelled");
   });
 
+  it("fails closed on a local manifest left behind by an app update and says how to rebuild it", async () => {
+    const { directory, manifest, sha256 } = fixture("linux-x64");
+    const stale = String(Number(REMOTE_BUNDLE_VERSION) - 2);
+    // no archive beside it: the version is refused before any asset is looked at
+    rmSync(join(directory, "bundle.tgz"));
+    writeFileSync(manifest, JSON.stringify({ version: stale, features: ["pi-visual"], assets: { "linux-x64": { url: "bundle.tgz", sha256 } } }));
+    const update = bundleFile("linux-x64", new AbortController().signal, { directory, manifest: "", feature: "pi-visual" });
+    await expect(update).rejects.toThrow("Remote bundle version mismatch");
+    await expect(update).rejects.toThrow(`(${manifest}) is version ${stale}, but this web server needs ${REMOTE_BUNDLE_VERSION}`);
+    await expect(update).rejects.toThrow("run bun run build:remote linux-x64");
+    // the rebuilt manifest passes the version check and still has to pass the feature and checksum checks
+    writeFileSync(manifest, JSON.stringify({ version: REMOTE_BUNDLE_VERSION, assets: { "linux-x64": { url: "bundle.tgz", sha256 } } }));
+    await expect(bundleFile("linux-x64", new AbortController().signal, { directory, manifest: "", feature: "pi-visual" })).rejects.toThrow("does not include pi-visual");
+    writeFileSync(manifest, JSON.stringify({ version: REMOTE_BUNDLE_VERSION, features: ["pi-visual"], assets: { "linux-x64": { url: "bundle.tgz", sha256 } } }));
+    writeFileSync(join(directory, "bundle.tgz"), "not the archive the manifest names");
+    await expect(bundleFile("linux-x64", new AbortController().signal, { directory, manifest: "", feature: "pi-visual" })).rejects.toThrow("checksum mismatch");
+    writeFileSync(join(directory, "bundle.tgz"), `private runtime for linux-x64`);
+    expect((await bundleFile("linux-x64", new AbortController().signal, { directory, manifest: "", feature: "pi-visual" })).sha256).toBe(sha256);
+  });
+
+  it("points a version mismatch at an explicit manifest override, and never repeats a configured URL", async () => {
+    const local = fixture("linux-x64");
+    const override = fixture("linux-x64");
+    writeFileSync(override.manifest, JSON.stringify({ version: "0", assets: {} }));
+    // a rebuilt remote-bundles/ manifest does not help while the override still selects the stale one
+    const configured = bundleFile("linux-x64", new AbortController().signal, { directory: local.directory, manifest: override.manifest });
+    await expect(configured).rejects.toThrow(`the manifest HERDR_WEB_BUNDLE_MANIFEST names (${override.manifest}) is version 0`);
+    await expect(configured).rejects.toThrow("or unset HERDR_WEB_BUNDLE_MANIFEST");
+    const original = globalThis.fetch;
+    const fetched: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      fetched.push(String(input));
+      return Response.json({ version: "0", assets: { "linux-x64": { url: "https://bundles.invalid/bundle.tgz", sha256: local.sha256 } } });
+    }) as typeof fetch;
+    try {
+      const secret = "https://user:token@bundles.invalid/manifest.json";
+      const remote = bundleFile("linux-x64", new AbortController().signal, { directory: local.directory, manifest: secret, cacheDir: join(local.directory, "cache") });
+      await expect(remote).rejects.toThrow("the manifest HERDR_WEB_BUNDLE_MANIFEST names is version 0");
+      const message = await remote.catch((error: Error) => error.message);
+      expect(message).not.toContain("token");
+      // the published release, chosen when no manifest is local or configured
+      const release = bundleFile("darwin-arm64", new AbortController().signal, { directory: local.directory, manifest: "", cacheDir: join(local.directory, "cache") });
+      await expect(release).rejects.toThrow(`the published remote-v${REMOTE_BUNDLE_VERSION} release manifest is version 0`);
+      // only the manifests were read: no asset download began
+      expect(fetched.every((url) => url.endsWith("manifest.json"))).toBe(true);
+    } finally { globalThis.fetch = original; }
+  });
+
   it("installs a bundle for the Pi visual bridge only when its manifest carries the feature", async () => {
     const { directory, manifest, sha256 } = fixture("linux-x64");
     const options = { directory, manifest: "", feature: "pi-visual" };
