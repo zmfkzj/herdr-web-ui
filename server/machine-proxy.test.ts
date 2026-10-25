@@ -7,6 +7,8 @@ import type { MachineManager } from "./machines.ts";
 const asked: (string | null)[] = [];
 const promptAsked: (string | null)[] = [];
 const PLAN_CARD = { id: "claude-plan:abc", agent: "claude", kind: "plan", title: "Plan", question: "Would you like to proceed?", options: [{ label: "Yes", description: null }], multi_select: false, custom_option_index: null };
+const historyAsked: (string | null)[] = [];
+const faviconAsked: { search: string; authorization: string | null; cookie: string | null }[] = [];
 const diffAsked: { path: string; search: string; authorization: string | null; cookie: string | null; forwarded: string | null }[] = [];
 /** What a PC's conversation routes received, decoded as that PC's server decodes it. */
 const conversationAsked: { path: string; pane_id: string | null; ref: string | null; session: string | null; digest: string | null }[] = [];
@@ -25,6 +27,14 @@ const remote = Bun.serve({
     }
     if (path === "/api/pane/conversation/tool-output") return new Response("complete remote output", { headers: { "content-type": "text/plain; charset=utf-8" } });
     if (path === "/api/fs/file") return new Response("%PDF-1.7", { headers: { "content-type": "application/pdf" } });
+    if (path === "/api/sessions/history") {
+      historyAsked.push(request.headers.get("authorization"));
+      return Response.json({ workspace_id: "w1", agent: "pi", cwd: "/work", sessions: [{ id: "s1", title: null, firstMessage: "a private prompt", startedAt: null, updatedAt: "2026-10-01T00:00:00.000Z", resume: null }] });
+    }
+    if (path === "/api/fs/favicon") {
+      faviconAsked.push({ search: new URL(request.url).search, authorization: request.headers.get("authorization"), cookie: request.headers.get("cookie") });
+      return Response.json({ icon: null });
+    }
     if (path === "/api/pane/prompt") {
       const search = new URL(request.url).searchParams;
       promptAsked.push(search.get("plan"));
@@ -64,6 +74,26 @@ describe("PC proxy", () => {
     expect(await unchanged.text()).toBe("");
     expect(asked).toEqual([null, "\"v1\""]);
   });
+});
+
+it("never forwards a PC's session history to a watching device, nor a route spelled with a trailing, doubled or encoded slash", async () => {
+  const base = "http://127.0.0.1/api/machines/pc1";
+  const query = "?workspace_id=w1&agent=pi";
+  const watched = await handleMachineRequest(new Request(`${base}/sessions/history${query}`), manager, undefined, undefined, true);
+  expect(watched.status).toBe(403);
+  expect(await watched.text()).not.toContain("a private prompt");
+  for (const readOnly of [true, false]) {
+    for (const path of ["sessions/history/", "sessions//history", "sessions%2Fhistory", "sessions%2fhistory", "pane/commands/", "workspace/directories/"]) {
+      const response = await handleMachineRequest(new Request(`${base}/${path}${query}`), manager, undefined, undefined, readOnly);
+      expect([readOnly, path, response.status]).toEqual([readOnly, path, 404]);
+    }
+  }
+  expect(historyAsked).toEqual([]);
+  // a driving device gets the PC's answer, asked with the PC's credential
+  const driven = await handleMachineRequest(new Request(`${base}/sessions/history${query}`), manager);
+  expect(driven.status).toBe(200);
+  expect(JSON.stringify(await driven.json())).toContain("a private prompt");
+  expect(historyAsked).toEqual(["Bearer remote-token"]);
 });
 
 it("forwards conversation images and complete output, while rejecting arbitrary nested paths", async () => {
@@ -137,6 +167,20 @@ it("opens a PC's file from a navigation another site started, and keeps every ot
   }
 });
 
+it("asks a PC for a folder's project icon once, with the bridge's own credential, and only from this app", async () => {
+  const search = `?root=${encodeURIComponent("/home/u/my app")}`;
+  const response = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/fs/favicon${search}`, { headers: { cookie: "ovis_token=browser-secret" } }), manager);
+  expect(response.status).toBe(200);
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(await response.json()).toEqual({ icon: null });
+  expect(faviconAsked).toEqual([{ search, authorization: "Bearer remote-token", cookie: null }]);
+  // unlike a file itself, it is never opened by a navigation from another site
+  const crossSite = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/fs/favicon${search}`, { headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate" } }), manager);
+  expect(crossSite.status).toBe(403);
+  expect(await crossSite.json()).toMatchObject({ error: { code: "invalid_origin" } });
+  expect(faviconAsked).toHaveLength(1);
+});
+
 it("refuses a path with an empty segment instead of forwarding it as another route", async () => {
   const before = asked.length;
   for (const path of ["pc1//fs/file?path=%2Fetc%2Fhostname", "pc1/fs//file?path=%2Fetc%2Fhostname", "pc1//session"]) {
@@ -148,17 +192,17 @@ it("refuses a path with an empty segment instead of forwarding it as another rou
 it("forwards a repository diff read with its query and the bridge's own credential, and nothing of the browser's", async () => {
   const before = diffAsked.length;
   const search = "?pane_id=w1%3Ap1&scope=commit&base=HEAD~1&path=dir%20with%20space%2Fa.txt";
-  for (const route of ["files", "file"]) {
+  for (const route of ["files", "file", "refs"]) {
     const response = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/workspace/diff/${route}${search}`, {
-      headers: { cookie: "herdr_web_token=browser-secret; herdr_web_device=device-secret", authorization: "Bearer browser-secret", "x-forwarded-for": "203.0.113.9" },
+      headers: { cookie: "ovis_token=browser-secret; ovis_device=device-secret", authorization: "Bearer browser-secret", "x-forwarded-for": "203.0.113.9" },
     }), manager);
     expect(response.status).toBe(200);
     expect(response.headers.get("set-cookie")).toBeNull();
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toEqual({ files: [], total: 0, truncated: false });
   }
-  expect(diffAsked.slice(before)).toEqual(["files", "file"].map((route) => ({ path: `/api/workspace/diff/${route}`, search, authorization: "Bearer remote-token", cookie: null, forwarded: null })));
-  // only the two reads are routes: nothing else under that name reaches the PC
+  expect(diffAsked.slice(before)).toEqual(["files", "file", "refs"].map((route) => ({ path: `/api/workspace/diff/${route}`, search, authorization: "Bearer remote-token", cookie: null, forwarded: null })));
+  // only the three reads are routes: nothing else under that name reaches the PC
   for (const path of ["workspace/diff", "workspace/diff/file/extra", "workspace/diff/apply", "workspace/diffs/file"]) {
     const response = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/${path}${search}`), manager);
     expect(response.status).toBe(404);
@@ -167,7 +211,7 @@ it("forwards a repository diff read with its query and the bridge's own credenti
   const crossSite = await handleMachineRequest(new Request(`http://127.0.0.1/api/machines/pc1/workspace/diff/file${search}`, { headers: { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate" } }), manager);
   expect(crossSite.status).toBe(403);
   expect(await crossSite.json()).toMatchObject({ error: { code: "invalid_origin" } });
-  expect(diffAsked.length).toBe(before + 2);
+  expect(diffAsked.length).toBe(before + 3);
 });
 
 it("gives a watching device a PC's plan card without Claude's plan file, even from a PC that ignores the ask", async () => {

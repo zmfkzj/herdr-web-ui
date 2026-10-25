@@ -68,7 +68,7 @@ try {
   // must travel inline in this experiment, never by a filename sent by the terminal.
   native = new PtySession({ command: "/usr/bin/env", args: [
     ...Object.keys(process.env).filter((key) => key.startsWith("HERDR_")).flatMap((key) => ["-u", key]),
-    process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--session", process.env["HERDR_TEST_SESSION"] || "herdr-web-ui-test",
+    process.env["OVIS_HERDR_BIN"] || "herdr", "--session", process.env["HERDR_TEST_SESSION"] || "herdr-web-ui-test",
   ], cols: 100, rows: 30, env: { TERM_PROGRAM: "xterm", TMUX: "fixture" }, onExit() {}, onData(data) {
     nativeOutput += data;
     if (nativeOutput.length > 8 * 1024 * 1024) throw new Error("Fixture native output exceeded its bound");
@@ -112,7 +112,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 1280, height: 850 }, locale: "en-US" });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.addInitScript((id) => localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal"), pane);
+  await page.addInitScript((id) => localStorage.setItem(`ovis:view:${id}`, "terminal"), pane);
   await page.goto(`http://127.0.0.1:${server.port}/?pane=${encodeURIComponent(pane)}&view=terminal`);
   await page.locator(".conn-live").first().waitFor();
   await page.screenshot({ path: join(evidence, "before.png") });
@@ -129,7 +129,7 @@ try {
   writeFileSync(join(evidence, "native.txt"), nativeOutput);
   writeFileSync(join(evidence, "mirror-ansi.txt"), read.text);
   const result = {
-    herdr: Bun.spawnSync([process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim(),
+    herdr: Bun.spawnSync([process.env["OVIS_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim(),
     encoder: encoderPath ? "installed pi-tui encodeKitty" : "Pi-compatible Kitty fixture",
     native: { image: imagePayload(nativeOutput), commands: commands(nativeOutput) },
     local: { image: imagePayload(captured.local), commands: commands(captured.local) },

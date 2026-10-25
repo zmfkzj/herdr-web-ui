@@ -178,8 +178,8 @@ try {
   const context = await browser.newContext({ viewport: { width: 1200, height: 800 }, locale: "en-US" });
   await context.addInitScript((id) => {
     Object.defineProperty(navigator, "platform", { get: () => "MacIntel" });
-    localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en", terminalInputMode: "direct" }));
-    localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal");
+    localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", terminalInputMode: "direct" }));
+    localStorage.setItem(`ovis:view:${id}`, "terminal");
   }, pane);
   const page = await context.newPage();
   failurePage = page;
@@ -226,6 +226,7 @@ try {
     const before = sent.length;
     await input.press(shortcut);
     await until(() => sent.length > before, `${shortcut} sends a frame`);
+    // fixed wait: proves that no further frame follows the first (an ESC CR beside the key would come here)
     await page.waitForTimeout(settle);
     return sent.slice(before);
   };
@@ -269,12 +270,14 @@ try {
     });
     await page.screenshot({ path: join(evidence, `${label}-follow-up-queued.png`) });
     assert.deepEqual(followFrames, ALT_ENTER, `${label}: one Alt+Enter while answering is one alt+enter key`);
+    // fixed wait: proves that pi sends no request for the follow-up in this time
     await page.waitForTimeout(NO_REQUEST_WAIT_MS);
     assert.equal(requestsOf(followUp), 0, `${label}: the follow-up waits for the answer`);
     model.release(first);
     await until(() => requestsOf(followUp) === 1, `${label}: pi sends the follow-up after the answer`);
     await shows(`answered ${followUp}`, `${label}: pi shows the follow-up's answer`);
     await page.screenshot({ path: join(evidence, `${label}-follow-up-answered.png`) });
+    // fixed wait: proves that pi sends no request for the follow-up in this time
     await page.waitForTimeout(NO_REQUEST_WAIT_MS);
     assert.equal(requestsOf(followUp), 1, `${label}: the follow-up is sent once`);
 
@@ -296,7 +299,7 @@ try {
   assert.deepEqual(errors, [], "no page errors");
   await paneSendKeys(pane, ["ctrl+c"]).catch(() => {});
   await paneSendKeys(pane, ["ctrl+c"]).catch(() => {});
-  result["herdr"] = Bun.spawnSync([process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
+  result["herdr"] = Bun.spawnSync([process.env["OVIS_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
   result["pi"] = Bun.spawnSync(["pi", "--version"]).stdout.toString().trim();
   result["status"] = "passed";
   writeFileSync(join(evidence, "result.json"), JSON.stringify(result, null, 2));

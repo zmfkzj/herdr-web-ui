@@ -188,8 +188,8 @@ try {
     imageAnswers.push({ url: url.pathname + url.search, status: response.status(), session: response.headers()["x-herdr-pi-session"] ?? null });
   });
   await page.addInitScript((id) => {
-    localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
-    localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal");
+    localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
+    localStorage.setItem(`ovis:view:${id}`, "terminal");
   }, pane);
 
   /** what the image layer draws, read against the terminal's own text rows */
@@ -376,7 +376,7 @@ try {
   assert.deepEqual(errors, [], "no page errors");
   result["imageAnswers"] = imageAnswers.length;
   result["refusedAnswers"] = imageAnswers.filter((answer) => answer.status !== 200).map((answer) => ({ ...answer, url: answer.url.replace(/digest=[0-9a-f]+/, "digest=…") }));
-  result["herdr"] = Bun.spawnSync([process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
+  result["herdr"] = Bun.spawnSync([process.env["OVIS_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
   result["pi"] = Bun.spawnSync(["pi", "--version"]).stdout.toString().trim();
   result["status"] = "passed";
   writeFileSync(join(evidence, "result.json"), JSON.stringify(result, null, 2));

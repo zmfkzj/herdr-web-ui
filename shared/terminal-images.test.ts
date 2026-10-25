@@ -44,7 +44,7 @@ describe("terminal image markers", () => {
 
 describe("pasted pictures' file refs in markers", () => {
   it("reads `file:<absolute path>` as the extension encodes it, Korean, spaces, `#` and `%` included", () => {
-    const path = "/home/u/.herdr-web-ui/붙여넣기 #1 100%.png";
+    const path = "/home/u/.ovis/붙여넣기 #1 100%.png";
     expect(parseTerminalImageMarker(uri({ ...base, ref: rfc3986(`file:${path}`) }))?.ref).toBe(`file:${path}`);
     expect(parsePiFileRef(`file:${path}`)).toEqual({ path });
     expect(parsePiFileRef("file:C:\\Users\\a.png")).toEqual({ path: "C:\\Users\\a.png" });

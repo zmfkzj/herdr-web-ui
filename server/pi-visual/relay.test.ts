@@ -92,7 +92,7 @@ const grants = new GuiViewGrants();
 const desktops = new RemoteDesktops(manager, grants);
 /** whether the browser's device may still give input (index.ts: its role is "drive") */
 let drive = true;
-const COOKIE = "herdr_web_device=browser-a";
+const COOKIE = "ovis_device=browser-a";
 /** `/gui view W1` run by this browser in p1 of a PC, through that PC's current bridge connection */
 const ran = (machine: string, text = "/gui view W1", cookie = COOKIE) => grants.observe({ binding: desktopBinding(new Request("http://x", { headers: { cookie } })), machine, connection: endpoints.get(machine)! }, "p1", text);
 let local: ReturnType<typeof Bun.serve>;
@@ -117,7 +117,7 @@ beforeAll(async () => {
           relay.close(); return new Response("upgrade", { status: 426 });
         } catch (error) { return new Response(error instanceof Error ? error.message : "refused", { status: 403 }); }
       }
-      return handleMachineRequest(request, manager as unknown as MachineManager, undefined, undefined, false, { desktops });
+      return handleMachineRequest(request, manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, { desktops });
     },
     websocket: { open(ws) { ws.data.relay.bind(ws as ServerWebSocket<unknown>); }, message(ws, raw) { ws.data.relay.message(String(raw)); }, close(ws) { ws.data.relay.close(); } },
   });
@@ -172,26 +172,26 @@ describe("private desktops of other PCs", () => {
 
   it("asks for the password unless this browser ran /gui view for that worker on that PC, once per command", async () => {
     ran("pc-b");
-    const other = await post("pc-b", { ...AUTO }, "herdr_web_device=browser-b");
+    const other = await post("pc-b", { ...AUTO }, "ovis_device=browser-b");
     expect(other.status).toBe(403);
     expect((await other.json() as { error: { code: string } }).error.code).toBe("gui_view_required");
     expect((await post("pc-b", { ...AUTO, worker: "W2" })).status).toBe(403);
     // a command run on PC a opens nothing on PC b, whose pane, session and worker have the same names
-    ran("pc-a", "/gui view W1", "herdr_web_device=browser-c");
-    expect((await post("pc-b", AUTO, "herdr_web_device=browser-c")).status).toBe(403);
+    ran("pc-a", "/gui view W1", "ovis_device=browser-c");
+    expect((await post("pc-b", AUTO, "ovis_device=browser-c")).status).toBe(403);
     // the PC resolves what the command named: `/gui view w1` there is not W1's desktop when a w1 exists;
     // here only W1 runs, so it opens, and the grant is spent by that ticket
-    ran("pc-b", "/gui view w1", "herdr_web_device=browser-d");
-    expect((await post("pc-b", AUTO, "herdr_web_device=browser-d")).status).toBe(200);
-    expect((await post("pc-b", AUTO, "herdr_web_device=browser-d")).status).toBe(403);
+    ran("pc-b", "/gui view w1", "ovis_device=browser-d");
+    expect((await post("pc-b", AUTO, "ovis_device=browser-d")).status).toBe(200);
+    expect((await post("pc-b", AUTO, "ovis_device=browser-d")).status).toBe(403);
     // a browser's own `command` field is never taken for one
-    expect((await post("pc-b", { ...AUTO, command: { worker: "W1", ageMs: 0 } }, "herdr_web_device=browser-e")).status).toBe(403);
+    expect((await post("pc-b", { ...AUTO, command: { worker: "W1", ageMs: 0 } }, "ovis_device=browser-e")).status).toBe(403);
     // a command made on the connection before a reconnect opens nothing on the new one
-    ran("pc-b", "/gui view W1", "herdr_web_device=browser-f");
+    ran("pc-b", "/gui view W1", "ovis_device=browser-f");
     reconnect("pc-b");
-    expect((await post("pc-b", AUTO, "herdr_web_device=browser-f")).status).toBe(403);
+    expect((await post("pc-b", AUTO, "ovis_device=browser-f")).status).toBe(403);
     // with the password the user typed, it opens; the password goes to the PC's bridge only
-    const manual = await post("pc-b", { session: SESSION, port: 3392, password: "typed-by-user", fingerprint: "ab".repeat(32), readOnly: true, width: 1024, height: 768 }, "herdr_web_device=browser-b");
+    const manual = await post("pc-b", { session: SESSION, port: 3392, password: "typed-by-user", fingerprint: "ab".repeat(32), readOnly: true, width: 1024, height: 768 }, "ovis_device=browser-b");
     expect(manual.status).toBe(200);
     const body = await manual.text();
     expect(body).not.toContain("typed-by-user");
@@ -199,7 +199,7 @@ describe("private desktops of other PCs", () => {
 
   it("binds tickets to the browser, uses them once and refuses them after a reconnect", async () => {
     const issue = async () => { ran("pc-b"); return (await (await post("pc-b", AUTO)).json() as { ticket: string }).ticket; };
-    const stolen = browser(await issue(), "herdr_web_device=browser-b");
+    const stolen = browser(await issue(), "ovis_device=browser-b");
     await until(() => stolen.state.closed, "a ticket used by another browser is refused");
     expect(stolen.state.open).toBe(false);
     const ticket = await issue();
@@ -218,12 +218,12 @@ describe("private desktops of other PCs", () => {
   });
 
   it("decides HTTPS and its own switch on the browser's request, before the PC is asked", async () => {
-    const insecure = await handleMachineRequest(new Request("http://pc.example.net/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://pc.example.net" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, { desktops });
+    const insecure = await handleMachineRequest(new Request("http://pc.example.net/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://pc.example.net" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, { desktops });
     expect(insecure.status).toBe(403);
     expect((await insecure.json() as { error: { code: string } }).error.code).toBe("https_required");
     // straight over Tailscale to this server's tailnet address (index.ts: directTailnetRequest): plain http passes,
     // and the browser still needs its own `/gui view` grant
-    const overTailnet = (encrypted: boolean) => handleMachineRequest(new Request("http://100.127.163.32:7318/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://100.127.163.32:7318" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, { desktops, encrypted });
+    const overTailnet = (encrypted: boolean) => handleMachineRequest(new Request("http://100.127.163.32:7318/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://100.127.163.32:7318" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, { desktops, encrypted });
     expect((await (await overTailnet(true)).json() as { error: { code: string } }).error.code).toBe("gui_view_required");
     ran("pc-b");
     const cleartext = await overTailnet(false);

@@ -3,7 +3,7 @@
  *
  * herdr follows the pane's provider child, not the gjc parent: a turn gjc finished keeps
  * reading `working` for what the child does, and the sidebar holds RUN with no done alert.
- * The transcript the pane's gjc process holds (gjc-runtime.ts finds exactly that file, never a
+ * The transcript the pane's gjc extension reports (gjc-runtime.ts finds exactly that file, never a
  * newest file by cwd) tells the parent turn instead: a user prompt, a tool result or an
  * assistant message that stopped for a tool means work; one that stopped for good (`stop`,
  * `length`) is rest, and one that errored or was aborted is rest after a failure — READY, not

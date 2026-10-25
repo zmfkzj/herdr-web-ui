@@ -1,23 +1,24 @@
 import "./test-herdr.ts";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, realpathSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { createServer } from "../server/index.ts";
 import { herdrRpc, herdrSocketPath, sessionSnapshot, workspaceCreate, workspaceClose } from "../server/herdr/client.ts";
 import { gjcTranscriptForPane, isGjcProcess } from "../server/gjc-runtime.ts";
+import { processStartedAt } from "../server/process-start.ts";
 import { UsageService } from "../server/usage.ts";
+import { GJC_NATIVE_DIRECTORY, GJC_NATIVE_HEARTBEAT_MS, type GjcNativeBinding } from "../shared/gjc-native.ts";
 import type { ServerMessage, SessionSnapshot } from "../shared/protocol.ts";
 
 type Status = "idle" | "working" | "done" | "blocked";
 type NativeRecord = Readonly<Record<string, unknown>>;
-const root = mkdtempSync(join(tmpdir(), "herdr-gjc-status-browser-"));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-gjc-status-browser-")));
 const store = join(root, ".gjc", "agent", "sessions", "v2-fixture");
 const script = join(root, "gjc");
-const oldPath = process.env.PATH;
-const sdkRows: Record<string, unknown>[] = [];
-const sdkRegistry = join(root, "sdk-fixture.json");
+const bindingsDirectory = join(root, ".gjc", "agent", GJC_NATIVE_DIRECTORY);
+const bindingTimers: ReturnType<typeof setInterval>[] = [];
 const oldHome = process.env.HOME, oldSocket = process.env.HERDR_SOCKET;
 const evidenceDirectory = process.env.UI_EVIDENCE_DIR || process.env.CHECK_BROWSER_EVIDENCE_DIR;
 const workspaces: string[] = [], frames: ServerMessage[] = [];
@@ -73,11 +74,20 @@ async function fixture(transcript: string): Promise<string> {
   assert.ok(foreground?.argv);
   assert.ok(isGjcProcess(foreground.argv), "fixture must be recognized as GJC");
   const header: { id: string } = JSON.parse(readFileSync(transcript, "utf8").split("\n")[0] ?? "");
-  sdkRows.push({ sessionId: header.id, pid: foreground.pid, hostIncarnation: "owned-fixture",
-    endpointGeneration: 1, identityProvenance: "composite", live: true, terminal: false,
-    terminalUncertain: false, ambiguous: false,
-    locator: { cwd: root, worktreeRoot: null, stateRoot: join(root, ".gjc", "agent") }, path: transcript });
-  writeFileSync(sdkRegistry, JSON.stringify(sdkRows));
+  const birth = processStartedAt(foreground.pid);
+  assert.notEqual(birth, null, "fixture process must have a birth identity");
+  const bindingPath = join(bindingsDirectory, `${foreground.pid}.json`);
+  const binding: GjcNativeBinding = {
+    version: 1, pid: foreground.pid, processStartedAt: birth!, instanceId: crypto.randomUUID(),
+    sequence: 1, updatedAt: 0, session: { id: header.id, path: transcript, cwd: root },
+  };
+  const publish = () => {
+    binding.updatedAt = Date.now();
+    writeFileSync(`${bindingPath}.tmp`, JSON.stringify(binding), { mode: 0o600 });
+    renameSync(`${bindingPath}.tmp`, bindingPath);
+  };
+  publish();
+  bindingTimers.push(setInterval(publish, GJC_NATIVE_HEARTBEAT_MS));
   await until(async () => await gjcTranscriptForPane(paneId, root, root) === transcript, "exact native transcript binding");
   await herdrRpc("pane.report_agent", { pane_id: paneId, source: "manual", agent: "gjc", state: "working" });
   await herdrRpc("pane.report_agent_session", { pane_id: paneId, source: "herdr:codex", agent: "codex", seq: Date.now(), agent_session_id: "01a00000-0000-7000-8000-000000000001" });
@@ -107,11 +117,14 @@ function agentRow(paneId: string) {
   assert.ok(page);
   return page.locator(`.agents-sidebar .agent-item[data-machine="local"][data-pane="${paneId}"]`);
 }
+// the pane on screen was looked at: its row draws herdr's DONE as ready, as herdr's own client does (#1279)
+let onScreen: string | null = null;
+const drawn = (paneId: string, status: Status): Status => status === "done" && paneId === onScreen ? "idle" : status;
 async function settled(paneId: string, status: Status, start?: number): Promise<void> {
   if (start !== undefined) await until(() => frames.slice(start).some((frame) =>
     frame.type === "pane-status" && frame.pane_id === paneId && frame.agent_status === status), `${scenario}: pushed ${status}`);
   await until(async () => (await httpSnapshot()).panes.find((item) => item.pane_id === paneId)?.agent_status === status, `${scenario}: HTTP ${status}`);
-  await until(() => agentRow(paneId).locator(`.badge[data-status="${status}"]`).isVisible(), `${scenario}: browser ${status}`);
+  await until(() => agentRow(paneId).locator(`.badge[data-status="${drawn(paneId, status)}"]`).isVisible(), `${scenario}: browser ${drawn(paneId, status)}`);
   await rawWorking(paneId);
 }
 async function checkpoint(name: string): Promise<void> {
@@ -124,7 +137,7 @@ async function staysDone(paneId: string, start: number): Promise<void> {
   const observedUntil = Date.now() + 2_000;
   await until(async () => {
     assert.equal((await httpSnapshot()).panes.find((item) => item.pane_id === paneId)?.agent_status, "done");
-    assert.ok(await agentRow(paneId).locator('.badge[data-status="done"]').isVisible());
+    assert.ok(await agentRow(paneId).locator(`.badge[data-status="${drawn(paneId, "done")}"]`).isVisible());
     assert.ok(!frames.slice(start).some((frame) => frame.type === "pane-status" && frame.pane_id === paneId && frame.agent_status !== "done"), "stale raw events must not push a native status regression");
     return Date.now() >= observedUntil;
   }, "DONE remains stable while stale raw events are processed");
@@ -137,22 +150,7 @@ function passed(): void {
 process.env.HERDR_SOCKET = herdrSocketPath();
 process.env.HOME = root;
 try {
-  const sdkBin = join(root, "bin");
-  mkdirSync(sdkBin);
-  const sdkCommand = join(sdkBin, "gjc");
-  writeFileSync(sdkCommand, `#!${process.execPath}
-import { readFileSync } from "node:fs";
-const rows = JSON.parse(readFileSync(${JSON.stringify(sdkRegistry)}, "utf8"));
-const at = process.argv.indexOf("--json-input");
-const input = at < 0 ? {} : JSON.parse(process.argv[at + 1]);
-const row = rows.find((candidate) => candidate.sessionId === input.resolveSessionId);
-console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
-  indexSeq: 1, sessions: rows, continuationCursor: null,
-  savedSession: row ? { id: row.sessionId, path: row.path } : null,
-} }));
-`);
-  chmodSync(sdkCommand, 0o755);
-  process.env.PATH = `${sdkBin}:${oldPath ?? ""}`;
+  mkdirSync(bindingsDirectory, { recursive: true });
   mkdirSync(store, { recursive: true });
   if (evidenceDirectory) mkdirSync(evidenceDirectory, { recursive: true });
   writeFileSync(script, "import { openSync } from 'node:fs'; globalThis.held = openSync(process.argv[2], 'r'); console.log('Synthetic GJC fixture'); setInterval(() => {}, 1000);\n");
@@ -177,8 +175,8 @@ console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
   browser = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? "/opt/google/chrome/chrome", headless: true, args: ["--no-sandbox", "--accept-lang=en-US"] });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await context.addInitScript((ids) => {
-    localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en", quietOpenedDone: false }));
-    for (const id of ids) localStorage.setItem(`herdr-web-ui:view:${id}`, "chat");
+    localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
+    for (const id of ids) localStorage.setItem(`ovis:view:${id}`, "chat");
   }, [paneId, delayedPaneId]);
   page = await context.newPage();
   await page.goto(origin);
@@ -187,6 +185,7 @@ console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
   await settled(paneId, "idle");
   assert.ok((await conversation(paneId)).includes("Synthetic GJC completed answer"));
   await agentRow(paneId).locator(".agent-select").click();
+  onScreen = paneId;
   await page.getByText("Synthetic GJC completed answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
   assert.ok(!frames.some((frame) => frame.type === "pane-status" && frame.pane_id === paneId && frame.agent_status === "done"));
   await checkpoint("initial-rest"); passed();
@@ -232,6 +231,7 @@ console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
   scenario = "Delayed native readiness pushes DONE from raw RUN";
   await settled(delayedPaneId, "working");
   await agentRow(delayedPaneId).locator(".agent-select").click();
+  onScreen = delayedPaneId;
   start = frames.length;
   delayed.append(delayed.message("user", "Synthetic delayed request"), delayed.message("assistant", "Synthetic delayed completed answer"));
   await settled(delayedPaneId, "done", start);
@@ -242,6 +242,7 @@ console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
   try { await checkpoint("failure"); } catch (captureError) { console.error("GJC screenshot failed", captureError); }
   throw error;
 } finally {
+  for (const timer of bindingTimers) clearInterval(timer);
   try {
     if (evidenceDirectory) writeFileSync(join(evidenceDirectory, "gjc-status-summary.json"), JSON.stringify({ scenarios: outcomes, failedScenario: outcomes.length === 6 ? null : scenario }, null, 2) + "\n");
   } finally {
@@ -258,7 +259,6 @@ console.log(JSON.stringify({ type: "broker_response", ok: true, result: {
         } finally {
           if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
           if (oldSocket === undefined) delete process.env.HERDR_SOCKET; else process.env.HERDR_SOCKET = oldSocket;
-          if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
           rmSync(root, { recursive: true, force: true });
         }
       }

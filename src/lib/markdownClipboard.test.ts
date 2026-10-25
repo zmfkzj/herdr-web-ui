@@ -1,80 +1,67 @@
 import { describe, expect, test } from "bun:test";
-import { renderedMarkdownPayload, type ClipboardNode } from "./markdownClipboard.ts";
+import { renderedClipboardPayload, type ClipboardNode } from "./markdownClipboard.ts";
 
 const text = (value: string): ClipboardNode => ({ tag: "", text: value });
 const element = (tag: string, content: readonly ClipboardNode[], attrs?: Record<string, string>): ClipboardNode => ({ tag, children: content, attrs });
+// The plain text is the browser's own selection string, passed through untouched; only the rich
+// HTML is built from the nodes, so that is all these tests look at. The browser regression
+// (scripts/chat-selection-copy-regression.ts) holds the exact plain-text expectations.
+const html = (nodes: readonly ClipboardNode[]): string => renderedClipboardPayload(nodes, "").html;
 
-describe("renderedMarkdownPayload", () => {
-  test("keeps lists, emphasis, links, and heading source levels", () => {
-    const nodes = [
-      element("H3", [text("Plan")], { "data-markdown-heading": "1" }),
+describe("renderedClipboardPayload", () => {
+  test("rebuilds headings, lists, emphasis and safe links as rich HTML", () => {
+    expect(html([
+      element("H3", [text("Plan")], { class: "markdown-h1" }),
       element("UL", [
         element("LI", [element("STRONG", [text("First")])]),
         element("LI", [element("A", [text("Docs")], { href: "https://example.com" })]),
       ]),
-    ];
-    const payload = renderedMarkdownPayload(nodes);
-    expect(payload.text).toBe("# Plan\n\n- **First**\n- [Docs](https://example.com)");
-    expect(payload.html).toContain("<ul><li><strong>First</strong></li>");
+    ])).toBe('<h3>Plan</h3><ul><li><strong>First</strong></li><li><a href="https://example.com">Docs</a></li></ul>');
   });
 
-  test("keeps nested and ordered task list markers", () => {
-    const nodes = [element("OL", [
-      element("LI", [
-        element("SPAN", [], { role: "checkbox", "aria-checked": "true" }),
-        text("Done"),
-        element("UL", [element("LI", [text("Child")])]),
-      ]),
-    ], { start: "3" })];
-    expect(renderedMarkdownPayload(nodes).text).toBe("3. [x] Done\n       - Child");
+  test("retains nested ordered lists and their start number", () => {
+    expect(html([element("OL", [
+      element("LI", [text("Done"), element("UL", [element("LI", [text("Child")])])]),
+    ], { start: "3" })])).toBe('<ol start="3"><li>Done<ul><li>Child</li></ul></li></ol>');
   });
 
-  test("copies a sole code block as plain code without losing blank lines or spaces", () => {
+  test("keeps code whitespace and leaves out a code block's label, controls and notes", () => {
     const code = "  one\n\n\n  two  ";
-    const nodes = [element("DIV", [
-      element("DIV", [text("ts"), element("BUTTON", [text("Copy")])], { class: "markdown-code-header" }),
+    expect(html([element("P", [text("Run this")]), element("DIV", [
+      element("DIV", [element("SPAN", [text("ts")]), element("BUTTON", [text("Copy")], { class: "icon-button markdown-code-copy" })], { class: "markdown-code-header" }),
+      element("P", [text("Couldn't copy. Select the text and copy it manually.")], { class: "markdown-code-error", role: "alert" }),
       element("PRE", [element("CODE", [text(code)])]),
-    ])];
-    expect(renderedMarkdownPayload(nodes).text).toBe(code);
+      element("P", [text("Too long to highlight")], { class: "hl-note" }),
+      element("BUTTON", [text("Show all 40 lines")], { class: "markdown-code-more" }),
+    ], { class: "markdown-code" })])).toBe(`<p>Run this</p><pre><code>${code}</code></pre>`);
   });
 
-  test("fences code in a mixed selection without altering its whitespace", () => {
-    const nodes = [
-      element("P", [text("Run this")]),
-      element("PRE", [element("CODE", [text("one\n\n\n```  ")])], { "data-language": "sh" }),
-    ];
-    expect(renderedMarkdownPayload(nodes).text).toBe("Run this\n\n````sh\none\n\n\n```  \n````");
-  });
-
-  test("preserves chip raw text and image Markdown even when an image is a fallback link", () => {
-    const nodes = [element("P", [
-      element("SPAN", [element("SVG", [text("icon")]), text("/review")], { class: "markdown-skill" }),
-      text(" "),
-      element("SPAN", [text("diagram")], { "data-markdown-copy": "![diagram](https://example.com/picture.png)" }),
-    ])];
-    expect(renderedMarkdownPayload(nodes).text).toBe("/review ![diagram](https://example.com/picture.png)");
+  test("keeps a selected file button's text and an image's fallback label", () => {
+    expect(html([element("P", [
+      element("BUTTON", [element("CODE", [text("main.ts")])], { class: "markdown-file" }),
+      element("SPAN", [text("diagram")]),
+    ])])).toBe("<p><code>main.ts</code>diagram</p>");
   });
 
   test("exports rich HTML without executable attributes, embedded resources, or unsafe links", () => {
-    const nodes = [
+    expect(html([
       element("P", [text('<hello & "world">')], { onclick: "alert(1)", style: "background:url(https://example.com)" }),
       element("SCRIPT", [text("alert(1)")]),
       element("IFRAME", [], { src: "https://example.com" }),
       element("IMG", [], { alt: "picture", src: "https://example.com/p.png", onerror: "alert(1)" }),
       element("A", [text("unsafe")], { href: "javascript:alert(1)" }),
       element("STRONG", [text("safe")]),
-    ];
-    expect(renderedMarkdownPayload(nodes).html).toBe('<p>&lt;hello &amp; &quot;world&quot;&gt;</p>picture<a>unsafe</a><strong>safe</strong>');
+      element("SPAN", [text("hidden")], { "aria-hidden": "true" }),
+    ])).toBe('<p>&lt;hello &amp; &quot;world&quot;&gt;</p>picture<a>unsafe</a><strong>safe</strong>');
   });
 
-  test("preserves quoted text and tables with escaped cell delimiters", () => {
-    const nodes = [
+  test("retains quotes and tables as rich HTML", () => {
+    expect(html([
       element("BLOCKQUOTE", [element("P", [text("Quote")])]),
       element("TABLE", [
         element("THEAD", [element("TR", [element("TH", [text("Name")])])]),
         element("TBODY", [element("TR", [element("TD", [text("a|b")])])]),
       ]),
-    ];
-    expect(renderedMarkdownPayload(nodes).text).toBe("> Quote\n\n| Name |\n| --- |\n| a\\|b |");
+    ])).toBe("<blockquote><p>Quote</p></blockquote><table><thead><tr><th>Name</th></tr></thead><tbody><tr><td>a|b</td></tr></tbody></table>");
   });
 });

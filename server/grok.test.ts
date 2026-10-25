@@ -1,11 +1,15 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import * as fs from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { forgetTranscriptState, HistoryChanged, transcriptPage } from "./conversation.ts";
 import { grokToolOutput, grokProjection, GrokUnavailable, parseGrokTranscript } from "./grok.ts";
-import { grokHomeFromEnvironment, grokPaneProcesses, grokTranscriptPath, isGrokExecutable } from "./grok-store.ts";
-import type { ConversationPart } from "../shared/protocol.ts";
+import { grokHomeFromEnvironment, grokPaneProcesses, grokTranscriptPath, isGrokExecutable, resolveGrokStore } from "./grok-store.ts";
+import * as herdr from "./herdr/client.ts";
+import type { ConversationPart, HerdrPane } from "../shared/protocol.ts";
 
 const session = "fictional-session";
 const event = (update: object, extension = false) => JSON.stringify({ timestamp: 1700000000, method: extension ? "_x.ai/session/update" : "session/update", params: { sessionId: session, update } }) + "\n";
@@ -51,7 +55,7 @@ describe("Grok native event adapter", () => {
     expect(part.name).toBe("run_terminal_command");
     expect(JSON.parse(part.input).variant).toBe("Bash");
     expect(part.output).toBe("FICTIONAL_TOOL_OUTPUT\n");
-    expect(page().turns.at(-1)!.parts.at(-1)).toEqual({ kind: "text", text: "FICTIONAL_AFTER_TOOL" });
+    expect(page().turns.at(-1)!.parts.at(-1)).toEqual({ kind: "text", text: "FICTIONAL_AFTER_TOOL", phase: "final_answer" });
   });
   test("text chunks, hidden boundaries and synthetic prompts", () => {
     const turns = parseGrokTranscript(user(0, "hello ") + user(0, "world") + answer("one ") + answer("two") + user(1, "hidden", { hideFromScrollback: true }) + answer("separate answer") + user(2, "visible", { syntheticPrompt: true }));
@@ -92,7 +96,7 @@ describe("Grok native event adapter", () => {
   });
   test("turn completion separates assistant activity without dropping earlier messages", () => {
     const turns = parseGrokTranscript(user(0) + answer("first") + event({ sessionUpdate: "turn_completed" }, true) + answer("later"));
-    expect(turns.map((t) => t.parts)).toEqual([[{ kind: "text", text: "prompt 0" }], [{ kind: "text", text: "first" }], [{ kind: "text", text: "later" }]]);
+    expect(turns.map((t) => t.parts)).toEqual([[{ kind: "text", text: "prompt 0" }], [{ kind: "text", text: "first", phase: "final_answer" }], [{ kind: "text", text: "later" }]]);
   });
   test("native tool metadata, search variants and historical diffs survive output replacement", () => {
     const native = event({ sessionUpdate: "tool_call", toolCallId: "edit-1", _meta: { "x.ai/tool": { name: "edit_file" } }, content: [{ type: "diff", path: "fiction.txt", oldText: "before", newText: "after" }] });
@@ -222,6 +226,115 @@ describe("exact store lookup", () => {
       expect(grokPaneProcesses({ foreground_processes: [{ pid: 11, argv: [exe] }] })).toEqual([]);
     }
   });
+  // These resolver tests need Linux /proc/<pid>/fd and /proc/<pid>/exe; macOS and
+  // Windows intentionally use Terminal because that evidence is unavailable.
+  for (const scenario of [
+    { name: "older files stay open", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: true },
+    { name: "/resume writes a newer session", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false },
+    { name: "the reported id is held in two directories", otherGroup: "other-group", otherSession: session, otherMtime: 100, binds: false },
+    { name: "held sessions have tied write times", otherGroup: "group", otherSession: "tied-session", otherMtime: 200, binds: false },
+    { name: "the newest held events file is unlinked", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, change: "unlink" },
+    { name: "the newest held events file is renamed", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, change: "rename" },
+    { name: "a replacement reported file has a newer timestamp", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, replacement: "current" },
+    { name: "a replacement competing file has an older timestamp", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, replacement: "other" },
+    // a newer held events file moved to a name or a folder the session filter does not take
+    { name: "the newest held events file is renamed without its prefix", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, change: "rename-away" },
+    { name: "the newest held session's folder is renamed past the id filter", otherGroup: "group", otherSession: "resumed-session", otherMtime: 300, binds: false, change: "rename-folder" },
+    // older write times: these must not bind as merely older held sessions either
+    { name: "an older held session's folder is renamed past the id filter", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: false, change: "rename-folder" },
+    { name: "an events-named file is held deeper in the store", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: false, nested: true },
+    { name: "a held events file is renamed in a folder renamed past the id filter", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: false, change: "rename-both" },
+    // another file held in a session folder: its events file beside it says nothing moved away
+    { name: "another file is held beside an older session's events file", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: true, heldLock: "beside events.jsonl" },
+    { name: "another file is held in a session folder with no events file", otherGroup: "group", otherSession: "older-session", otherMtime: 100, binds: false, heldLock: "alone" },
+  ] as { name: string; otherGroup: string; otherSession: string; otherMtime: number; binds: boolean; change?: string; replacement?: string; nested?: boolean; heldLock?: string }[]) {
+    test.skipIf(process.platform !== "linux" || !existsSync("/proc/self/fd"))(`resolves Herdr's session safely when ${scenario.name}`, async () => {
+      const home = realpathSync(root);
+      const transcript = join(home, "sessions", "%2Ffiction", session, "updates.jsonl");
+      const current = join(dirname(transcript), "events.jsonl");
+      const other = join(home, "sessions", scenario.otherGroup, scenario.otherSession, "events.jsonl");
+      const retained = join(home, "sessions", "group", "retained-session", "events.jsonl");
+      const outside = join(home, "events.jsonl");
+      mkdirSync(dirname(other), { recursive: true });
+      mkdirSync(dirname(retained), { recursive: true });
+      writeFileSync(transcript, user(0));
+      writeFileSync(current, "");
+      writeFileSync(other, "");
+      writeFileSync(retained, "");
+      writeFileSync(outside, "");
+      utimesSync(current, 200, 200);
+      utimesSync(other, scenario.otherMtime, scenario.otherMtime);
+      utimesSync(retained, 50, 50);
+      utimesSync(outside, 400, 400);
+      // Only the reported directory has updates.jsonl, including the duplicate-id case.
+      const executable = join(home, "grok");
+      // Use our runtime, not a sleep executable that may dispatch by its copied name.
+      copyFileSync(process.execPath, executable);
+      const held = [current, other, retained, outside];
+      if (scenario.heldLock !== undefined) {
+        const lock = join(home, "sessions", "group", "closed-session", "updates.jsonl.lock");
+        mkdirSync(dirname(lock), { recursive: true });
+        writeFileSync(lock, "");
+        if (scenario.heldLock !== "alone") writeFileSync(join(dirname(lock), "events.jsonl"), "");
+        // a file held at the store's root (Grok's session index) is no session's
+        const index = join(home, "sessions", "session_search.sqlite");
+        writeFileSync(index, "");
+        held.push(lock, index);
+      }
+      if (scenario.nested) {
+        const nested = join(home, "sessions", "group", "older-session", "checkpoint", "events.jsonl");
+        mkdirSync(dirname(nested), { recursive: true });
+        writeFileSync(nested, "");
+        utimesSync(nested, 100, 100);
+        held.push(nested);
+      }
+      const fds = held.map((file) => openSync(file, "r"));
+      const child = spawn(executable, ["-e", "process.stdin.resume()"], { stdio: ["pipe", "ignore", "ignore", ...fds] });
+      const pane: HerdrPane = {
+        pane_id: "grok-fixture", agent: "grok", agent_status: "ready", focused: false,
+        revision: 0, tab_id: "tab-fixture", terminal_id: "terminal-fixture", workspace_id: "workspace-fixture",
+        agent_session: { agent: "grok", kind: "id", source: "herdr:grok", value: session },
+      };
+      const info = spyOn(herdr, "paneProcessInfo").mockResolvedValue({
+        pane_id: pane.pane_id, foreground_processes: [{ pid: child.pid!, name: "grok", argv: [executable] }],
+      });
+      const nativeStat = fs.statSync;
+      let replaced = false;
+      const stats = spyOn(fs, "statSync").mockImplementation(new Proxy(nativeStat, {
+        apply(target, receiver, args) {
+          const replacement = "replacement" in scenario ? scenario.replacement : null;
+          const file = replacement === "current" ? current : other;
+          // Replace after /proc's link was read, before the path's stat is sampled.
+          if (replacement && !replaced && args[0] === file) {
+            replaced = true;
+            unlinkSync(file);
+            writeFileSync(file, "");
+            utimesSync(file, replacement === "current" ? 400 : 100, replacement === "current" ? 400 : 100);
+          }
+          return Reflect.apply(target, receiver, args);
+        },
+      }));
+      try {
+        await once(child, "spawn", { signal: AbortSignal.timeout(2000) });
+        if (scenario.change === "unlink") unlinkSync(other);
+        else if (scenario.change === "rename") renameSync(other, `${other}.old`);
+        else if (scenario.change === "rename-away") renameSync(other, join(dirname(other), "old-events.jsonl"));
+        else if (scenario.change === "rename-folder") renameSync(dirname(other), join(dirname(dirname(other)), ".archived-resumed"));
+        else if (scenario.change === "rename-both") {
+          renameSync(other, join(dirname(other), "old-events.jsonl"));
+          renameSync(dirname(other), join(dirname(dirname(other)), ".archived-older"));
+        }
+        expect(await resolveGrokStore(pane, home)).toBe(scenario.binds ? transcript : null);
+      } finally {
+        stats.mockRestore();
+        info.mockRestore();
+        const exited = once(child, "exit", { signal: AbortSignal.timeout(2000) });
+        child.kill();
+        await exited;
+        for (const fd of fds) closeSync(fd);
+      }
+    });
+  }
   test("discovery checks a script only behind bun or node, never arbitrary arguments", () => {
     const processes = [
       { pid: 11, argv: ["/usr/bin/node", "/opt/grok/grok.js"] },

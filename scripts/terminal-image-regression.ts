@@ -187,8 +187,8 @@ try {
   // the terminal layer's own reads (bound by a digest); the image viewer's are the chat's, checked apart
   page.on("request", (request) => { if (request.url().includes("/conversation/image") && new URL(request.url()).searchParams.has("digest")) imageRequests.push(new URL(request.url()).pathname + new URL(request.url()).search); });
   await page.addInitScript((id) => {
-    localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
-    localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal");
+    localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
+    localStorage.setItem(`ovis:view:${id}`, "terminal");
   }, pane);
   // the page's socket, passed through to the server, so a test can drop it (a real reconnect)
   let liveSocket: WebSocketRoute | null = null;
@@ -580,7 +580,7 @@ try {
   // images extension's `pasted-images` entry, named by its file), a one-row tool image, and a picture
   // pasted into the draft. Each opens on click (zoom, download); its comments are saved, there again
   // when it is reopened, and go to the message draft (never sent) with that picture's SHA-256.
-  const pasteDir = join(project, ".herdr-web-ui");
+  const pasteDir = join(project, ".ovis");
   mkdirSync(pasteDir, { recursive: true });
   const pastedFile = join(pasteDir, "paste e2e #1.png"), draftFile = join(pasteDir, "paste-draft.png");
   writeFileSync(pastedFile, Buffer.from(pictures.pasted, "base64"));
@@ -619,7 +619,7 @@ try {
 
   // comments: saved, back when reopened, and into the message draft with this picture's SHA-256
   const review = page.locator(".pi-review");
-  const draftKey = `herdr-web-ui:composer-draft:${pane}`;
+  const draftKey = `ovis:composer-draft:${pane}`;
   const openReview = async (image: Drawn[number], label: string) => {
     await opensOnClick(image, label, 0, true);
     await lightbox.getByRole("button", { name: "Image comments" }).click();
@@ -733,7 +733,7 @@ try {
   assert.ok(ptyFrames > 0, "terminal bytes were seen");
   assert.deepEqual(moves, {}, "herdr's attach stream never scrolls or shifts cells");
   result["imageRequests"] = imageRequests.length;
-  result["herdr"] = Bun.spawnSync([process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
+  result["herdr"] = Bun.spawnSync([process.env["OVIS_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
   result["pi"] = Bun.spawnSync(["pi", "--version"]).stdout.toString().trim();
   result["status"] = "passed";
   writeFileSync(join(evidence, "result.json"), JSON.stringify(result, null, 2));

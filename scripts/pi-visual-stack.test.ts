@@ -93,7 +93,7 @@ describe.skipIf(process.platform !== "linux")("pi-visual-stack.sh", () => {
     writeFileSync(join(bin, "guacd"), guacdMock, { mode: 0o755 });
     writeFileSync(join(bin, "bun"), bunMock, { mode: 0o755 });
     env = {
-      HOME: join(base, "home"), XDG_CONFIG_HOME: join(base, "config"), HERDR_WEB_STATE_DIR: join(base, "state"),
+      HOME: join(base, "home"), XDG_CONFIG_HOME: join(base, "config"), OVIS_STATE_DIR: join(base, "state"),
       PATH: `${bin}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
       HERDR_STACK_DIR: stack, HERDR_STACK_GUACD_BIN: join(bin, "guacd"),
       HERDR_STACK_GUACD_PORT: String(await freePort()), PORT: String(await freePort()), HOST: "127.0.0.1",

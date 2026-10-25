@@ -1,7 +1,7 @@
 /** Real-browser regressions against owned herdr panes. Run after `bun run build`. */
 import "./test-herdr.ts"; // a herdr session of its own: nothing shows in the user's
 import assert from "node:assert/strict";
-import { copyFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { chromium } from "playwright-core";
@@ -13,6 +13,7 @@ import type { Machine } from "../shared/machines.ts";
 import { MAX_ATTACHMENT_BYTES } from "../shared/attachments.ts";
 import { alertsOffMarked, alertsState, runMoreItem } from "./header-more.ts";
 import { routeDrained } from "./drained-route.ts";
+import { contextMenuKey } from "./context-menu-key.ts";
 import { checkTerminalFileInput } from "./terminal-file-input-regression.ts";
 import { checkTerminalInput } from "./terminal-input-regression.ts";
 import { checkSafariIme } from "./terminal-safari-ime-regression.ts";
@@ -24,6 +25,7 @@ import { checkAltEnter } from "./terminal-alt-enter-regression.ts";
 import { checkCommandArrows } from "./terminal-command-arrows-regression.ts";
 import { checkFolderFilter, checkNewFolder } from "./folder-filter-regression.ts";
 import { checkPaletteKeys } from "./palette-keys-regression.ts";
+import { checkFollowHerdrFocus } from "./follow-focus-regression.ts";
 import { UsageService } from "../server/usage.ts";
 import { openSettingsPage } from "./settings-page.ts";
 import { assertCspClean, watchCsp } from "./csp-violations.ts";
@@ -32,7 +34,7 @@ import { browserEvidencePage, browserEvidenceTracing, startBrowserEvidence } fro
 import type { BrowserEvidenceSession } from "./browser-evidence.ts";
 import { chromePath } from "./chrome-path.ts";
 
-const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-web-ui-browser-")));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "ovis-browser-")));
 const workspaces: string[] = [];
 const worktreeWorkspaces: string[] = [];
 // the repository the worktree step makes, for the cleanup to find what the step made
@@ -77,7 +79,7 @@ try {
   for (const suffix of ["a", "b"]) {
     const cwd = join(root, suffix);
     mkdirSync(cwd);
-    const result = await workspaceCreate({ cwd, label: `herdr-web-ui-test-browser-${suffix}` });
+    const result = await workspaceCreate({ cwd, label: `ovis-test-browser-${suffix}` });
     workspaces.push(result.workspace.workspace_id);
     panes.push(result.root_pane.pane_id);
   }
@@ -93,8 +95,8 @@ try {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await context.addInitScript((ids) => {
     // only the first load: a reload must keep what Settings stored, such as the language
-    if (!localStorage.getItem("herdr-web-ui:settings")) localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
-    for (const id of ids) localStorage.setItem(`herdr-web-ui:view:${id}`, "chat");
+    if (!localStorage.getItem("ovis:settings")) localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
+    for (const id of ids) localStorage.setItem(`ovis:view:${id}`, "chat");
   }, panes);
   // A hook for a check that changes the roster on a page already loaded: a route cannot reach the
   // /api/machines/events stream the page has open, so `window.__rewriteMachinesFrame`, while set,
@@ -178,7 +180,7 @@ try {
   await composer.waitFor();
   await page.locator(".composer .voice-mic").waitFor();
   console.log("PASS a desktop's chat offers the mic before Settings is asked");
-  assert.equal(await workspaceHeader(workspaces[0]!).locator(".workspace-name").textContent(), "herdr-web-ui-test-browser-a",
+  assert.equal(await workspaceHeader(workspaces[0]!).locator(".workspace-name").textContent(), "ovis-test-browser-a",
     "Spaces names the workspace rather than its current pane");
   assert.equal(await workspaceGroup(workspaces[0]!).locator(".pane-select").count(), 1, "a workspace has one representative selector");
   assert.equal(await page.locator(".workspace-contents, .sidebar-tab-heading, .sidebar-pane-item").count(), 0,
@@ -190,14 +192,14 @@ try {
   // must close without selecting the highlighted result, and Enter on a row runs that row.
   const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
   const paletteSearch = palette.getByRole("searchbox", { name: "Search panes and actions", exact: true });
-  const selectedPane = () => page.evaluate(() => JSON.parse(sessionStorage.getItem("herdr-web-ui:selection") ?? "null")?.pane_id as string | undefined);
+  const selectedPane = () => page.evaluate(() => JSON.parse(sessionStorage.getItem("ovis:selection") ?? "null")?.pane_id as string | undefined);
   const openPalette = async (): Promise<void> => {
     await page.keyboard.press("ControlOrMeta+Shift+k");
     await palette.waitFor();
     await until(async () => await paletteSearch.evaluate((input) => document.activeElement === input), "palette search takes focus");
   };
   await openPalette();
-  await paletteSearch.fill("herdr-web-ui-test-browser-b");
+  await paletteSearch.fill("ovis-test-browser-b");
   await until(async () => await palette.locator(".palette-pane").count() === 1, "the other pane is the palette's only result");
   await page.keyboard.press("Tab");
   assert.equal(await palette.getByRole("button", { name: "Close command palette", exact: true }).evaluate((button) => document.activeElement === button), true,
@@ -240,7 +242,7 @@ try {
   await until(async () => await selectedPane() === paneA, "return to the first pane after palette selection");
 
   await openPalette();
-  await paletteSearch.fill("herdr-web-ui-test-browser-b");
+  await paletteSearch.fill("ovis-test-browser-b");
   await until(async () => await palette.locator(".palette-pane").count() === 1, "IME check has a matching result to avoid activating");
   const paletteComposition = await paletteSearch.evaluate((input) => [
     { key: "Enter", isComposing: true },
@@ -253,7 +255,7 @@ try {
   assert.deepEqual(paletteComposition, [true, true, true, true, true, true], "IME candidate, commit and cancel keys keep their default action");
   assert.equal(await palette.isVisible(), true, "IME Enter and Escape leave the palette open");
   assert.equal(await selectedPane(), paneA, "IME Enter never activates its matching pane");
-  assert.equal(await paletteSearch.inputValue(), "herdr-web-ui-test-browser-b", "IME cancellation leaves the query alone");
+  assert.equal(await paletteSearch.inputValue(), "ovis-test-browser-b", "IME cancellation leaves the query alone");
   await paletteSearch.press("Escape");
   await palette.waitFor({ state: "hidden" });
 
@@ -317,6 +319,7 @@ try {
   await page.setViewportSize(paletteViewport);
   console.log("PASS palette buttons keep native Enter, IME keeps its keys, and arrow selection stays visible on short desktop and phone lists");
   await checkPaletteKeys(page, { workspaceId: workspaces[1]! });
+  await checkFollowHerdrFocus(page, { workspaceId: workspaces[1]! });
 
   // Hold a real machines response, then deliver a newer status through herdr/SSE.
   const badge = page.locator(".pane-item.is-selected .badge");
@@ -356,7 +359,7 @@ try {
   assert.equal(await runDot.evaluate((dot) => getComputedStyle(dot).animationName), "sidebar-breathe", "the dot breathes");
   releasePoll();
   await until(() => pollFinished, "stale machines response released");
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(300); // fixed wait: the stale poll may not revert the RUN badge
   assert.equal(await badge.getAttribute("data-status"), "working", "stale poll must not revert RUN to INPUT");
   assert.equal(await agentRow(paneA).locator(".badge").getAttribute("data-status"), "working",
     "a stale poll must not revert the separate Agents list either");
@@ -366,14 +369,26 @@ try {
   }
   await unrouteHeldPoll();
   await herdrRpc("pane.report_agent", { pane_id: paneA, source: "manual", agent: "claude", state: "idle" });
-  // The bridge's collector retains the completed-turn event even when a direct native read
-  // already says idle. Compare the row with the same authoritative roster the UI consumes.
-  await until(async () => {
-    const roster = await (await context.request.get(`${origin}/api/machines`)).json() as { machines: Machine[] };
-    const settled = roster.machines.find((machine) => machine.id === "local")?.snapshot?.panes.find((pane) => pane.pane_id === paneA)?.agent_status;
-    return (settled === "idle" || settled === "done") && await agentRow(paneA).locator(".badge").getAttribute("data-status") === settled;
-  }, "the agent row reflects the bridge's completed-turn status");
-  console.log("PASS delayed machines poll preserves newer streamed pane status");
+  // This fixture only reports Claude to herdr; it has no native conversation. Selection of
+  // its unavailable chat must keep DONE unread, then presenting real terminal output reads it.
+  await page.locator(".pane-frame.is-current .chat-terminal-fallback").waitFor();
+  await agentRow(paneA).locator('.badge[data-status="done"]').waitFor();
+  const completionRoster = await (await context.request.get(`${origin}/api/machines`)).json() as { machines: Machine[] };
+  const completionSnapshot = completionRoster.machines.find((machine) => machine.id === "local")?.snapshot;
+  const completion = completionSnapshot?.panes.find((pane) => pane.pane_id === paneA);
+  assert.equal(completion?.agent_status, "done", "the bridge retains the completed turn");
+  assert.ok(completion?.finish_id && Number.isSafeInteger(completion.finish_id), "the completed turn has a server finish ID");
+  assert.equal(typeof completionSnapshot?.finish_epoch, "string");
+  const finishKey = `ovis:finish:local:${encodeURIComponent(completionSnapshot!.finish_epoch!)}:${encodeURIComponent(paneA)}`;
+  assert.equal(await page.locator(".pane-frame.is-current [data-pane-content]").count(), 0, "an unavailable conversation is not presented content");
+  assert.equal(await page.evaluate((key) => localStorage.getItem(key), finishKey), null, "an unavailable chat does not acknowledge its finish");
+  await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+  await page.locator(".pane-frame.is-current .terminal-stack[data-pane-content]").waitFor();
+  await agentRow(paneA).locator('.badge[data-status="idle"]').waitFor();
+  assert.equal(await page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "null")?.id, finishKey), completion.finish_id,
+    "presenting terminal output acknowledges exactly the bridge's completed turn");
+  await page.getByTitle("Chat transcript (⌘⇧J)", { exact: true }).click();
+  console.log("PASS delayed machines poll preserves newer status; unavailable chat keeps DONE until terminal content is presented");
 
   // Agents is global to the sidebar, so collapsing a PC's Spaces does not hide
   // its reported agents or prevent explicit pane selection from that list.
@@ -387,7 +402,7 @@ try {
   assert.equal(await agentRow(paneA).isVisible(), true, "PC folding leaves Agents visible");
   await agentRow(paneB).locator(".agent-select").click();
   await agentRow(paneB).locator('.agent-select[aria-current="true"]').waitFor();
-  assert.deepEqual(await page.evaluate(() => JSON.parse(sessionStorage.getItem("herdr-web-ui:selection") ?? "null")),
+  assert.deepEqual(await page.evaluate(() => JSON.parse(sessionStorage.getItem("ovis:selection") ?? "null")),
     { machine_id: "local", pane_id: paneB }, "Agent selection retains its machine and pane target");
   assert.equal(await machineToggle.getAttribute("aria-expanded"), "false", "Agent selection preserves the user's PC fold");
   painted.delete(paneA);
@@ -409,7 +424,7 @@ try {
   const offlineContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   let offlineEvidence: BrowserEvidenceSession | undefined;
   try {
-    await offlineContext.addInitScript(() => localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en", alertsOn: false })));
+    await offlineContext.addInitScript(() => localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", alertsOn: false })));
     await offlineContext.route("**/api/machines", (route) => route.fulfill({ json: { machines: offlineMachines } }));
     await offlineContext.route("**/api/machines/events", (route) => route.fulfill({
       contentType: "text/event-stream", body: `retry: 60000\ndata: ${JSON.stringify({ type: "machines", machines: offlineMachines })}\n\n`,
@@ -429,9 +444,9 @@ try {
       button?.focus();
       return element.contains(document.activeElement);
     }), false, "offline workspace controls cannot take keyboard focus");
-    const selectionBefore = await offlinePage.evaluate(() => sessionStorage.getItem("herdr-web-ui:selection"));
+    const selectionBefore = await offlinePage.evaluate(() => sessionStorage.getItem("ovis:selection"));
     await offlineAgent.dispatchEvent("click");
-    assert.equal(await offlinePage.evaluate(() => sessionStorage.getItem("herdr-web-ui:selection")), selectionBefore,
+    assert.equal(await offlinePage.evaluate(() => sessionStorage.getItem("ovis:selection")), selectionBefore,
       "offline Agent clicks leave the current selection unchanged");
     // the linked pane is shown from the cache, and offers no plan it could not read
     await offlinePage.locator(".view-switch").waitFor();
@@ -595,7 +610,7 @@ try {
     await terminalInput.focus();
     const beforeCtrlV = inputs.length;
     await page.keyboard.press("Control+v");
-    await page.waitForTimeout(NO_SEND_WAIT_MS);
+    await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: Ctrl+V may send no control key
     assert.deepEqual(inputs.slice(beforeCtrlV), [], "Ctrl+V must never send the image-paste control key");
   }
   for (const [shortcut, text] of [
@@ -632,7 +647,7 @@ try {
     const beforeEnter = inputs.length;
     await page.keyboard.press(shortcut!);
     await until(() => inputs.length > beforeEnter, `terminal ${shortcut}`);
-    await page.waitForTimeout(NO_SEND_WAIT_MS);
+    await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: no second copy of the shortcut sequence may arrive
     assert.deepEqual(inputs.slice(beforeEnter).map(({ pane_id, text }) => ({ pane_id, text })),
       [{ pane_id: paneA, text: expected }], `${shortcut} must send its sequence exactly once`);
   }
@@ -642,7 +657,7 @@ try {
     await terminalInput.dispatchEvent("keydown", {
       key: "Enter", code: "Enter", shiftKey: true, ...composition, bubbles: true, cancelable: true,
     });
-    await page.waitForTimeout(NO_SEND_WAIT_MS);
+    await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: no ESC-CR may be sent during composition
     assert.equal(inputs.slice(beforeIme).some(({ text }) => text === "\x1b\r"), false,
       "IME commits must not receive the custom Shift+Enter sequence");
   }
@@ -665,7 +680,7 @@ try {
     textarea.dispatchEvent(new KeyboardEvent("keyup", enter));
   });
   await until(() => inputs.length >= beforeCommittedIme + 2, "IME commit followed by Shift+Enter");
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: nothing beyond the commit and one Shift+Enter may arrive
   assert.deepEqual(inputs.slice(beforeCommittedIme).map(({ pane_id, text }) => ({ pane_id, text })),
     [{ pane_id: paneA, text: "한" }, { pane_id: paneA, text: "\x1b\r" }],
     "a pending IME commit must precede Shift+Enter without a delayed duplicate");
@@ -689,7 +704,7 @@ try {
     const beforeSwitch = inputs.length;
     await page.keyboard.press(key);
     await until(async () => !(await selectedTitle())?.startsWith(`${paneA} —`), `${key} leaves the pane`);
-    await page.waitForTimeout(NO_SEND_WAIT_MS);
+    await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the shortcut may reach no pane
     assert.deepEqual(inputs.slice(beforeSwitch), [], `${key} must not reach a pane`);
     await page.locator(`.pane-select[title^="${paneA} —"]`).click();
     await until(async () => (await selectedTitle())?.startsWith(`${paneA} —`) === true, "back on the first pane");
@@ -704,7 +719,7 @@ try {
   await until(async () => (await selectedTitle())?.startsWith(`${paneA} —`) === true, "back on the first pane");
   await composer.fill("draft");
   await page.keyboard.press("ControlOrMeta+Shift+ArrowDown");
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the shortcut may not switch pane while a draft is typed
   assert.ok((await selectedTitle())?.startsWith(`${paneA} —`), "a draft keeps Mod+Shift+arrows for selecting text");
   await composer.fill("");
   console.log("PASS pane shortcut from the empty message box; a draft keeps text selection");
@@ -735,7 +750,7 @@ try {
   const sidebarWidths = () => page.evaluate(() => ({
     sidebar: Math.round(document.querySelector(".sidebar")!.getBoundingClientRect().width),
     header: Math.round(document.querySelector(".header-side")!.getBoundingClientRect().width),
-    stored: localStorage.getItem("herdr-web-ui:sidebar-width"),
+    stored: localStorage.getItem("ovis:sidebar-width"),
   }));
   const defaultWidths = await sidebarWidths();
   assert.equal(defaultWidths.stored, null, "no sidebar width is stored before the edge is dragged");
@@ -773,7 +788,7 @@ try {
   const rowsSetting = page.locator('.settings-dialog .segmented[aria-label="Sidebar rows"]');
   await rowsSetting.getByRole("button", { name: "Two lines", exact: true }).click();
   await page.locator(".workspace-copy.is-two-line").first().waitFor();
-  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("herdr-web-ui:settings") ?? "{}").sidebarRows), "two");
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("ovis:settings") ?? "{}").sidebarRows), "two");
   assert.ok(await page.locator(".workspace-header").first().evaluate((row) => row.getBoundingClientRect().height) > oneLineHeight, "a two-line row is taller");
   await page.locator(".agents-sidebar.is-one-line").waitFor({ state: "detached" });
   assert.ok(await page.locator(".agents-sidebar .agent-row").first().evaluate((row) => row.getBoundingClientRect().height) > oneLineAgentHeight, "a two-line agent row is taller");
@@ -852,7 +867,7 @@ try {
   await runMoreItem(page, "Alerts");
   await until(async () => await alertsState(page) === "Off on this device", "alerts off");
   assert.equal(await alertsOffMarked(page), true, "alerts that are off mark the More button, in its dot and its name");
-  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("herdr-web-ui:settings") ?? "{}").alertsOn), false);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("ovis:settings") ?? "{}").alertsOn), false);
   assert.equal(await page.evaluate(async () => (await (await navigator.serviceWorker.getRegistration())?.pushManager.getSubscription()) ?? null), null, "turning alerts off drops the push subscription");
   await runMoreItem(page, "Alerts");
   await until(async () => /^On[ ,]/.test(await alertsState(page)), "alerts on again");
@@ -862,7 +877,7 @@ try {
   // where notifications are blocked the item is still there, and switches the in-app alerts
   const blocked = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await blocked.addInitScript(() => {
-    if (!localStorage.getItem("herdr-web-ui:settings")) localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
+    if (!localStorage.getItem("ovis:settings")) localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
     Object.defineProperty(Notification, "permission", { configurable: true, get: () => "denied" });
   });
   const blockedPage = await blocked.newPage();
@@ -875,7 +890,7 @@ try {
   await runMoreItem(blockedPage, "Alerts");
   await until(async () => await alertsState(blockedPage) === "Off on this device", "blocked alerts off");
   assert.equal(await alertsOffMarked(blockedPage), true);
-  assert.equal(await blockedPage.evaluate(() => JSON.parse(localStorage.getItem("herdr-web-ui:settings") ?? "{}").alertsOn), false);
+  assert.equal(await blockedPage.evaluate(() => JSON.parse(localStorage.getItem("ovis:settings") ?? "{}").alertsOn), false);
   await runMoreItem(blockedPage, "Alerts");
   await until(async () => await alertsState(blockedPage) === "On in the app", "blocked alerts on again");
   assert.equal(await alertsOffMarked(blockedPage), false);
@@ -886,7 +901,7 @@ try {
   // The pending protocol has a real foreground agent and an owned byte recorder: merely
   // reporting an idle shell as working would not prove that server-side queueing happened.
   const pendingCwd = join(root, "pending"); mkdirSync(pendingCwd);
-  const pendingWorkspace = await workspaceCreate({ cwd: pendingCwd, label: "herdr-web-ui-test-browser-pending" });
+  const pendingWorkspace = await workspaceCreate({ cwd: pendingCwd, label: "ovis-test-browser-pending" });
   workspaces.push(pendingWorkspace.workspace.workspace_id);
   const pendingPane = pendingWorkspace.root_pane.pane_id;
   const pendingProgram = join(root, "claude"); copyFileSync(process.execPath, pendingProgram); chmodSync(pendingProgram, 0o755);
@@ -921,11 +936,11 @@ try {
   assert.equal(await page.locator(".composer-action").count(), 1, "one primary action");
   const actionsBeforeTextClick = pendingActions.length;
   await pendingRows.locator(".pending-message-bubble").first().click();
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: clicking pending text may trigger no action
   assert.equal(pendingActions.length, actionsBeforeTextClick, "pending message text is selectable, not a send action");
   assert.equal(pendingBytes(), "");
   await reportPending("blocked"); await page.locator('.composer-status[data-status="blocked"]').waitFor();
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: blocked status may not advance pending input
   assert.equal(pendingBytes(), "", "blocked status never advances pending input");
   assert.equal(await pendingRows.count(), 3);
   await reportPending("working"); await page.locator('.composer-status[data-status="working"]').waitFor();
@@ -937,7 +952,7 @@ try {
   // a draft puts Send where Stop was: Escape in the box is still Stop, once a completion is put away, and keeps the draft
   await composer.fill("/he");
   await composer.press("Escape");
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the first Escape may send nothing
   assert.equal(pendingBytes(), `\u001b[200~${queuedTexts[0]}\u001b[201~\r`, "the first Escape on a command being completed only puts the completion away");
   await composer.fill("a draft while the agent works");
   assert.equal(await page.getByRole("button", { name: "Stop agent", exact: true }).count(), 0);
@@ -973,7 +988,7 @@ try {
   assert.equal(await page.locator('.pending-message[data-state="uncertain"]').count(), 2, "reload removes connection proof");
   assert.equal(await page.locator(".pending-message-send").count(), 0, "unknown delivery cannot be resent");
   await reportPending("idle"); await page.locator('.composer-status:not([data-status="working"])').waitFor();
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: readiness may not replay saved pending input
   assert.equal(pendingBytes(), `\u001b[200~${queuedTexts[0]}\u001b[201~\r\u001b`, "reload and readiness never replay saved pending input");
   for (let left = 2; left > 0; left--) { await page.getByRole("button", { name: "Discard saved copy", exact: true }).first().click(); await until(async () => await pendingRows.count() === left - 1, "discard saved copy"); }
   console.log("PASS Send queues server-owned input, explicit Send now delivers once, and reload/readiness never replay uncertain copies");
@@ -984,7 +999,7 @@ try {
   const report = (state: string) => herdrRpc("pane.report_agent", { pane_id: paneA, source: "manual", agent: "claude", state });
   await report("working");
   await page.evaluate(({ pane, texts }) => {
-    localStorage.setItem(`herdr-web-ui:queue:${pane}`, JSON.stringify({ version: 1, messages: texts.map((text, index) => ({ id: `legacy-browser-${index}`, text })) }));
+    localStorage.setItem(`ovis:queue:${pane}`, JSON.stringify({ version: 1, messages: texts.map((text, index) => ({ id: `legacy-browser-${index}`, text })) }));
   }, { pane: paneA, texts: ["printf 'browser-queue-ok\\n'", "# second queued message", "# third queued message"] });
   await page.reload(); await page.locator(".conn-live").waitFor();
   await until(async () => await page.locator(".composer-queue-text").count() === 3, "legacy held rows restored");
@@ -1145,7 +1160,7 @@ try {
   await composer.fill("한글 조합");
   const imeInputs = inputs.length;
   await composer.dispatchEvent("keydown", IME_ENTER);
-  await page.waitForTimeout(NO_SEND_WAIT_MS);
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: an IME Enter may send nothing
   assert.equal(inputs.length, imeInputs);
   assert.equal(await composer.inputValue(), "한글 조합");
   await composer.fill("");
@@ -1426,10 +1441,17 @@ try {
   assert.equal(await page.getByRole("alert").filter({ hasText: /the first \d+ of \d+ files/ }).count(), 0, "nothing was left out");
   limitedUploads.length = 0;
   // the first file is over the size limit: its error and the count left out both stay in the note
-  await page.locator('input[type="file"]').setInputFiles([
-    { name: "huge.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(MAX_ATTACHMENT_BYTES + 1) },
-    ...Array.from({ length: 100 }, (_, index) => ({ name: `many-${index}.png`, mimeType: "image/png", buffer: png })),
-  ]);
+  // Paths let Chromium pick the real files. A buffer sends 32 MB through Playwright's injected
+  // base64 decoder on the page before the app can reject it by size, timing out on a busy runner.
+  const hugeFile = join(root, "huge.bin");
+  writeFileSync(hugeFile, "");
+  truncateSync(hugeFile, MAX_ATTACHMENT_BYTES + 1);
+  const manyFiles = Array.from({ length: 100 }, (_, index) => {
+    const path = join(root, `many-${index}.png`);
+    writeFileSync(path, png);
+    return path;
+  });
+  await page.locator('input[type="file"]').setInputFiles([hugeFile, ...manyFiles]);
   await until(async () => (await ready.count()) === readyBefore + 6 + 99, "the files within both limits uploaded");
   const note = page.getByRole("alert").filter({ hasText: "Too large to attach: huge.bin" });
   await note.waitFor();
@@ -1467,7 +1489,7 @@ try {
   await until(async () => (await dialog.getByLabel(/^Directory/).inputValue()).endsWith("/a"), "Directory follows Browse into a");
   // New folder inside a: the workspace starts in the folder it made
   await checkNewFolder(page, dialog, () => createRequests, "made-here");
-  await dialog.getByLabel(/^Name/).fill("herdr-web-ui-test-browser-created");
+  await dialog.getByLabel(/^Name/).fill("ovis-test-browser-created");
   await dialog.getByRole("button", { name: "Start", exact: true }).click();
   await until(() => createRequests === 1, "creation started");
   assert.equal(createCwd, join(root, "a", "made-here"), "Start uses the folder Browse is showing");
@@ -1485,14 +1507,14 @@ try {
 
   // Existing git worktrees are discovered through the list API. A new worktree from the row's
   // ⋯ menu appears under the same workspace, using its exact branch rather than its editable label.
-  repo = join(root, `herdr-web-ui-test-repo-${process.pid.toString(36)}`);
+  repo = join(root, `ovis-test-repo-${process.pid.toString(36)}`);
   mkdirSync(repo);
-  const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=herdr-web-ui test", "-c", "user.email=test@example.invalid", ...args], { cwd: repo ?? undefined, stdout: "pipe", stderr: "pipe" });
+  const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=ovis test", "-c", "user.email=test@example.invalid", ...args], { cwd: repo ?? undefined, stdout: "pipe", stderr: "pipe" });
   assert.equal(git("init", "-q", "-b", "main").exitCode, 0, "git init");
   writeFileSync(join(repo, "README.md"), "worktree fixture\n");
   assert.equal(git("add", "README.md").exitCode, 0);
   assert.equal(git("commit", "-q", "-m", "fixture").exitCode, 0, "git commit");
-  const repoWorkspace = await workspaceCreate({ cwd: repo, label: "herdr-web-ui-test-repo" });
+  const repoWorkspace = await workspaceCreate({ cwd: repo, label: "ovis-test-repo" });
   workspaces.push(repoWorkspace.workspace.workspace_id);
   const repoRow = workspaceHeader(repoWorkspace.workspace.workspace_id);
   await repoRow.waitFor();
@@ -1512,7 +1534,7 @@ try {
   const initialRow = page.locator(`.worktree-children .workspace-group[data-workspace="${initialWorktree.workspace_id}"]`);
   await until(async () => await initialRow.locator(".workspace-name").textContent() === "Existing checkout", "a named worktree's row is titled by its workspace name");
   assert.equal(await initialRow.locator(".worktree-workspace-label").textContent(), "browser/initial", "the list API discovers an existing worktree's exact branch, said after the name");
-  assert.equal(await repoRow.locator(".workspace-name").textContent(), "herdr-web-ui-test-repo", "the parent keeps its workspace name");
+  assert.equal(await repoRow.locator(".workspace-name").textContent(), "ovis-test-repo", "the parent keeps its workspace name");
   // A list read from before creation must not erase the branch supplied by the create response.
   let releaseWorktreeList!: () => void;
   const heldWorktreeList = new Promise<void>((resolve) => { releaseWorktreeList = resolve; });
@@ -1542,7 +1564,7 @@ try {
   const repoMenu = page.getByRole("menu");
   await repoMenu.waitFor();
   const repoActions = await repoMenu.getByRole("menuitem").allTextContents();
-  assert.deepEqual(repoActions, ["Pin workspace", "Rename workspace", "Close group", "New worktree", "Open worktree…", "Expand"],
+  assert.deepEqual(repoActions, ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close group", "New worktree", "Open worktree…", "Expand"],
     "a folded repository group has native workspace and worktree actions");
   await page.keyboard.press("Escape");
   await repoMenu.waitFor({ state: "detached" });
@@ -1630,7 +1652,7 @@ try {
   await agentRow(worktree.pane_id).waitFor();
   await repoHeader.locator(".workspace-select").click();
   await repoHeader.locator('.workspace-select[aria-current="true"]').waitFor();
-  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("herdr-web-ui:selection") ?? "null")?.pane_id),
+  assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem("ovis:selection") ?? "null")?.pane_id),
     repoWorkspace.root_pane.pane_id, "selecting the parent after its branch returns to the parent's own pane");
   const repoToggle = repoHeader.locator(".workspace-toggle");
   await repoToggle.click();
@@ -1661,17 +1683,17 @@ try {
   const sent = moves.length;
   await childHeader.locator(".workspace-select").focus();
   await page.keyboard.press("Alt+ArrowDown");
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(400); // fixed wait: no worktree move may be sent
   assert.equal(moves.length, sent, "a lone worktree has nowhere to move");
   await page.unroute("**/api/workspace/move");
   writeFileSync(join(worktree.path, "unsaved.txt"), "dirty\n");
   // a desktop draws no row ⋯: the context-menu key opens the menu at the focused row
   await childHeader.locator(".workspace-select").focus();
-  await page.keyboard.press("Shift+F10");
+  await contextMenuKey(page);
   const childMenu = page.getByRole("menu");
   await childMenu.waitFor();
   const childActions = await childMenu.getByRole("menuitem").allTextContents();
-  assert.deepEqual(childActions, ["Pin workspace", "Rename workspace", "Close workspace", "Delete worktree checkout…"], "a worktree workspace's menu");
+  assert.deepEqual(childActions, ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close workspace", "Delete worktree checkout…"], "a worktree workspace's menu");
   await page.keyboard.press("Escape");
   await childMenu.waitFor({ state: "detached" });
   await childHeader.locator(".workspace-select").click({ button: "right" });
@@ -1717,7 +1739,7 @@ try {
     await page.getByRole("menuitem", { name: "New tab with agent…", exact: true }).click();
   };
   await openAgentTab();
-  const tabDialog = page.getByRole("dialog", { name: /^New tab · herdr-web-ui-test-browser-created/ });
+  const tabDialog = page.getByRole("dialog", { name: /^New tab · ovis-test-browser-created/ });
   await tabDialog.waitFor();
   assert.equal(await tabDialog.locator(".new-session-folder").textContent(), join(root, "a", "made-here"), "the folder is the workspace's, shown");
   assert.equal(await tabDialog.getByRole("button", { name: "Browse", exact: true }).count(), 0, "the folder is not asked for");
@@ -1739,7 +1761,7 @@ try {
   await tabDialog.waitFor({ state: "hidden" });
   await until(async () => (await page.locator(`.pane-select[title^="${createdTab.pane_id} —"]`).getAttribute("aria-current")) === "true", "the new tab's pane is selected, and the row shows it");
   assert.equal(await page.locator(`.pane-select[title^="${created.pane_id} —"]`).count(), 0, "the workspace stays one row");
-  assert.equal(await workspaceGroup(created.workspace_id).locator(".workspace-name").textContent(), "herdr-web-ui-test-browser-created",
+  assert.equal(await workspaceGroup(created.workspace_id).locator(".workspace-name").textContent(), "ovis-test-browser-created",
     "opening another tab preserves the workspace name in Spaces");
   assert.equal(await workspaceGroup(created.workspace_id).locator(".workspace-select").count(), 1,
     "all tabs share the workspace's representative row");
@@ -1823,7 +1845,7 @@ try {
   await tabDialog.waitFor({ state: "hidden" });
   await page.unroute("**/api/tab/create");
   await page.unroute("**/api/agents");
-  await page.evaluate(() => localStorage.removeItem("herdr-web-ui:new-session-agent"));
+  await page.evaluate(() => localStorage.removeItem("ovis:new-session-agent"));
   console.log("PASS reopening after a failed agent start owns focus before paint, enables its fields and closes with Escape");
   // the PC's + is New workspace again, not a tab in the workspace the last dialog was for
   await page.getByRole("button", { name: /^New workspace on / }).click();
@@ -1861,7 +1883,7 @@ try {
   await page.keyboard.press("Enter");
   await until(async () => (await tabsInHerdr()).join() === "first,second", "herdr has the tab's new name, trimmed");
   assert.deepEqual(await strip.getByRole("tab").allTextContents(), ["first", "second"]);
-  assert.equal(await workspaceGroup(created.workspace_id).locator(".workspace-name").textContent(), "herdr-web-ui-test-browser-created",
+  assert.equal(await workspaceGroup(created.workspace_id).locator(".workspace-name").textContent(), "ovis-test-browser-created",
     "renaming a tab leaves the workspace name unchanged");
   await until(async () => await strip.getByRole("tab", { name: "first", exact: true }).evaluate((tab) => tab === document.activeElement), "the renamed tab has the focus back");
   // F2 opens the field on the focused tab; Escape leaves the name alone, and so does an empty one
@@ -1938,7 +1960,7 @@ try {
   await until(async () => (await third.getAttribute("aria-selected")) === "true", "the third tab is open");
   // a held Delete is one press: its repeats close nothing
   await third.dispatchEvent("keydown", { key: "Delete", repeat: true, bubbles: true });
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(300); // fixed wait: a repeated Delete may close no tab
   assert.equal((await tabsInHerdr()).join(), "first,build,third");
   await third.click({ button: "right" });
   await page.getByRole("menu", { name: "third", exact: true }).getByRole("menuitem", { name: "Close tab", exact: true }).click();
@@ -2002,7 +2024,7 @@ try {
   await startupPrompt.waitFor({ state: "hidden" });
   await paintStartupMenu();
   await startupPrompt.getByRole("button", { name: "1. Yes, continue", exact: true }).waitFor();
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(500); // fixed wait: no Confirm may appear on the startup menu
   assert.equal(await startupPrompt.locator(".prompt-card-confirm").count(), 0);
   await startupPrompt.getByRole("button", { name: "1. Yes, continue", exact: true }).click();
   await startupPrompt.waitFor({ state: "hidden" });
@@ -2149,10 +2171,10 @@ try {
     await page.locator(".conn.conn-live").waitFor();
     await half("left").locator(`.pane-frame[data-layout-pane="${paneA}"]`).getByRole("log").waitFor();
     await half("right").locator(`.pane-frame[data-layout-pane="${paneB}"]`).getByRole("log").waitFor();
-    assert.match(await page.evaluate(() => sessionStorage.getItem("herdr-web-ui:split") ?? ""), /"active":"a"/, "the split is kept for a reload");
+    assert.match(await page.evaluate(() => sessionStorage.getItem("ovis:split") ?? ""), /"active":"a"/, "the split is kept for a reload");
     await half("right").getByRole("button", { name: "Close this half", exact: true }).click();
     await until(async () => await page.locator(".pane-slot").count() === 1, "one pane after closing a half");
-    assert.equal(await page.evaluate(() => sessionStorage.getItem("herdr-web-ui:split")), null);
+    assert.equal(await page.evaluate(() => sessionStorage.getItem("ovis:split")), null);
     await page.locator(`.pane-frame[data-layout-pane="${paneA}"]`).getByRole("log").waitFor();
   }
   console.log("PASS a dragged row opens its pane beside the open one; a press switches the active half; a half closes");
@@ -2186,7 +2208,7 @@ try {
   // a phone: the composer's chip shows the plan's count on the status line's one row, and its steps
   // open above the card without making the page scroll sideways
   const planPhone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  await planPhone.addInitScript(() => localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en", defaultView: "chat" })));
+  await planPhone.addInitScript(() => localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", defaultView: "chat" })));
   const phone = await planPhone.newPage();
   phone.on("pageerror", (error) => errors.push(error.message));
   const unroutePhonePlanned = await planned(phone, { events: true });
@@ -2218,10 +2240,10 @@ try {
   await mobilePage.locator(`.pane-select[title^="${paneA} —"]`).click();
   await mobilePage.getByRole("textbox", { name: "Message", exact: true }).waitFor();
   await mobilePage.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await mobilePage.waitForTimeout(NO_SEND_WAIT_MS);
+  await mobilePage.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: a picked pane may not take the keyboard
   assert.equal(await typing(mobilePage), false, "a pane picked on a phone does not take the keyboard");
   await mobilePage.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
-  await mobilePage.waitForTimeout(NO_SEND_WAIT_MS);
+  await mobilePage.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: switching the lens may not take the keyboard
   assert.equal(await typing(mobilePage), false, "nor does switching its lens");
   await mobilePage.getByTitle("Chat transcript (⌘⇧J)", { exact: true }).click();
   await mobilePage.getByRole("textbox", { name: "Message", exact: true }).tap();
@@ -2308,13 +2330,13 @@ try {
   await line.fill("echo 한글");
   const imeSent = touchSent.length;
   await line.dispatchEvent("keydown", IME_ENTER);
-  await touchPage.waitForTimeout(NO_SEND_WAIT_MS);
+  await touchPage.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: an IME Enter may send nothing
   assert.equal(touchSent.length, imeSent);
   assert.equal(await line.inputValue(), "echo 한글");
   await line.dispatchEvent("compositionstart", { data: "" });
   const beforeComposeSend = touchSent.length;
   await touchPage.getByRole("button", { name: "Send to the terminal", exact: true }).click();
-  await touchPage.waitForTimeout(NO_SEND_WAIT_MS);
+  await touchPage.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the Send button may send nothing mid-composition
   assert.equal(touchSent.length, beforeComposeSend, "button cannot submit an unfinished composition");
   await line.dispatchEvent("compositionend", { data: "한글" });
   await line.fill("");
@@ -2354,11 +2376,11 @@ try {
   const selectedRow = page.locator(".pane-item.is-selected .pane-select");
   assert.equal(await page.locator(".pane-item.is-selected .row-menu-toggle").isVisible(), false, "a desktop draws no row ⋯");
   await selectedRow.focus();
-  await page.keyboard.press("Shift+F10");
+  await contextMenuKey(page);
   const rowMenu = page.getByRole("menu");
   await rowMenu.waitFor();
   const rowActions = await rowMenu.getByRole("menuitem").allTextContents();
-  assert.deepEqual(rowActions, ["Pin workspace", "Rename workspace", "Close workspace"], "the workspace menu keeps workspace scope");
+  assert.deepEqual(rowActions, ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close workspace"], "the workspace menu keeps workspace scope");
   // Escape puts the menu away and the focus back on the row
   await page.keyboard.press("Escape");
   await rowMenu.waitFor({ state: "detached" });
@@ -2373,7 +2395,7 @@ try {
   await page.keyboard.press("Escape");
   await rowMenu.waitFor({ state: "detached" });
   assert.equal(await selectedRow.evaluate((row) => document.activeElement === row), true, "Escape after a right-click returns focus to the row");
-  await page.keyboard.press("Shift+F10");
+  await contextMenuKey(page);
   await rowMenu.getByRole("menuitem", { name: "Close workspace", exact: true }).click();
   const confirmClose = page.getByRole("alertdialog");
   await confirmClose.waitFor();
@@ -2384,13 +2406,13 @@ try {
   await page.keyboard.press("Escape");
   await confirmClose.waitFor({ state: "detached" });
   assert.equal(await selectedRow.evaluate((row) => document.activeElement === row), true, "cancelling the confirm returns focus to the row");
-  await page.keyboard.press("Shift+F10");
+  await contextMenuKey(page);
   await rowMenu.getByRole("menuitem", { name: "Close workspace", exact: true }).click();
   await confirmClose.waitFor();
   await confirmClose.getByRole("button", { name: "Close", exact: true }).click();
   workspaces.splice(workspaces.indexOf(created.workspace_id), 1);
   await until(async () => {
-    const selected = JSON.parse(await page.evaluate(() => sessionStorage.getItem("herdr-web-ui:selection") ?? "null"));
+    const selected = JSON.parse(await page.evaluate(() => sessionStorage.getItem("ovis:selection") ?? "null"));
     return selected?.pane_id && selected.pane_id !== created.pane_id;
   }, "closed pane selection recovered");
   // the pane selected in its place must not take the keyboard: a phone would raise it over
@@ -2402,10 +2424,10 @@ try {
   await page.locator(".pane-item.is-selected .pane-select").click();
   await until(async () => await page.evaluate(() => document.activeElement?.matches("textarea, input, [contenteditable]") ?? false),
     "picking the auto-selected pane focuses its input");
-  await page.evaluate(() => sessionStorage.setItem("herdr-web-ui:selection", JSON.stringify({ machine_id: "local", pane_id: "obsolete-pane" })));
+  await page.evaluate(() => sessionStorage.setItem("ovis:selection", JSON.stringify({ machine_id: "local", pane_id: "obsolete-pane" })));
   await page.reload();
   await until(async () => {
-    const selected = JSON.parse(await page.evaluate(() => sessionStorage.getItem("herdr-web-ui:selection") ?? "null"));
+    const selected = JSON.parse(await page.evaluate(() => sessionStorage.getItem("ovis:selection") ?? "null"));
     return selected?.pane_id && selected.pane_id !== "obsolete-pane";
   }, "obsolete saved selection recovered");
   console.log("PASS closed and obsolete saved panes recover their selection");
@@ -2419,7 +2441,7 @@ try {
   const securedOrigin = `http://127.0.0.1:${secured.port}`;
   const securedContext = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   // Use a new pane so this bridge never competes with the first server's attachments.
-  const securedWorkspace = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-browser-signout" });
+  const securedWorkspace = await workspaceCreate({ cwd: root, label: "ovis-test-browser-signout" });
   workspaces.push(securedWorkspace.workspace.workspace_id);
   const securedPage = await securedContext.newPage();
   const securedEvidence = await watchBrowserEvidence(securedContext, securedPage, "token-gate-signout");

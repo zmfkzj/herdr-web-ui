@@ -311,7 +311,7 @@ describe("terminalImageGallery", () => {
   });
 
   it("opens a pasted picture by its file, as an @path mention is, which image comments take as a file source", () => {
-    const path = "/home/u/.herdr-web-ui/붙여넣기 #1 100%.png";
+    const path = "/home/u/.ovis/붙여넣기 #1 100%.png";
     for (const machine of ["local", "pc 2"]) {
       const image = terminalImageGallery(machine, "w1:p1", { ref: `file:${path}` }, "image/png", "Attached image")!;
       const url = new URL(image.src, origin);
@@ -329,7 +329,7 @@ describe("terminalImageGallery", () => {
 
   it("places a pasted picture's file-ref markers like a tool image's", async () => {
     const { write } = terminal();
-    expect(await write(image("file:/home/u/.herdr-web-ui/paste 1.png"))).toEqual(["file:/home/u/.herdr-web-ui/paste 1.png 2,3 rows 3-8"]);
+    expect(await write(image("file:/home/u/.ovis/paste 1.png"))).toEqual(["file:/home/u/.ovis/paste 1.png 2,3 rows 3-8"]);
   });
 });
 

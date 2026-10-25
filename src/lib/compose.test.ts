@@ -1,9 +1,14 @@
 import { describe, expect, it } from "bun:test";
 
 import { skillSyntax } from "../../shared/skill-syntax.ts";
-import { agentDisplayLabel, composerDelivery, composerMessage, terminalOnlyCommand, composerSendShown, composerPayload, composerModelDraw, composerStatusCompact, composerStatusHint, composerStatusWord, COMPOSER_STATUS_COMPACT_BELOW, contextLeftPercent, formatTokens, imageMention, insertLeadingMention, MAX_COMPOSER_CHARS, QUEUE_READY_STATUS, rankSlashCommands, submitNote, submitNotTyped, submitRefusal, sameMessage, pendingActionUncertain } from "./compose.ts";
-import { briefDescription, commandGroup, commandsForTrigger, slashCommandReplacement } from "./compose.ts";
+import { agentDisplayLabel, composerDelivery, composerMessage, composerSendShown, composerPayload, composerModelDraw, composerStatusCompact, composerStatusHint, composerStatusWord, COMPOSER_STATUS_COMPACT_BELOW, contextLeftPercent, formatTokens, imageMention, insertLeadingMention, insertNote, MAX_COMPOSER_CHARS, QUEUE_READY_STATUS, rankSlashCommands, submitNote, submitNotTyped, submitRefusal, sameMessage, pendingActionUncertain } from "./compose.ts";
+import { briefDescription, COMMAND_GROUPS, commandGroup, commandsForTrigger, slashCommandReplacement, terminalCommand, typedTerminalCommand } from "./compose.ts";
+import type { SlashCommand } from "../../shared/protocol.ts";
 import { activeTrigger, applyCompletion, type ActiveTrigger } from "./mentions.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { paneCommands } from "../../server/commands.ts";
 
 describe("menu rows", () => {
   it("keeps a description's first sentence, without its full stop", () => {
@@ -140,6 +145,12 @@ describe("composerMessage and submitNote", () => {
     // regression #541: a send dropped before its frame left the browser typed nothing
     expect(submitNotTyped("not_transmitted")).toBe(true);
     expect(submitNote("not_transmitted", "the connection dropped before this message was sent")).toBe("Not sent: the connection dropped before this message left. Send it again.");
+    // a send whose wait ended before the PC said what it supports typed nothing, and the note names that, not a drop (#1806)
+    expect(submitNotTyped("capabilities_unknown")).toBe(true);
+    expect(submitNote("capabilities_unknown", "this PC has not said yet what it supports; nothing was sent")).toBe("Not sent: this PC has not said yet what it supports. Send it again.");
+    // an Insert refused for a control character says so, not that the terminal is not ready: a retry would be refused the same
+    expect(insertNote("invalid_insert_text", "the text holds a control character")).toBe("Not inserted: the line holds a control character. Remove it, then insert again.");
+    expect(insertNote("capabilities_unknown", "this PC has not said yet what it supports; nothing was sent")).toBe("Not inserted: this PC has not said yet what it supports. Insert it again.");
     // a Send now that never left proves a held row unsent, not a queued one its turn's end may still type
     expect(pendingActionUncertain("not_transmitted", "held")).toBe(false);
     expect(pendingActionUncertain("not_transmitted", "queued")).toBe(true);
@@ -209,6 +220,23 @@ describe("composerPayload", () => {
     expect(composerPayload("", false)).toBe("");
   });
 
+  it("drops whole paste markers from the message, so its text and its paste agree and neither ends early", () => {
+    const pasted = "run this\u001b[201~\rtouch /tmp/x\n\u001b[200~next";
+    expect(composerMessage(pasted)).toBe("run this\ntouch /tmp/x\nnext");
+    expect(composerPayload(pasted, true)).toBe("\u001b[200~run this\rtouch /tmp/x\rnext\u001b[201~");
+    expect(composerPayload(pasted, false)).toBe("run this\rtouch /tmp/x\rnext");
+    // dropping one marker cannot leave another made of the bytes around it
+    expect(composerMessage("a\u001b[20\u001b[201~0~b")).toBe("ab");
+    // a marker at the end goes before the trailing newlines it hid
+    expect(composerMessage("ls\n\u001b[201~")).toBe("ls");
+  });
+
+  it("keeps every other escape byte, which the bridge refuses rather than having it rewritten here", () => {
+    expect(composerMessage("\u001b[31mred\u001b[0m")).toBe("\u001b[31mred\u001b[0m");
+    expect(composerMessage("half \u001b[201")).toBe("half \u001b[201");
+    expect(composerPayload("tab\there 한글 ✓", true)).toBe("\u001b[200~tab\there 한글 ✓\u001b[201~");
+  });
+
   it("caps what one send can carry", () => {
     expect(MAX_COMPOSER_CHARS).toBeLessThanOrEqual(20_000);
     expect(composerPayload("x".repeat(MAX_COMPOSER_CHARS), false)).toHaveLength(MAX_COMPOSER_CHARS);
@@ -217,8 +245,8 @@ describe("composerPayload", () => {
 
 describe("imageMention", () => {
   it("references the stored file as an editable @path with a trailing space", () => {
-    expect(imageMention("/tmp/proj/.herdr-web-ui/paste-1.png")).toBe(
-      "@/tmp/proj/.herdr-web-ui/paste-1.png ",
+    expect(imageMention("/tmp/proj/.ovis/paste-1.png")).toBe(
+      "@/tmp/proj/.ovis/paste-1.png ",
     );
   });
 });
@@ -416,34 +444,124 @@ describe("context left", () => {
   });
 });
 
-// /tree moves the session's branch and opens the agent's tree browser, which the chat reads as
-// nothing at all: no card, and the pane still looks done while the terminal waits for arrow keys.
-// The composer says so before the send, because after it the browser is already open and the reader
-// is already in the state the note describes
-describe("commands the chat cannot finish", () => {
-  it("names /tree where the agent has it", () => {
-    expect(terminalOnlyCommand("pi", "/tree")).toBe("tree");
-    expect(terminalOnlyCommand("pi", "  /TREE  ")).toBe("tree");
-    expect(terminalOnlyCommand("pi", "/tree w13:p2")).toBe("tree"); // takes no argument, but a stray
-    // one is still the same command typed and the reader still needs telling
-    // omp's own docs describe the same command, the same navigator and the same three branch-summary
-    // choices, so the chat cannot show its browser either
-    expect(terminalOnlyCommand("omp", "/tree")).toBe("tree");
+// The catalog says which commands run in the terminal (a row's visibility, or its bare form's
+// interaction): the chat lists them apart and never sends one on its own. A row the agent's own
+// menu hides (agent-hidden) mirrors that menu: never listed, and typed by hand it goes like any text.
+describe("terminal commands", () => {
+  const config: SlashCommand = { name: "config", description: "Open configuration", source: "builtin", visibility: "terminal" };
+  const tree: SlashCommand = { name: "tree", description: "Browse the session tree", source: "builtin", forms: [{ match: "bare", interaction: "terminal" }] };
+  const model: SlashCommand = { name: "model", description: "Choose a model", source: "builtin", forms: [{ match: "bare", interaction: "dialog", dialog: "model" }, { match: "other", interaction: "none" }] };
+  const resume: SlashCommand = { name: "resume", description: "Resume a session", source: "builtin", forms: [{ match: "bare", interaction: "dialog" }, { match: { sub: "list" }, interaction: "terminal" }] };
+  const heapdump: SlashCommand = { name: "heapdump", description: "Write a heap dump", source: "builtin", visibility: "agent-hidden", forms: [{ match: "bare", interaction: "terminal" }] };
+  const plain: SlashCommand = { name: "compact", description: "Compact the context", source: "builtin" };
+  const skill: SlashCommand = { name: "deploy", description: "Deploy", source: "skill", origin: "project" };
+  const commands = [config, tree, model, resume, heapdump, plain, skill];
+  const slash: ActiveTrigger = { kind: "slash", query: "", start: 0, end: 1 };
+
+  it("groups a row with terminal visibility, or a bare terminal form, apart from its source", () => {
+    expect(terminalCommand(config)).toBe(true);
+    expect(terminalCommand(tree)).toBe(true);
+    // only a subcommand needs the terminal: the command itself stays with its source
+    expect([model, resume, plain, skill].map(terminalCommand)).toEqual([false, false, false, false]);
+    expect(commandGroup(config)).toBe("terminal");
+    expect(commandGroup(tree)).toBe("terminal");
+    expect(commandGroup(resume)).toBe("builtin");
+    expect(commandGroup(skill)).toBe("skill-project");
+    // the group stands last: the agent's offered commands first, what needs the terminal after them
+    expect(COMMAND_GROUPS[COMMAND_GROUPS.length - 1]).toBe("terminal");
   });
 
-  it("stays quiet about everything else", () => {
-    expect(terminalOnlyCommand("pi", "/fork")).toBeNull();
-    expect(terminalOnlyCommand("pi", "/compact")).toBeNull();
-    // a message that merely mentions or begins like it: /treemap is not /tree, and prose that only
-    // names the command is not a command
-    expect(terminalOnlyCommand("pi", "/treemap")).toBeNull();
-    expect(terminalOnlyCommand("pi", "use /tree to switch branches")).toBeNull();
-    expect(terminalOnlyCommand("pi", "tree")).toBeNull();
-    expect(terminalOnlyCommand("pi", "//tree")).toBeNull();
-    // an agent with no evidence of the command gets no note: telling a Claude reader about a tree
-    // browser Claude does not have is its own kind of wrong
-    expect(terminalOnlyCommand("claude", "/tree")).toBeNull();
-    expect(terminalOnlyCommand("codex", "/tree")).toBeNull();
-    expect(terminalOnlyCommand(null, "/tree")).toBeNull();
+  it("never lists an agent-hidden row, and lists terminal rows at a bare slash", () => {
+    const listed = commandsForTrigger(commands, "claude", slash).map((command) => command.name);
+    expect(listed).toEqual(["config", "tree", "model", "resume", "compact", "deploy"]);
+    expect(terminalCommand(heapdump)).toBe(false);
+    // rows without the new fields (an older server) read as they always did
+    expect(commandsForTrigger([plain, skill], "claude", slash)).toEqual([plain, skill]);
+  });
+
+  it("finds the terminal command a message types, in the form it was typed", () => {
+    expect(typedTerminalCommand(commands, "/config")).toBe(config);
+    expect(typedTerminalCommand(commands, "  /CONFIG  ")).toBe(config);
+    expect(typedTerminalCommand(commands, "/tree")).toBe(tree);
+    // takes no argument, but a stray one is still the same command typed
+    expect(typedTerminalCommand(commands, "/tree w13:p2")).toBe(tree);
+    // the typed form decides: /model opens a dialog and /model sonnet needs nothing, /resume list needs the terminal
+    expect(typedTerminalCommand(commands, "/model")).toBeNull();
+    expect(typedTerminalCommand(commands, "/model sonnet")).toBeNull();
+    expect(typedTerminalCommand(commands, "/resume")).toBeNull();
+    expect(typedTerminalCommand(commands, "/resume list")).toBe(resume);
+    expect(typedTerminalCommand(commands, "/resume LIST\nplease")).toBe(resume);
+  });
+
+  it("sends a hand-typed agent-hidden command, prose and look-alikes like any text", () => {
+    expect(typedTerminalCommand(commands, "/heapdump")).toBeNull();
+    expect(typedTerminalCommand(commands, "/compact")).toBeNull();
+    expect(typedTerminalCommand(commands, "/configure")).toBeNull();
+    expect(typedTerminalCommand(commands, "use /config to change it")).toBeNull();
+    expect(typedTerminalCommand(commands, "config")).toBeNull();
+    expect(typedTerminalCommand(commands, "//config")).toBeNull();
+    expect(typedTerminalCommand(commands, "")).toBeNull();
+    // a row typed with another trigger is another row: Codex's $skill is never /skill
+    expect(typedTerminalCommand([{ ...config, trigger: "$" }], "/config")).toBeNull();
+    expect(typedTerminalCommand([{ ...config, trigger: "$" }], "$config")).toEqual({ ...config, trigger: "$" });
+    // a catalog without the fields names no terminal command, as before the fields existed
+    expect(typedTerminalCommand([plain, skill], "/compact")).toBeNull();
+  });
+
+});
+
+describe("the menu over a catalog the server built", () => {
+  // The rows come from the integrated server catalog, serialized as they cross the wire, so the
+  // client is checked against the forms and visibility the scanners really emit (Codex: terminal
+  // screens and the popup's agent-hidden rows), not against hand-written rows.
+  function codexRows(): SlashCommand[] {
+    const home = mkdtempSync(join(tmpdir(), "compose-catalog-"));
+    try {
+      mkdirSync(join(home, ".codex", "skills", "deploy"), { recursive: true });
+      writeFileSync(join(home, ".codex", "skills", "deploy", "SKILL.md"), "---\nname: deploy\ndescription: Ship it\n---\n");
+      return JSON.parse(JSON.stringify(paneCommands("codex", null, home))) as SlashCommand[];
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }
+  const slash: ActiveTrigger = { kind: "slash", query: "", start: 0, end: 1 };
+
+  it("lists the terminal screens in the terminal group and never lists the agent-hidden rows", () => {
+    const rows = codexRows();
+    const listed = commandsForTrigger(rows, "codex", slash);
+    const names = new Set(listed.map((row) => row.name));
+    const terminal = new Set(listed.filter((row) => commandGroup(row) === "terminal").map((row) => row.name));
+    for (const name of ["config", "resume", "permissions", "mcp", "status", "review"]) expect(terminal.has(name)).toBeTrue();
+    for (const name of ["model", "compact", "init"]) expect(names.has(name) && !terminal.has(name)).toBeTrue();
+    for (const name of ["apps", "debug-config", "debug-m-drop", "debug-m-update"]) {
+      expect(rows.some((row) => row.name === name && row.visibility === "agent-hidden")).toBeTrue();
+      expect(names.has(name)).toBeFalse();
+    }
+    expect(commandsForTrigger(rows, "codex", { ...slash, prefix: "$" }).map((row) => [row.name, commandGroup(row)])).toEqual([["deploy", "skill-user"]]);
+  });
+
+  it("lists Claude's terminal screens apart and leaves out what Claude's own menu hides", () => {
+    const home = mkdtempSync(join(tmpdir(), "compose-catalog-"));
+    let rows: SlashCommand[];
+    try { rows = JSON.parse(JSON.stringify(paneCommands("claude", null, home))) as SlashCommand[]; }
+    finally { rmSync(home, { recursive: true, force: true }); }
+    const listed = commandsForTrigger(rows, "claude", slash);
+    const names = new Set(listed.map((row) => row.name));
+    const terminal = new Set(listed.filter((row) => commandGroup(row) === "terminal").map((row) => row.name));
+    for (const name of ["config", "resume", "permissions"]) expect(terminal.has(name)).toBeTrue();
+    expect(names.has("compact") && !terminal.has("compact")).toBeTrue();
+    for (const name of ["agents", "heapdump", "setup-bedrock"]) {
+      expect(rows.some((row) => row.name === name && row.visibility === "agent-hidden")).toBeTrue();
+      expect(names.has(name)).toBeFalse();
+    }
+    expect(typedTerminalCommand(rows, "/config")?.name).toBe("config");
+    expect(typedTerminalCommand(rows, "/heapdump")).toBeNull();
+  });
+
+  it("offers the terminal for what the catalog says needs it, and sends the rest as typed", () => {
+    const rows = codexRows();
+    expect(typedTerminalCommand(rows, "/config")?.name).toBe("config");
+    expect(typedTerminalCommand(rows, "/review")?.name).toBe("review");
+    expect(typedTerminalCommand(rows, "/review the auth change")).toBeNull();
+    expect(typedTerminalCommand(rows, "/apps")).toBeNull();
+    expect(typedTerminalCommand(rows, "/compact")).toBeNull();
   });
 });

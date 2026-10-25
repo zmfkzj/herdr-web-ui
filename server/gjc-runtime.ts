@@ -1,14 +1,10 @@
-/**
- * GJC conversation identity comes only from its public SDK broker binding a live pane
- * process to its exact saved session. Shared terminal/store helpers below are also used by omp.
- */
+/** GJC transcript identity is published by its lifecycle extension; shared terminal/store helpers are also used by omp. */
 
 import { execFileSync } from "node:child_process";
-import { closeSync, fstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import nodePath, { join, type PlatformPath } from "node:path";
 
-import { GjcSdkLookupError, gjcSdkTranscript } from "./gjc-sdk.ts";
-import { captureGjcIndex, gjcIndexUnchanged, type GjcIndexStamp } from "./gjc-index.ts";
+import { readGjcNativeBinding, validateGjcNativeTranscript } from "./gjc-native.ts";
 import { herdrRpc } from "./herdr/client.ts";
 import { processStartedAt } from "./process-start.ts";
 import { descendantArgv, windowsProcessTable, type ProcessRow } from "./windows-processes.ts";
@@ -47,6 +43,22 @@ export function recentProcessTable(read: () => Promise<ProcessRow[]> = windowsPr
   return entry.rows;
 }
 
+let freshReads = 0;
+let freshTable: { read: () => Promise<ProcessRow[]>; started: number; rows: Promise<ProcessRow[]> } | null = null;
+
+/**
+ * A fresh Windows process table for the final PID-reuse check. Concurrent lookups share a read only
+ * when it started after their own initial check (`after`), so N GJC panes start one PowerShell, not N.
+ */
+function freshProcessTable(read: () => Promise<ProcessRow[]>, after: number): Promise<ProcessRow[]> {
+  if (freshTable && freshTable.read === read && freshTable.started > after) return freshTable.rows;
+  const entry = { read, started: ++freshReads, rows: Promise.resolve().then(read) };
+  freshTable = entry;
+  const clear = () => { if (freshTable === entry) freshTable = null; };
+  void entry.rows.then(clear, clear);
+  return entry.rows;
+}
+
 /** A gjc process by its number and when it started: a number alone comes back for another process. */
 export type GjcProcess = { pid: number; started: number | null };
 
@@ -80,8 +92,24 @@ export async function gjcPidUnderShell(
   return null;
 }
 
-/** Forget the process table kept between Windows polls. */
-export function forgetGjcState(): void { processTable = null; transcriptFlights.clear(); transcriptBindings.clear(); }
+type LookupToken = { cancelled: boolean };
+const lookupsInFlight = new Map<string, Set<LookupToken>>();
+
+/** Forget the Windows process-table snapshot and cancel reads belonging to ended server state. */
+export function forgetGjcState(): void {
+  for (const lookups of lookupsInFlight.values()) for (const lookup of lookups) lookup.cancelled = true;
+  lookupsInFlight.clear();
+  processTable = null;
+  freshTable = null;
+}
+
+/** Cancel a pane's in-flight native identity checks when its pane ends. */
+export function forgetGjcPane(paneId: string): void {
+  const lookups = lookupsInFlight.get(paneId);
+  if (!lookups) return;
+  for (const lookup of lookups) lookup.cancelled = true;
+  lookupsInFlight.delete(paneId);
+}
 
 /**
  * Where `file` sits inside `root`, as path segments, or null when it is not inside. The
@@ -140,6 +168,11 @@ export function parseGjcPs(output: string): GjcTerminal | null {
  * header decides, and a rejected candidate can be megabytes.
  */
 function transcriptCwd(path: string): string | null {
+  return transcriptHeader(path)?.cwd ?? null;
+}
+
+/** transcriptCwd's header, with the session version it names (undefined when it names none). */
+export function transcriptHeader(path: string): { cwd: string; version: unknown } | null {
   let fd: number;
   try {
     fd = openSync(path, "r");
@@ -150,9 +183,9 @@ function transcriptCwd(path: string): string | null {
     const buffer = Buffer.alloc(4096);
     const size = readSync(fd, buffer, 0, buffer.length, 0);
     const lines = buffer.subarray(0, size).toString("utf8").split("\n");
-    let header = JSON.parse(lines[0] ?? "") as { type?: string; cwd?: unknown };
-    if (header.type === "title") header = JSON.parse(lines[1] ?? "") as { type?: string; cwd?: unknown };
-    return header.type === "session" && typeof header.cwd === "string" ? header.cwd : null;
+    let header = JSON.parse(lines[0] ?? "") as { type?: string; cwd?: unknown; version?: unknown };
+    if (header.type === "title") header = JSON.parse(lines[1] ?? "") as { type?: string; cwd?: unknown; version?: unknown };
+    return header.type === "session" && typeof header.cwd === "string" ? { cwd: header.cwd, version: header.version } : null;
   } catch {
     return null; // not a gjc transcript, or a header longer than the read
   } finally {
@@ -162,30 +195,51 @@ function transcriptCwd(path: string): string | null {
 
 /**
  * Shared breadcrumb/descriptor lookup: GJC and omp subagents live beside their session file, so
- * this helper maps such a path to its parent. The SDK-based GJC pane resolver does not use it.
+ * this helper maps such a path to its parent, which must itself be a session inside the store once
+ * links are followed. `depth` is where sessions sit: 2 for `<cwd>/<id>.jsonl`, 1 for a session
+ * directory of omp's own holding `<id>.jsonl`. The pane resolver uses the explicit lifecycle record.
  */
-export function gjcSessionFile(root: string, path: string, paths: PlatformPath = nodePath): string | null {
+export function gjcSessionFile(root: string, path: string, paths: PlatformPath = nodePath, depth: 1 | 2 = 2): string | null {
   const parts = path.endsWith(".jsonl") ? storeRelative(root, path, paths) : null;
   if (!parts) return null;
-  if (parts.length === 2) return path;
-  if (parts.length !== 3) return null;
-  const session = paths.join(root, parts[0]!, `${parts[1]!}.jsonl`);
-  try { return statSync(session).isFile() ? session : null; } catch { return null; }
+  if (parts.length === depth) return path;
+  if (parts.length !== depth + 1) return null;
+  const session = paths.join(root, ...parts.slice(0, depth - 1), `${parts[depth - 1]!}.jsonl`);
+  try {
+    if (!statSync(session).isFile()) return null;
+    // a parent linked out of the store is no session of it
+    return storeRelative(realpathSync(root), realpathSync(session), paths)?.length === depth ? session : null;
+  } catch { return null; }
 }
 
-/** Validate the shared native breadcrumb under `agentDir/terminal-sessions` and reject stale leftovers. */
-export function terminalBreadcrumb(agentDir: string, cwd: string, terminalId: string, startedAt: number): string | null {
+/**
+ * Where a store keeps its sessions and terminal breadcrumbs: `<agentDir>/sessions/<cwd>/<id>.jsonl`
+ * and `<agentDir>/terminal-sessions` by default. omp can move either (omp.ts ompStoreLayout).
+ */
+export interface StoreRoots { sessions: string; terminalSessions: string; depth: 1 | 2 }
+
+const defaultStoreRoots = (agentDir: string): StoreRoots =>
+  ({ sessions: join(agentDir, "sessions"), terminalSessions: join(agentDir, "terminal-sessions"), depth: 2 });
+
+/**
+ * Validate the shared native breadcrumb under the store's terminal sessions (an agent directory's
+ * own, or the roots given) and reject stale leftovers.
+ */
+export function terminalBreadcrumb(store: string | StoreRoots, cwd: string, terminalId: string, startedAt: number): string | null {
   if (!/^(?:pts-\d+|tty[\w-]+|tmux-%\d+)$/.test(terminalId) || !Number.isFinite(startedAt)) return null;
+  const roots = typeof store === "string" ? defaultStoreRoots(store) : store;
   try {
-    const marker = join(agentDir, "terminal-sessions", terminalId);
+    const marker = join(roots.terminalSessions, terminalId);
     const stat = statSync(marker);
     if (!stat.isFile() || stat.size > 8192 || stat.mtimeMs < startedAt - 1000) return null;
     const [savedCwd, savedPath] = readFileSync(marker, "utf8").split("\n");
     if (!savedCwd || !savedPath || realpathSync(savedCwd) !== realpathSync(cwd)) return null;
-    const root = realpathSync(join(agentDir, "sessions"));
+    // omp writes a relative session directory as given, relative to a directory nothing proves
+    if (!nodePath.isAbsolute(savedPath)) return null;
+    const root = realpathSync(roots.sessions);
     const saved = realpathSync(savedPath);
     if (!statSync(saved).isFile()) return null;
-    const path = gjcSessionFile(root, saved);
+    const path = gjcSessionFile(root, saved, nodePath, roots.depth);
     if (!path) return null;
     const headerCwd = transcriptCwd(path);
     return headerCwd && realpathSync(headerCwd) === realpathSync(cwd) ? path : null;
@@ -193,23 +247,23 @@ export function terminalBreadcrumb(agentDir: string, cwd: string, terminalId: st
 }
 
 /**
- * The transcript an agent's processes show, from its store under `agentDir` (GJC and omp lay
- * theirs out alike): an exact open transcript first, then the terminal-scoped breadcrumb written
+ * The transcript an agent's processes show, from its store's `roots` (GJC and omp lay theirs out
+ * alike): an exact open transcript first, then the terminal-scoped breadcrumb written
  * during the process's lifetime. A directory descriptor or cwd proves only the store, not the
  * active session; never infer ownership from cwd or session recency. `path` is null unless
  * exactly one transcript qualifies; `found` says how many did. `environOf` supplies a process's
  * environment already read elsewhere, so none is read here; undefined for a pid reads it.
  */
-export function heldTranscript(agentDir: string, cwd: string, pids: readonly number[], environOf?: (pid: number) => readonly string[] | null | undefined): { path: string | null; found: number } {
+export function heldTranscript(roots: StoreRoots, cwd: string, pids: readonly number[], environOf?: (pid: number) => readonly string[] | null | undefined): { path: string | null; found: number } {
   let root: string;
-  try { root = realpathSync(join(agentDir, "sessions")); }
+  try { root = realpathSync(roots.sessions); }
   catch { return { path: null, found: 0 }; }
   const open = new Set<string>();
   const breadcrumbs = new Set<string>();
   for (const pid of pids) {
     const terminal = gjcTerminal(pid, environOf?.(pid));
     if (terminal) {
-      const path = terminalBreadcrumb(agentDir, cwd, terminal.id, terminal.startedAt);
+      const path = terminalBreadcrumb(roots, cwd, terminal.id, terminal.startedAt);
       if (path) breadcrumbs.add(path);
     }
     let fds: string[] = [];
@@ -217,7 +271,7 @@ export function heldTranscript(agentDir: string, cwd: string, pids: readonly num
     for (const fd of fds) {
       try {
         const file = realpathSync(readlinkSync(`/proc/${pid}/fd/${fd}`));
-        const target = statSync(file).isFile() ? gjcSessionFile(root, file) : null;
+        const target = statSync(file).isFile() ? gjcSessionFile(root, file, nodePath, roots.depth) : null;
         if (target && transcriptCwd(target) === cwd) open.add(target);
       } catch { /* closed, deleted or unreadable descriptor */ }
     }
@@ -226,213 +280,123 @@ export function heldTranscript(agentDir: string, cwd: string, pids: readonly num
   return { path: candidates.size === 1 ? [...candidates][0]! : null, found: candidates.size };
 }
 
-const GJC_HEADER_BYTES = 64 * 1024;
-
-type GjcSdkBinding = NonNullable<Awaited<ReturnType<typeof gjcSdkTranscript>>>;
-
-/** The SDK-selected path is usable only as its exact main session transcript. */
-export function validateGjcSdkTranscript(binding: GjcSdkBinding, cwd: string, agentDir: string): string | null {
-  if (!binding || !Number.isSafeInteger(binding.pid) || binding.pid <= 0
-    || typeof binding.sessionId !== "string" || binding.sessionId === ""
-    || typeof binding.path !== "string" || !nodePath.isAbsolute(binding.path)
-    || !nodePath.isAbsolute(cwd) || !nodePath.isAbsolute(agentDir)) return null;
-  let fd: number;
-  try {
-    const root = realpathSync(join(agentDir, "sessions"));
-    const expectedCwd = realpathSync(cwd);
-    const path = realpathSync(binding.path);
-    const parts = storeRelative(root, path);
-    // A GJC main session is sessions/<project>/<file>.jsonl. Never translate a subagent path.
-    if (!parts || parts.length !== 2 || !path.endsWith(".jsonl")) return null;
-    fd = openSync(path, "r");
-    try {
-      if (!fstatSync(fd).isFile()) return null;
-      const buffer = Buffer.alloc(GJC_HEADER_BYTES);
-      const size = readSync(fd, buffer, 0, buffer.length, 0);
-      const end = buffer.subarray(0, size).indexOf(0x0a);
-      if (end < 0) return null;
-      const header = JSON.parse(buffer.subarray(0, end).toString("utf8")) as { type?: unknown; id?: unknown; cwd?: unknown };
-      if (header.type !== "session" || header.id !== binding.sessionId || typeof header.cwd !== "string") return null;
-      const headerCwd = realpathSync(header.cwd);
-      const sameCwd = process.platform === "win32"
-        ? headerCwd.toLowerCase() === expectedCwd.toLowerCase()
-        : headerCwd === expectedCwd;
-      return sameCwd ? path : null;
-    } finally { closeSync(fd); }
-  } catch { return null; }
-}
-
 type GjcPaneProcessInfo = { process_info?: { shell_pid?: unknown; foreground_processes?: { pid?: unknown; argv?: unknown }[] } };
 type GjcProcessIdentity = { pid: number; birth: number };
 
-type GjcTranscriptOptions = {
+export type GjcTranscriptOptions = {
   platform?: string;
   processInfo?: (paneId: string) => Promise<GjcPaneProcessInfo | null>;
   processBirth?: (pid: number) => number | null;
-  sdkTranscript?: typeof gjcSdkTranscript;
   readProcessTable?: () => Promise<ProcessRow[]>;
   now?: () => number;
 };
 
-/** Each SDK lookup spawns the gjc CLI, so equivalent pane/directory/I/O contexts share one flight. */
-const transcriptFlights = new Map<string, Set<{ options: GjcTranscriptOptions; flight: Promise<string | null> }>>();
-
-function sameLookupContext(a: GjcTranscriptOptions, b: GjcTranscriptOptions): boolean {
-  return a.processInfo === b.processInfo
-    && a.processBirth === b.processBirth
-    && a.sdkTranscript === b.sdkTranscript
-    && a.readProcessTable === b.readProcessTable;
+function sameBirth(left: number, right: number, platform: string): boolean {
+  return platform === "darwin" ? Math.abs(left - right) <= 1000 : left === right;
 }
 
-/**
- * A binding the broker proved, kept while the index it came from is unchanged or only gains
- * unrelated heartbeats. Its liveness also ages with the clock (a session whose heartbeats stop,
- * about one a minute, stops counting as live within two), so age can only turn it into no binding.
- */
-const BINDING_TTL_MS = 30_000;
+async function foregroundProcesses(
+  info: GjcPaneProcessInfo | null,
+  platform: string,
+  options: GjcTranscriptOptions,
+  fresh: boolean,
+  freshAfter = -1,
+): Promise<GjcProcessIdentity[] | null> {
+  const processInfo = info?.process_info;
+  if (!processInfo) return null;
+  if (platform === "win32") {
+    const readTable = options.readProcessTable ?? windowsProcessTable;
+    const table = fresh
+      ? () => freshProcessTable(readTable, freshAfter)
+      : () => recentProcessTable(readTable, (options.now ?? Date.now)());
+    const process = await gjcPidUnderShell(processInfo.shell_pid, platform, table);
+    if (process === undefined) return null;
+    if (process === null) return [];
+    if (!Number.isSafeInteger(process.started) || process.started === null || process.started <= 0) return null;
+    return [{ pid: process.pid, birth: process.started }];
+  }
 
-type KeptBinding = {
-  options: GjcTranscriptOptions;
-  indexStamp: GjcIndexStamp;
-  processes: GjcProcessIdentity[];
-  binding: GjcSdkBinding;
-  at: number;
-};
+  const foreground = processInfo.foreground_processes;
+  if (!Array.isArray(foreground)) return null;
+  const identities = new Map<number, number>();
+  const birthOf = options.processBirth ?? processStartedAt;
+  for (const process of foreground) {
+    const argv = Array.isArray(process.argv) ? process.argv.filter((arg): arg is string => typeof arg === "string") : [];
+    if (!isGjcProcess(argv)) continue;
+    if (typeof process.pid !== "number" || !Number.isSafeInteger(process.pid) || process.pid <= 0) return null;
+    const birth = birthOf(process.pid);
+    if (birth === null || !Number.isSafeInteger(birth) || birth <= 0) return null;
+    const previous = identities.get(process.pid);
+    if (previous !== undefined && !sameBirth(previous, birth, platform)) return null;
+    identities.set(process.pid, birth);
+  }
+  return [...identities].map(([pid, birth]) => ({ pid, birth }));
+}
 
-/**
- * Proven bindings by lookup context. A null answer is never kept: the first message after /new
- * creates the transcript the broker then names, without a new index row.
- */
-const transcriptBindings = new Map<string, KeptBinding>();
+function sameProcess(left: GjcProcessIdentity, right: GjcProcessIdentity, platform: string): boolean {
+  return left.pid === right.pid && sameBirth(left.birth, right.birth, platform);
+}
 
-/**
- * Resolves only while the SDK-selected GJC process is still foreground in this pane with the
- * same birth identity. Optional I/O callbacks keep this race check fixture-testable. Overlapping
- * reads with the same lookup context share a lookup. A later read reuses the proven binding only
- * while the index is unchanged or has only unrelated heartbeats, the pane's GJC processes are the
- * same ones and the transcript still names that session; anything else asks the broker again (a
- * /new keeps the pid and can keep the old file, but always writes the index).
- */
+function sameNativeVersion(left: NonNullable<ReturnType<typeof readGjcNativeBinding>>, right: NonNullable<ReturnType<typeof readGjcNativeBinding>>): boolean {
+  if (left.pid !== right.pid || left.processStartedAt !== right.processStartedAt
+    || left.instanceId !== right.instanceId || left.sequence !== right.sequence) return false;
+  if (left.session === null || right.session === null) return left.session === right.session;
+  return left.session.id === right.session.id && left.session.path === right.session.path && left.session.cwd === right.session.cwd;
+}
+
+/** Resolve only the exact, live GJC process's unexpired native lifecycle record. */
 export function gjcTranscriptForPane(
   paneId: string,
   cwd: string,
-  home = process.env["HOME"] ?? "",
+  home = process.env["HOME"] ?? process.env["USERPROFILE"] ?? "",
   options: GjcTranscriptOptions = {},
 ): Promise<string | null> {
-  const key = JSON.stringify([paneId, cwd, home, options.platform ?? process.platform]);
-  const flights = transcriptFlights.get(key) ?? new Set<{ options: GjcTranscriptOptions; flight: Promise<string | null> }>();
-  for (const shared of flights) {
-    if (sameLookupContext(shared.options, options)) return shared.flight;
-  }
-  const flight: Promise<string | null> = lookupGjcTranscript(key, paneId, cwd, home, options).finally(() => {
-    flights.delete(entry);
-    if (transcriptFlights.get(key) === flights && flights.size === 0) transcriptFlights.delete(key);
+  const token: LookupToken = { cancelled: false };
+  const lookups = lookupsInFlight.get(paneId) ?? new Set<LookupToken>();
+  lookups.add(token);
+  lookupsInFlight.set(paneId, lookups);
+  return lookupNativeTranscript(paneId, cwd, home, options, token).finally(() => {
+    lookups.delete(token);
+    if (lookups.size === 0 && lookupsInFlight.get(paneId) === lookups) lookupsInFlight.delete(paneId);
   });
-  const entry = { options, flight };
-  flights.add(entry);
-  transcriptFlights.set(key, flights);
-  return flight;
 }
 
-async function lookupGjcTranscript(
-  key: string,
+async function lookupNativeTranscript(
   paneId: string,
   cwd: string,
   home: string,
   options: GjcTranscriptOptions,
+  token: LookupToken,
 ): Promise<string | null> {
-  const platform = options.platform ?? process.platform;
-  const agentDir = join(home, ".gjc", "agent");
-  if (!nodePath.isAbsolute(cwd) || !nodePath.isAbsolute(agentDir)) return null;
-  const readProcessInfo = options.processInfo ?? ((id: string) => herdrRpc<GjcPaneProcessInfo>(
-    "pane.process_info", { pane_id: id },
-  ).catch(() => null));
-  const sdkTranscript = options.sdkTranscript ?? gjcSdkTranscript;
-  const readProcessTable = options.readProcessTable ?? windowsProcessTable;
-  const processBirth = options.processBirth ?? processStartedAt;
-  const now = options.now ?? Date.now;
-  // macOS reads a start as now minus whole elapsed seconds, so two reads of one process
-  // differ by up to a second.
-  const sameBirth = (a: number, b: number) => platform === "darwin" ? Math.abs(a - b) <= 1000 : a === b;
-  const sameProcesses = (a: GjcProcessIdentity[], b: GjcProcessIdentity[]) => a.length === b.length
-    && a.every((process) => b.some((other) => other.pid === process.pid && sameBirth(other.birth, process.birth)));
-  const forget = (): null => { transcriptBindings.delete(key); return null; };
-
-  const processes = async (info: GjcPaneProcessInfo | null, fresh: boolean): Promise<GjcProcessIdentity[] | null> => {
-    if (!info?.process_info) return null;
-    if (platform === "win32") {
-      const table = fresh ? readProcessTable : () => recentProcessTable(readProcessTable);
-      const process = await gjcPidUnderShell(info.process_info.shell_pid, platform, table);
-      if (process === undefined) return null;
-      if (process === null) return [];
-      if (!Number.isSafeInteger(process.started) || process.started === null) return null;
-      return [{ pid: process.pid, birth: process.started }];
-    }
-
-    const foreground = info.process_info.foreground_processes;
-    if (!Array.isArray(foreground)) return null;
-    const found: GjcProcessIdentity[] = [];
-    const seen = new Map<number, number>();
-    for (const process of foreground) {
-      const argv = Array.isArray(process.argv) ? process.argv.map(String) : [];
-      if (!isGjcProcess(argv)) continue;
-      if (typeof process.pid !== "number" || !Number.isSafeInteger(process.pid) || process.pid <= 0) return null;
-      const started = processBirth(process.pid);
-      if (started === null || !Number.isFinite(started)) return null;
-      const previous = seen.get(process.pid);
-      if (previous !== undefined && !sameBirth(previous, started)) return null;
-      if (previous === undefined) {
-        seen.set(process.pid, started);
-        found.push({ pid: process.pid, birth: started });
-      }
-    }
-    return found;
-  };
-
   try {
+    if (!nodePath.isAbsolute(cwd) || !nodePath.isAbsolute(home) || token.cancelled) return null;
+    const platform = options.platform ?? process.platform;
+    const readProcessInfo = options.processInfo ?? ((id: string) => herdrRpc<GjcPaneProcessInfo>(
+      "pane.process_info", { pane_id: id },
+    ).catch(() => null));
     const initialInfo = await readProcessInfo(paneId);
-    if (!initialInfo) return forget();
-    const initial = await processes(initialInfo, false);
-    if (!initial || initial.length === 0) return forget();
-    // Read before the lookup: a write that lands during it then makes the next read ask again.
-    const indexStamp = captureGjcIndex(agentDir), checkedAt = now();
-    const kept = transcriptBindings.get(key);
-    if (kept && indexStamp !== null
-      && sameLookupContext(kept.options, options) && checkedAt - kept.at < BINDING_TTL_MS) {
-      // the kept table may be a few seconds old on Windows; the shared one is not proof enough
-      const current = platform === "win32" ? await processes(initialInfo, true) : initial;
-      const guardSessionIds = [...new Set([...kept.binding.guardSessionIds, kept.binding.sessionId])];
-      if (current && sameProcesses(current, kept.processes)
-        && gjcIndexUnchanged(agentDir, kept.indexStamp, indexStamp, kept.processes.map(({ pid }) => pid), guardSessionIds)) {
-        const path = validateGjcSdkTranscript(kept.binding, cwd, agentDir);
-        if (path) {
-          kept.indexStamp = indexStamp;
-          return path;
-        }
-      }
-    }
-    transcriptBindings.delete(key);
-    const pids = initial.map((process) => process.pid);
-    const binding = await sdkTranscript(pids, cwd, agentDir);
-    const owner = binding && initial.find((process) => process.pid === binding.pid);
-    if (!binding || !owner) return null;
-    const path = validateGjcSdkTranscript(binding, cwd, agentDir);
-    if (!path) return null;
+    if (!initialInfo || token.cancelled) return null;
+    const initial = await foregroundProcesses(initialInfo, platform, options, false);
+    if (!initial || initial.length !== 1 || token.cancelled) return null;
+    const freshAfter = freshReads;
+    const owner = initial[0]!;
+
+    const binding = readGjcNativeBinding(home, owner.pid, options.now?.());
+    if (!binding || !sameBirth(binding.processStartedAt, owner.birth, platform) || !binding.session || token.cancelled) return null;
+    const path = validateGjcNativeTranscript(binding, cwd, home, platform);
+    if (!path || token.cancelled) return null;
 
     const finalInfo = await readProcessInfo(paneId);
-    if (!finalInfo) return null;
-    const final = await processes(finalInfo, true);
-    if (!final?.some((process) => process.pid === owner.pid && sameBirth(process.birth, owner.birth))) return null;
-    if (indexStamp !== null) {
-      for (const [other, entry] of transcriptBindings) if (checkedAt - entry.at >= BINDING_TTL_MS) transcriptBindings.delete(other);
-      // aged from before the lookup, when the index stamp was read
-      transcriptBindings.set(key, { options, indexStamp, processes: initial, binding, at: checkedAt });
-    }
-    return path;
-  } catch (error) {
-    // a timed-out lookup reaches the route as 504, so the chat keeps what it shows (#1295); the kept
-    // binding was already dropped, since a lookup only runs once it no longer held
-    if (error instanceof GjcSdkLookupError) throw error;
-    return forget();
+    if (!finalInfo || token.cancelled) return null;
+    const final = await foregroundProcesses(finalInfo, platform, options, true, freshAfter);
+    if (!final || final.length !== 1 || !sameProcess(owner, final[0]!, platform) || token.cancelled) return null;
+
+    const current = readGjcNativeBinding(home, owner.pid, options.now?.());
+    if (!current || !sameBirth(current.processStartedAt, final[0]!.birth, platform) || !sameNativeVersion(binding, current) || token.cancelled) return null;
+    const currentPath = validateGjcNativeTranscript(current, cwd, home, platform);
+    if (currentPath !== path || token.cancelled) return null;
+    return currentPath;
+  } catch {
+    return null;
   }
 }

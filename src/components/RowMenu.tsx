@@ -36,6 +36,8 @@ export interface RowMenuItem {
   current?: boolean;
   /** a switch's state, when the item is one: it is then a checkbox item (a pressed button in the sheet), not a plain item */
   checked?: boolean;
+  /** shown with its state but not runnable here (a watching device and a shared switch): it keeps its place in the keyboard order, and a press on it leaves the menu open */
+  disabled?: boolean;
   run: () => void;
 }
 
@@ -47,6 +49,8 @@ interface Props {
   /** the menu's accessible name, and the sheet's title */
   title: string;
   subtitle?: string;
+  /** a phone's sheet only, under the subtitle and wrapped, not cut: text a row cuts (a hover tooltip says it on a desktop) */
+  detail?: string;
   /** drawn above the items, and in the sheet's head in the title's place: what the menu is about, when that is more than a name */
   header?: ReactNode;
   items: RowMenuItem[];
@@ -63,7 +67,7 @@ const POPOVER_ITEMS = '[role="menuitem"], [role="menuitemcheckbox"]';
 // the sheet is modal: its Cancel is one of the stops
 const SHEET_ITEMS = '.row-sheet-item, .row-sheet-cancel';
 
-export function RowMenu({ anchor, point, restoreFocusTo, title, subtitle, header, items, align = "end", onClose, variant }: Props) {
+export function RowMenu({ anchor, point, restoreFocusTo, title, subtitle, detail, header, items, align = "end", onClose, variant }: Props) {
   const t = useT();
   const sheet = useMediaQuery(SHEET_QUERY);
   const surface = useRef<HTMLDivElement>(null);
@@ -175,6 +179,7 @@ export function RowMenu({ anchor, point, restoreFocusTo, title, subtitle, header
   const keepFocus = (event: ReactMouseEvent<HTMLButtonElement>): void => event.preventDefault();
 
   const run = (item: RowMenuItem): void => {
+    if (item.disabled) return;
     onClose();
     item.run();
   };
@@ -188,12 +193,13 @@ export function RowMenu({ anchor, point, restoreFocusTo, title, subtitle, header
             <div className="row-sheet-head">
               <span className="row-sheet-title">{title}</span>
               {subtitle && <span className="row-sheet-subtitle">{subtitle}</span>}
+              {detail && <span className="row-sheet-detail">{detail}</span>}
             </div>
           )}
           {/* the items scroll between the head and Cancel: a tab's menu is taller than a short phone, and `.modal` hides its overflow */}
           <div className="row-sheet-items">
             {items.map((item) => (
-              <button key={item.id} type="button" className={`row-sheet-item${item.danger ? " is-danger" : ""}${item.divider ? " has-divider" : ""}`} aria-current={item.current ? "true" : undefined} aria-pressed={item.checked} title={item.title} onMouseDown={keepFocus} onMouseEnter={point ? (event) => event.currentTarget.focus({ preventScroll: true }) : undefined} onClick={() => run(item)}>
+              <button key={item.id} type="button" className={`row-sheet-item${item.danger ? " is-danger" : ""}${item.divider ? " has-divider" : ""}${item.disabled ? " is-disabled" : ""}`} aria-current={item.current ? "true" : undefined} aria-pressed={item.checked} aria-disabled={item.disabled || undefined} title={item.title} onMouseDown={keepFocus} onMouseEnter={point ? (event) => event.currentTarget.focus({ preventScroll: true }) : undefined} onClick={() => run(item)}>
                 {item.glyph ?? <item.icon aria-hidden="true" />}
                 <span className="row-sheet-label">{item.label}</span>
                 {item.hint && <span className="row-sheet-hint">{item.hint}</span>}
@@ -214,7 +220,7 @@ export function RowMenu({ anchor, point, restoreFocusTo, title, subtitle, header
       {items.map((item) => (
         <Fragment key={item.id}>
           {item.divider && <span className="row-menu-divider" role="separator" />}
-          <button type="button" role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"} aria-checked={item.checked} className={`menu-item${item.danger ? " is-danger" : ""}`} aria-current={item.current ? "true" : undefined} title={item.title} onMouseDown={keepFocus} onMouseEnter={point ? (event) => event.currentTarget.focus({ preventScroll: true }) : undefined} onClick={() => run(item)}>
+          <button type="button" role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"} aria-checked={item.checked} className={`menu-item${item.danger ? " is-danger" : ""}${item.disabled ? " is-disabled" : ""}`} aria-current={item.current ? "true" : undefined} aria-disabled={item.disabled || undefined} title={item.title} onMouseDown={keepFocus} onMouseEnter={point ? (event) => event.currentTarget.focus({ preventScroll: true }) : undefined} onClick={() => run(item)}>
             {item.glyph ?? <item.icon aria-hidden="true" />}
             <span className="menu-item-main">{item.label}</span>
             {item.hint && <span className="menu-item-hint">{item.hint}</span>}

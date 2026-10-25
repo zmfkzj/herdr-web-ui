@@ -169,8 +169,8 @@ try {
   page.on("pageerror", (error) => errors.push(error.message));
   page.setDefaultTimeout(20_000);
   await page.addInitScript((id) => {
-    localStorage.setItem("herdr-web-ui:settings", JSON.stringify({ language: "en" }));
-    localStorage.setItem(`herdr-web-ui:view:${id}`, "terminal");
+    localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
+    localStorage.setItem(`ovis:view:${id}`, "terminal");
   }, paneId);
   const dialog = page.getByRole("dialog");
   /** types into the pane's terminal grid key by key, as a user does */

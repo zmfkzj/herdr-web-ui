@@ -146,12 +146,12 @@ runs (`guacd -v`), that Bun is found, and that `bun install` and `bun run build`
 it names what is missing instead of installing or building it. It refuses to run as root.
 
 - **Settings:** `PORT` and `HOST` for the server (other server variables such as `HERDR_SOCKET`
-  or `HERDR_WEB_TOKEN` pass through), `HERDR_STACK_GUACD_BIN` for another guacd binary,
+  or `OVIS_TOKEN` pass through), `HERDR_STACK_GUACD_BIN` for another guacd binary,
   `HERDR_STACK_START_TIMEOUT` / `HERDR_STACK_STOP_TIMEOUT` in seconds (30 / 15). guacd always
   binds `127.0.0.1:4822`, the address the gateway dials. Use the same variables for `status` and
   `stop` as for `start`.
 - **Logs and records:** `guacd.log`, `web-ui.log` and the pid records live in
-  `${HERDR_WEB_STATE_DIR:-~/.config/herdr-web-ui}/pi-visual-stack/` (`HERDR_STACK_DIR` moves
+  `${OVIS_STATE_DIR:-~/.config/herdr-web-ui}/pi-visual-stack/` (`HERDR_STACK_DIR` moves
   them). Logs are appended to and kept after `stop`.
 - **Only its own processes:** a second `start` reuses the running pair, and two commands at once
   are serialized by a lock. A port already held by a guacd or server started some other way is
@@ -336,7 +336,7 @@ single raster frame and a maximum 4096-pixel edge; animated-image review is not 
 frame-accurate video editor. SVG is deliberately excluded from persistent review
 snapshots. Marked exports are saved beside normal uploaded pane attachments.
 
-Reviews persist in `<HERDR_WEB_STATE_DIR>/pi-visual/reviews.sqlite` (the normal
+Reviews persist in `<OVIS_STATE_DIR>/pi-visual/reviews.sqlite` (the normal
 app state directory when unset), with private file permissions. The store has a
 256 MiB/500-image limit and refuses new snapshots rather than silently deleting
 reviews. This branch does not add an administration UI for exporting/pruning the

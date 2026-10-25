@@ -7,6 +7,1091 @@ between releases do not reach them. Remote-PC runtime bundles are versioned sepa
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-10-25
+
+### Changed
+- On ovis.sh, the App Store and Google Play icons, and the download button on an iPhone or Android
+  phone, open the iPhone or Android part of the Beta page in the visitor's language instead of
+  saying "coming soon". The home page says under its download buttons that the phone apps are in
+  beta, its FAQ says both are in open beta, and every page's top navigation links to the Beta page.
+  ([#1929](https://github.com/devswha/ovis/pull/1929))
+
+### Fixed
+- An install made fresh with 0.4.14 or 0.4.15 no longer opens its sign-in gate after an update or a
+  restart. Such an install moved to the state folder from before the rename, which held none of its
+  paired devices, so any device, and anyone who could reach the address, got in without pairing;
+  its shared settings were reset too. Ovis now uses the right folder, and takes the paired devices,
+  shared settings and alert subscriptions of the other folder over into it, so devices paired before
+  or after the update keep working and a revoked device stays revoked. A device list that cannot be
+  read keeps the gate closed.
+  ([#1931](https://github.com/devswha/ovis/pull/1931))
+- An in-app update from such an install now stays on the new version after it restarts, instead of
+  going back to the old one and offering the same update again.
+  ([#1931](https://github.com/devswha/ovis/pull/1931))
+
+## [0.4.15] - 2026-10-25
+
+### Added
+- Files → Changes compares a branch against a base of your choosing: a **Branch** scope with a
+  base picker that lists the repository's local and remote branches (or takes a typed branch or
+  commit), and reads what the branch changed since its merge base with that base, untracked files
+  included, so what the base went on to change stays out. Each file's patch is read from the
+  comparison the list answered with: a base that moves on changes nothing until Refresh, and a
+  moved HEAD asks for one. A base that names no commit, a repository with no commit yet and a base
+  sharing no history with HEAD are each refused by name, with nothing compared in their place.
+  ([#1857](https://github.com/devswha/ovis/pull/1857))
+- Mute alerts for one agent from its row's menu in the Agents list (the ⋯, a right-click or the
+  context-menu key): the pane then raises no push (a browser's or the phone app's), in-app alert,
+  chime or tab notification on any device or browser of the server, while its status is still drawn. The choice is shared with the
+  other browsers like the pins, keyed by the PC and pane, and Unmute alerts tells only what
+  changes after it. A watching device sees the state and cannot change it.
+  ([#1848](https://github.com/devswha/ovis/pull/1848))
+- A running Claude Code subagent in the background-task list opens a read-only sheet with the
+  prompt it was given, what it has written and the tools it called so far, read from its own
+  transcript on request and bounded; Refresh reads it again. A background command, another
+  agent's task and a PC with an older bridge say so instead.
+  ([#1842](https://github.com/devswha/ovis/pull/1842))
+- A filter field above the sidebar's lists narrows the PC, workspace and agent rows to the ones whose
+  labels match what is typed (the command palette's fuzzy matcher), in their usual order with their
+  pins and folds; the selected pane's row and the rows over it stay, marked **Selected**. The query
+  is never saved: it is empty again after a clear, Escape, closing the phone's drawer or a reload.
+  ([#1851](https://github.com/devswha/ovis/pull/1851))
+- ovis.sh has a Beta page (https://ovis.sh/beta/, in English, Simplified Chinese, Japanese and
+  Korean) with two short steps for a tester: install Ovis on the computer, then join the iPhone
+  TestFlight beta or the Android Google Play closed test. Every page's footer links to it.
+  ([#1910](https://github.com/devswha/ovis/pull/1910))
+- On a phone, the terminal's key bar has a Paste key: it reads the clipboard from that tap alone
+  and puts the text into the input line at the caret, never into the grid, and drops a read that
+  answers after the line, its caret or a composition changed, or the pane, the mode or the
+  connection did. Beside Send, the input line has Insert: it types one line into the terminal
+  without Enter, so a path or a flag can be put at the prompt and edited there. The line clears
+  only once the PC confirms the terminal has the text; a refusal, a dropped connection or an
+  older PC keeps it with a note, and nothing is sent again on its own. Several lines are not
+  inserted: the line says to send them or insert them one at a time.
+  ([#1853](https://github.com/devswha/ovis/pull/1853))
+
+### Changed
+- A chat tool card names its files from the pane's folder, as the file browser does: in a pane on
+  `/work/app`, `/work/app/src/a.ts` reads `app/src/a.ts`. Its tooltip, the file it opens and a
+  copied label keep the whole path, and a file outside the folder still reads as written.
+  ([#1837](https://github.com/devswha/ovis/pull/1837))
+- Todo updates an agent makes one after another fold into one row in the chat's work block: the
+  current list with its progress, how many updates are still pending or failed, and every update
+  in order when opened. Narration or any other step between updates keeps them apart.
+  ([#1846](https://github.com/devswha/ovis/pull/1846))
+- The chat says a plan update succeeded only when the transcript records it: Claude Code's
+  results do; Codex and other agents record no outcome, so their latest list carries
+  "outcome not recorded" instead of a success claim.
+  ([#1846](https://github.com/devswha/ovis/pull/1846))
+- Ovis for Mac opens Ovis in its own window, like a native app, as soon as the server runs: no
+  more QR code and "Open in browser" first. The setup and the phone's QR code move to Ovis → Phone
+  Setup…, and show first only while Ovis is not installed or not running. File → Open in Browser
+  stays, links to other sites open in the default browser, and the window comes back to Ovis by
+  itself once the server runs again.
+  ([#1920](https://github.com/devswha/ovis/pull/1920))
+- On a Windows PC, the download button on ovis.sh now downloads `Ovis.exe` instead of copying the
+  PowerShell install command.
+  ([#1924](https://github.com/devswha/ovis/pull/1924))
+
+### Fixed
+- Turning alerts back on no longer lets a pending visibility retry remove this device's push
+  subscription.
+  ([#1871](https://github.com/devswha/ovis/pull/1871))
+- In the Android app with 3-button navigation, the message box and the terminal's key bar no
+  longer sit under the navigation buttons at the bottom of the screen (with a floating keyboard,
+  on Android System WebView 144 and later).
+  ([#1914](https://github.com/devswha/ovis/pull/1914))
+- A message sent from Chat while you were reading older turns now takes the chat back to its end
+  once the PC accepts it, and the reply is followed there. Scrolling, paging or jumping before the
+  message shows keeps the place you chose, and a message that was refused, queued or sent from
+  another browser never moves the chat.
+  ([#1831](https://github.com/devswha/ovis/pull/1831))
+- Chat stops following new output when the reader drags the scrollbar up a little after holding
+  it still, instead of only when the drag starts within half a second of the press.
+  ([#1902](https://github.com/devswha/ovis/pull/1902))
+- A pane running `claude attach` with options before `attach`, the start of the job's id or part
+  of its name also shows the background job's conversation, found the way Claude finds the job. A
+  job that cannot be told for certain keeps the terminal.
+  ([#1897](https://github.com/devswha/ovis/pull/1897))
+- Chat's command menu, and the terminal handoff of a command that needs the terminal, come back on
+  their own after the pane's command list failed to load (a dropped connection, a restarting
+  bridge), instead of staying empty until the pane is opened again.
+  ([#1893](https://github.com/devswha/ovis/pull/1893))
+- pi: `/name Release 1`, `/model <id>` and pi's other commands given an argument are no longer taken
+  for terminal screens.
+  ([#1893](https://github.com/devswha/ovis/pull/1893))
+- An omo pane is typed into as omo even when an omo-looking helper process is listed before the omo
+  that holds the session.
+  ([#1893](https://github.com/devswha/ovis/pull/1893))
+- OpenCode v2: the builtins both TUIs share are shown as verified on a v2 pane, as on v1.
+  ([#1893](https://github.com/devswha/ovis/pull/1893))
+- Claude Code: a bundled skill run by its slash command (`/code-review`, `/simplify`...), or a skill
+  of your own named like one, shows as skill activity.
+  ([#1893](https://github.com/devswha/ovis/pull/1893))
+- A connection diagnostics report whose body takes more than 10 seconds to arrive is cut off, so a
+  device sending one slowly can no longer hold every report slot and get other reports refused.
+  ([#1883](https://github.com/devswha/ovis/pull/1883))
+- Pasted and attached files no longer show up in the project's Git status: the default
+  `.ovis` folder now ignores itself, and its files still open by the path the prompt
+  names. An ignore file already in that folder, or an `OVIS_PASTE_DIR` folder, is left as is.
+  ([#1830](https://github.com/devswha/ovis/pull/1830))
+- A rendered HTML page, its own pictures, scripts and stylesheets, and the videos it plays from the
+  server, are read from the file that was checked, so a folder swapped on the way afterwards can
+  no longer put another file in their place. An HTML file that is a symlink takes its pictures,
+  scripts and stylesheets from the folder of the file it leads to.
+  ([#1892](https://github.com/devswha/ovis/pull/1892))
+- With Settings → Terminal → Follow herdr's focus on, a split this device opens itself (Split pane
+  right and open it) keeps the keyboard in the new pane and adds a Back entry, even when herdr's
+  focus moving there reaches this device before the split's answer. The setting's description now
+  says that a PC on Ovis older than 0.4.13 does not report herdr's focus.
+  ([#1887](https://github.com/devswha/ovis/pull/1887))
+- A message sent from the chat or the terminal's input line can no longer end its own bracketed paste
+  early: a paste marker pasted into it is dropped, and the bridge refuses a message whose text and
+  typed bytes disagree or that holds terminal control characters, before anything is typed or a
+  terminal draft is cleared. The draft stays with the reason.
+  ([#1840](https://github.com/devswha/ovis/pull/1840))
+- The phone app can recover damaged notification keys without reinstalling. Open each PC in the
+  app to refresh its push subscription; until then, its alerts may show only the fallback text.
+  ([#1880](https://github.com/devswha/ovis/pull/1880))
+- On Linux, a pi pane started with its own `PI_CODING_AGENT_DIR` draws its context ring against
+  the windows in that directory's model catalogs, not the ones in the server's. A pane whose
+  profile cannot be told (its environment cannot be read, and its session store is shared rather
+  than the one inside the server's own agent directory) draws no ring instead of the server's.
+  ([#1899](https://github.com/devswha/ovis/pull/1899))
+- A release installed in the app from 0.4.13 or older now gets its Rust PTY host too: the updater
+  of those versions builds a release without fetching it, so its terminals ran on Node, or were
+  mirrored on a PC without Node. The new release's supervisor fetches the host in the background
+  and checks it as an update does, and the next terminal runs on it.
+  ([#1913](https://github.com/devswha/ovis/pull/1913))
+- Dictation into the terminal in Safari (Mac, iPad and iPhone) types the corrected phrase once,
+  instead of losing it or typing every draft of it before the final one. A phrase dictated while
+  the pane is view-only is not typed later, and one dictated while the pane is not ready waits in
+  the held input until you send or discard it.
+  ([#1850](https://github.com/devswha/ovis/pull/1850))
+- With the key bar's Ctrl held, a Korean syllable still being typed in Safari is typed before the
+  chord or key-bar key, instead of being turned into the chord and lost.
+  ([#1850](https://github.com/devswha/ovis/pull/1850))
+- A touch swipe on a terminal no longer sends a leftover scroll step after a key, a disconnect, a
+  pane switch, the observe role or a released attach: each of them ends the swipe. A fast swipe's
+  scroll steps are spread over the next few frames, at most six per frame, instead of all at once,
+  and every step still arrives.
+  ([#1852](https://github.com/devswha/ovis/pull/1852))
+- A release's Ovis for Windows attach no longer fails: its swap marker is no longer an empty file, which
+  GitHub refuses to upload.
+  ([#1912](https://github.com/devswha/ovis/pull/1912))
+
+## [0.4.14] - 2026-10-25
+
+### Added
+- The Android app can take the PC's alerts as push notifications through Firebase Cloud
+  Messaging, once the app is built with a Firebase project: it registers with the push relay
+  per PC, decrypts each alert on the phone (the relay and Google cannot read it) and shows it.
+  Without Firebase set up, the app builds and runs as before.
+  ([#1744](https://github.com/devswha/ovis/pull/1744))
+- The phone app can get the PC's alerts as push notifications. Turning alerts on in the app
+  registers the phone with the push relay for that PC, and the PC sends it alerts as it sends them
+  to a browser. On iPhone the app decrypts each alert on the phone (the relay and Apple cannot read
+  it) and shows the PC's title and text, or "herdr needs you" when it cannot. The Android app does
+  the same once it is built with a Firebase project. Alerts reach the app once the relay at
+  `push.ovis.sh` is deployed.
+  ([#1817](https://github.com/devswha/ovis/pull/1817))
+- The diff viewer finds text in the file's loaded patch (Ctrl/Cmd+F or its Find button): added,
+  removed and unchanged lines, including context that is folded or scrolled out of view, with a
+  count and the match's line; it says that content outside the patch is not searched.
+  ([#1849](https://github.com/devswha/ovis/pull/1849))
+- Letta Code is offered in the agent picker for new workspaces, tabs and worktrees on a PC where
+  `letta` is installed. Its chat shows the terminal's text for now.
+  ([#1815](https://github.com/devswha/ovis/pull/1815))
+- Ovis for Mac can be downloaded from https://ovis.sh: every release attaches a signed and notarized
+  `Ovis.dmg`, so it opens without a Gatekeeper warning.
+  ([#1834](https://github.com/devswha/ovis/pull/1834))
+- Each release carries the Rust PTY host for Linux (x64, arm64) and macOS (universal) with a
+  SHA-256 manifest. Installing the plugin, an update installed from the app and `install.sh` put the
+  matching binary in `bin/ovis-pty-sidecar` after checking its checksum and that it runs, and the
+  server uses it when `OVIS_PTY_SIDECAR=rust` asks for the Rust host. Remote PC bundles carry it
+  too. (Later in this release, #1908 makes the Rust host the default; see Changed.)
+  ([#1859](https://github.com/devswha/ovis/pull/1859))
+- Ovis for Windows: download `Ovis.exe` from ovis.sh, click Install, and it sets up herdr, Bun and the
+  Ovis server for your user, starts herdr when you sign in to Windows, and shows the QR code for the
+  phone app, with no PowerShell or terminal. It asks before installing Git for Windows when that is
+  missing, and Remove leaves herdr and your agents running. Every release gets `Ovis.exe`, and an
+  `Ovis.msix` for the Microsoft Store once its identity is set.
+  ([#1873](https://github.com/devswha/ovis/pull/1873))
+
+### Changed
+- GJC chat and GJC done alerts read the active session reported by a native extension instead of
+  querying the SDK broker. Anyone upgrading must install it with
+  `bun scripts/install-gjc-integration.ts` and restart GJC: without it, chat uses Terminal and the
+  pane keeps herdr's own status, which may miss a done alert. Command menus use the filesystem
+  skill catalog.
+  ([#1542](https://github.com/devswha/ovis/pull/1542))
+- herdrweb.dev now forwards to https://ovis.sh/, the project's only website. The installers
+  (https://herdrweb.dev/install.sh, https://herdrweb.dev/install.ps1) and the demo
+  (https://herdrweb.dev/demo/) stay at their addresses.
+  ([#1658](https://github.com/devswha/ovis/pull/1658))
+- The connect screen warns before opening a plain http address outside a tailnet or home
+  network, as the pairing code would cross the internet unencrypted.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- The Mac app and ovis.sh call the program on your computer Ovis (the Ovis server) instead of herdr
+  web UI. ovis.sh no longer links to herdrweb.dev: its links go to the guide and the repository on
+  GitHub, and the setup answer shows the Windows command, `irm https://ovis.sh/install.ps1 | iex`.
+  ([#1663](https://github.com/devswha/ovis/pull/1663))
+- The herdr plugin is now `devswha.ovis`, installed from `devswha/ovis` on GitHub. Running the
+  one-line installer again moves an install under `devswha.herdr-web-ui`: it stops the old
+  plugin, installs the new one with the old one's settings and token, and removes the old id.
+  `herdr plugin update` does not move the id: an install it updates stays under
+  `devswha.herdr-web-ui` until the one-line installer runs again.
+  ([#1655](https://github.com/devswha/ovis/pull/1655))
+- Settings variables are now `OVIS_*` (`OVIS_TOKEN`, `OVIS_STATE_DIR`, ...; `OVIS_REF` for the
+  installer's ref). The old `HERDR_WEB_*` names still work, and the `OVIS_*` one wins where both
+  are set.
+  ([#1648](https://github.com/devswha/ovis/pull/1648))
+- The state dir moves from `~/.config/herdr-web-ui` to `~/.config/ovis` the first time the app
+  starts, leaving a link at the old path; sign-in cookies, browser storage, the offline cache and
+  pasted files (`<pane cwd>/.ovis`) use the Ovis name too. Browsers signed in before keep their
+  sign-in, paired devices stay paired, and settings and drafts carry over.
+  ([#1648](https://github.com/devswha/ovis/pull/1648))
+- ovis.sh's download button follows the visitor's platform: Download for Windows and Download for
+  Linux copy that platform's install command, and Get it on Android and Get it on iPhone show their
+  mark and say the app is coming soon. On a Mac, an unknown platform or without JavaScript it stays
+  Download for Mac. The labels read in every language of the site.
+  ([#1742](https://github.com/devswha/ovis/pull/1742))
+- The one-line installers and the demo are linked at ovis.sh (`curl -fsSL https://ovis.sh/install.sh | sh`,
+  `irm https://ovis.sh/install.ps1 | iex`, https://ovis.sh/demo/), which hands them on from
+  herdrweb.dev; the herdrweb.dev addresses keep working.
+  ([#1641](https://github.com/devswha/ovis/pull/1641))
+- In ovis.sh's day look, the sheep in the logo and the mascot has navy wool, so it stands out from
+  its pink face and the cream page. The night look and the app icon are unchanged.
+  ([#1742](https://github.com/devswha/ovis/pull/1742))
+- ovis.sh says what Ovis is in its title and description ("Ovis: Claude Code, Codex and every
+  herdr agent on your phone"), translated into Simplified Chinese, Japanese and Korean, and gives
+  search and answer engines structured data for the site, the app and its FAQ, an llms.txt, and
+  sitemap language pairs for the privacy and support pages. ovis.pages.dev and its preview
+  addresses stay out of search.
+  ([#1662](https://github.com/devswha/ovis/pull/1662))
+- ovis.sh's day/night button takes the other look's colors: navy with a cream moon by day, cream
+  with a navy sun at night, the sun now filled like the moon. The FAQ's + buttons take the same
+  colors. The sheep above the closing call to action stands on the page with no tile behind it.
+  ([#1752](https://github.com/devswha/ovis/pull/1752))
+- The web app's icon, favicon, notification badge and link preview are now the Ovis sheep the
+  phone and Mac apps and ovis.sh use. An installed app picks up the new icon with this update.
+  ([#1656](https://github.com/devswha/ovis/pull/1656))
+- The command palette finds settings by their own names: Interface font size, Enter sends, Send
+  queued messages automatically, New tab button, Show above the message box, the OpenAI API key and
+  the rest of their groups open Settings on that group, scrolled to it and focused, and Chat or
+  Terminal font size finds its page in Japanese and Chinese too.
+  ([#1835](https://github.com/devswha/ovis/pull/1835))
+- The chat's plan chip now says the step the agent is working on beside its `done/total`, cut
+  with an ellipsis where the row has no room for it and whole in the chip's tooltip and accessible
+  name, so a phone no longer has to open the plan to see it.
+  ([#1828](https://github.com/devswha/ovis/pull/1828))
+- Terminals on Linux and macOS run on the Rust PTY host by default, so Node is no longer needed:
+  the server checks the release's host once at startup and uses it, and a PC without Node attaches
+  its panes on it alone. The Node sidecar remains the fallback for one release, when the host is
+  missing or fails its check and the PC has Node 18 or newer; `OVIS_PTY_SIDECAR=node` asks for it.
+  The installer and the plugin's build no longer require Node, and `install.sh` installs Node 22
+  only when the host cannot be installed and there is no Node.
+  ([#1908](https://github.com/devswha/ovis/pull/1908))
+- The Rust PTY host can be turned on for real use on Linux and macOS: with `OVIS_PTY_SIDECAR=rust`,
+  the server checks the binary once before using it and stays on the Node sidecar when it is
+  missing, cannot run or cannot open a terminal, starts an attach on Node when the binary has gone
+  since, and uses Node until a restart after the host crashes. `~/` in `OVIS_PTY_SIDECAR_BIN` is
+  expanded, so the plugin's `env` file can name the binary. (Later in this release, #1908 makes the
+  Rust host the default; see above.)
+  ([#1829](https://github.com/devswha/ovis/pull/1829))
+
+### Fixed
+- Idle Antigravity conversations remain readable in Chat after the agent checkpoints its database
+  and removes the WAL side files, without recreating files in the agent's store.
+  ([#1727](https://github.com/devswha/ovis/pull/1727))
+- The Antigravity usage meter now appears on Linux when the CLI keeps its sign-in in the desktop
+  keyring.
+  ([#1776](https://github.com/devswha/ovis/pull/1776))
+- The phone app no longer opens a PC in the browser (Firefox, for one) when the address it opens
+  answers with a redirect to Ovis elsewhere: http to https, an IP address to the PC's name or
+  another port. That address becomes the PC and opens in the app. When the address redirects to
+  anything that is not Ovis, such as a sign-in page, the app shows its error page naming it
+  instead. Links to other sites still open in the browser.
+  ([#1903](https://github.com/devswha/ovis/pull/1903))
+- Copying a selection dragged through a code block in a chat reply no longer includes the block's
+  language label, its "Show all" toggle or its notes: the selection takes the code alone.
+  ([#1801](https://github.com/devswha/ovis/pull/1801))
+- Chat no longer types a message into a screen the agent has open in the terminal outside a
+  terminal peek (Codex's transcript search, Claude Code's /config): Send keeps it behind "A screen
+  is still open in the terminal", with Send anyway, until the agent's input row is back.
+  ([#1787](https://github.com/devswha/ovis/pull/1787))
+- A chat message is no longer sent to the pane's agent when the device that sent it is revoked, or
+  switches to watching, while the message is on its way to herdr; nothing is typed in its place.
+  ([#1792](https://github.com/devswha/ovis/pull/1792))
+- Chat keeps following new output after downward scrolling or clicking transcript text, while
+  upward scrolling and navigation keys stop following even when the transcript has no focused element.
+  ([#1734](https://github.com/devswha/ovis/pull/1734))
+- A pane running `claude attach <job>` shows the background job's conversation instead of its
+  terminal text, and work the job started before the attach is no longer shown as lost.
+  ([#1813](https://github.com/devswha/ovis/pull/1813))
+- A chat message whose device is revoked, or switches to watching, while Claude Code's restored copy of
+  the last message is being cleared now says why it was not sent, instead of a bare "was not sent".
+  ([#1798](https://github.com/devswha/ovis/pull/1798))
+- Earlier Claude sessions are listed from the store of the pane you open the list from
+  (`CLAUDE_CONFIG_DIR`), and Resume starts the session in that same store, so a second account's
+  session with the same id is neither listed nor opened by mistake. On Windows the pane's Claude is
+  found under its shell. If the new tab's shell picks another store (a startup file that exports
+  `CLAUDE_CONFIG_DIR`), the tab is closed and the list says so. When the store cannot be told, or
+  a new tab would not start in the same store, Resume is shown as unavailable instead of starting
+  the session in the default store. A remote PC shows Resume as unavailable until its bridge is
+  updated.
+  ([#1598](https://github.com/devswha/ovis/pull/1598))
+- A Claude Code pane on macOS that was started as `Claude` (capital C) shows the conversation
+  instead of terminal text.
+  ([#1521](https://github.com/devswha/ovis/pull/1521) by @jiaoew1991)
+- Command Code chat now resolves its reported session in the process's project when the shell
+  is in a different directory, including when herdr reports a helper's foreground directory.
+  ([#1745](https://github.com/devswha/ovis/pull/1745))
+- Native Codex skills on Linux use the first CODEX_HOME or HOME environment value, matching Codex.
+  CODEX_HOME must resolve to an existing directory, following symlinks before parent components as
+  Codex does. Relative paths use the Codex process's own directory; unresolved paths keep scanned skills.
+  ([#1750](https://github.com/devswha/ovis/pull/1750))
+- Codex Chat now finds a session resumed through the `codex resume` picker from another folder
+  when Codex shows the thread id in its terminal title: add `"thread-id"` to `[tui].terminal_title`
+  in `~/.codex/config.toml`. The title only offers that one conversation: the chat opens it once the
+  pane's screen shows one of its longer answers (64 or more letters and digits) that no other
+  conversation of the pane's folder also gave. An id that the pane's folder, or a stored
+  conversation's folder or name as Codex shows them in the title, also contains is not taken. With Codex's default
+  title, such a session still shows "Conversation unavailable", since nothing else ties the pane to it.
+  ([#1790](https://github.com/devswha/ovis/pull/1790))
+- Opening a finished chat now clears its DONE dot after several turns finished while away,
+  or when the previous finish was read in Terminal without a saved answer.
+  ([#1802](https://github.com/devswha/ovis/pull/1802))
+- In Safari with always-visible scrollbars, the message box no longer grows a line too early or
+  too late when a draft ends right where a line wraps: the hidden copy that measures it now gets
+  the same scrollbar.
+  ([#1826](https://github.com/devswha/ovis/pull/1826))
+- With Settings → Terminal → Follow herdr's focus on, herdr's focus moving to another pane no
+  longer takes this device's view while someone types into it, has a dialog open, or has an unsent
+  message on the pane (its chat draft, its terminal input line, or what the terminal held while it
+  was disconnected): the keyboard stays up, the dialog stays open and the draft stays in front. A
+  window in the background still follows.
+  ([#1803](https://github.com/devswha/ovis/pull/1803))
+- Chat no longer shows gjc's internal IRC deliveries between panes as notices when an older gjc
+  build wrote them without attribution. IRC records credited to the user still show.
+  ([#1794](https://github.com/devswha/ovis/pull/1794))
+- Grok Chat falls back to the terminal when a held session events file is replaced, rather than
+  letting a replacement file's timestamp confirm the wrong conversation.
+  ([#1733](https://github.com/devswha/ovis/pull/1733))
+- Grok chat falls back to the terminal, instead of showing an older conversation, when Grok holds
+  a session's events file under another name: renamed to `old-events.jsonl`, or in a session
+  folder renamed to a name the session filter skips.
+  ([#1894](https://github.com/devswha/ovis/pull/1894))
+- A command repeated from Chat (Hermes `/status`, say) shows its own result again after one send of it was lost on a
+  screen of identical result blocks, instead of every later repeat staying "Accepted" until "No result seen".
+  ([#1804](https://github.com/devswha/ovis/pull/1804))
+- A one-line message of more than 200 characters sent from the terminal's input line reaches the pane's
+  agent whole: it goes as the agent's prompt, pasted in the agent's own paste mode, where typing it left
+  Claude Code with only its tail. A shorter line, and any line to a pane whose agent is waiting for an
+  answer or that runs no agent, is still typed.
+  ([#1791](https://github.com/devswha/ovis/pull/1791))
+- The one-line installers (`install.sh`, `install.ps1`) work again while the latest release still
+  names the plugin `devswha.herdr-web-ui`: they install it under that id instead of failing with
+  "herdr does not list the plugin after installing it", and they leave an install under the old id
+  in place rather than stopping it for a move that release cannot make. The move to `devswha.ovis`
+  happens on the first run after a release that names the new id. Where raw.githubusercontent.com
+  is blocked, a release's version tells which id it uses.
+  ([#1691](https://github.com/devswha/ovis/pull/1691))
+- The iOS app shows which PC it is opening, with Change PC, instead of a blank black screen. A PC
+  that does not answer within 20 seconds gets Try again and Change PC there, and for a Tailscale
+  address a note that Tailscale may be off on the phone, instead of a wait of a minute or more.
+  ([#1860](https://github.com/devswha/ovis/pull/1860))
+- When a PC with a Tailscale address cannot be reached, the app's error page also says that
+  Tailscale may be off on the phone, next to Try again.
+  ([#1860](https://github.com/devswha/ovis/pull/1860))
+- On a phone, a key-bar tap (Enter, Esc, Ctrl and the rest) no longer brings the keyboard back up
+  after you put it away; only the keyboard key, or a tap on the line or the terminal, raises it.
+  ([#1632](https://github.com/devswha/ovis/pull/1632) by @adnankassem)
+- A link to the web app previews with the same Ovis sheep card as ovis.sh, and its image
+  description names the sheep instead of the old ram artwork.
+  ([#1718](https://github.com/devswha/ovis/pull/1718))
+- On a phone, a lone pane's banners (such as View only) now start below its menu button instead of
+  covering it.
+  ([#1784](https://github.com/devswha/ovis/pull/1784))
+- Ovis for Mac no longer stays on "Starting herdr…" after installing a release that installs the
+  plugin under its old id (0.4.13 and older): it finds that install and shows its status and QR
+  code. When the server does not come up within two minutes, it says so instead of waiting on,
+  and Try again repeats the step that failed.
+  ([#1832](https://github.com/devswha/ovis/pull/1832))
+- Restart and Start in Ovis for Mac start the server again instead of leaving it stopped: the
+  start no longer runs while the stop is still under way. Remove also waits for the server to stop
+  before it removes the plugin.
+  ([#1877](https://github.com/devswha/ovis/pull/1877))
+- The iOS app no longer keeps every page it left in memory: each Change PC used to leave the old
+  web view behind.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- The iOS app no longer shows a white screen while a page loads with the phone in light mode,
+  such as the seconds of a first launch.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- The Android app's launch screen and system bars are dark like the app instead of white, and
+  the bars take the color of the page's top bar, with icons that stand out on it.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- The app's error page says why a PC could not be opened on Android too, and shows up when a PC
+  answers with an HTTP error (such as a 502 while Ovis is stopped there) instead of keeping that
+  page and saving the PC. Its buttons also work on older Android WebViews.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- The Android app leaves its data out of backups and moves to a new phone, so a paired PC's
+  sign-in cannot be restored elsewhere.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- Debug builds of both apps no longer write pairing links to the device log. Release builds
+  already had this logging turned off.
+  ([#1697](https://github.com/devswha/ovis/pull/1697))
+- An omp Ask multiple-choice question keeps its card in Chat in a narrow pane, where omp clips the end of its
+  key hint (`⎋ cance…`).
+  ([#1814](https://github.com/devswha/ovis/pull/1814))
+- An omp Ask question keeps its card in Chat while omp shows its status row under the question panel
+  (omp 18.12 with `composer.shape: pi`).
+  ([#1812](https://github.com/devswha/ovis/pull/1812))
+- An omp pane whose sessions live outside `~/.omp/agent` shows its chat: the bridge finds the store
+  the pane's own omp process writes to, from its `--session-dir` or profile and the `HOME`,
+  `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR` or XDG data and state
+  directories it was started with, never from the bridge's own environment. A session herdr names
+  outside that store, a link out of it, another folder's session in a session directory of its own,
+  a session version omp does not write, an omp whose environment cannot be read and two omp
+  processes using different stores show no chat rather than a guess. Values omp reads from its own
+  `.env` files are not seen, and Windows keeps reading `~/.omp` and its profiles only.
+  ([#1898](https://github.com/devswha/ovis/pull/1898))
+- Queued `/model` commands in omp now open the session-only model picker, as immediate sends do,
+  including when an immediate send falls back to terminal input.
+  ([#1735](https://github.com/devswha/ovis/pull/1735))
+- Chat messages sent to an omp started with `--session-dir` now wait for its installed herdr
+  integration to report readiness, up to the startup timeout (30 seconds), before sending.
+  ([#1825](https://github.com/devswha/ovis/pull/1825))
+- A chat message with an `@skill` for OpenCode whose device is revoked, or switches to watching, before
+  anything is typed now says why it was not sent, instead of claiming that part of it was typed.
+  ([#1799](https://github.com/devswha/ovis/pull/1799))
+- ovis.sh/docs, /guide, /install, /changelog and /faq open the guide, the install steps, the
+  changelog and the FAQ instead of a missing page, and ovis.sh/ja/ and /zh/ open the home page in
+  Japanese and Chinese, like /ko/.
+  ([#1719](https://github.com/devswha/ovis/pull/1719))
+- On a phone with the keyboard up, the chat header's menu button no longer shows as six dots: a
+  lone pane's own menu button sat under the glass header's and now starts below it.
+  ([#1778](https://github.com/devswha/ovis/pull/1778))
+- An answer to a pi or OmO confirm or text input asked with a timeout is no longer refused as
+  stale when it is tapped after the countdown has ticked.
+  ([#1888](https://github.com/devswha/ovis/pull/1888))
+- Each plugin start keeps the run before it as `server.log.1` and begins a new `server.log`,
+  instead of appending every run to one file that grows forever. While the recorded server is
+  still running, the start appends to its log as before.
+  ([#1855](https://github.com/devswha/ovis/pull/1855))
+- A failed plugin start reads at most the last 64 KiB of what its server wrote to `server.log`
+  for the lines it prints, so a large log no longer costs memory. On Windows, the plugin's
+  wrapper still shows the last 15 lines of `server.log` itself.
+  ([#1855](https://github.com/devswha/ovis/pull/1855))
+- A plugin install that stops on a too-old Bun from Homebrew now says to run `brew upgrade bun`
+  instead of `bun upgrade`.
+  ([#1715](https://github.com/devswha/ovis/pull/1715))
+- Limit synchronous macOS process-start probes to one second so a stalled probe cannot block
+  conversation and pending-send checks indefinitely.
+  ([#1748](https://github.com/devswha/ovis/pull/1748))
+- A question card's "Not updated" notice counts failed reads of the screen across a restart of the
+  poll: a failed read, a refused answer and one more failed read now show it.
+  ([#1856](https://github.com/devswha/ovis/pull/1856))
+- An agent's open row menu now closes when its PC disconnects or its row disappears, and stays
+  closed if the PC or row returns. A brief reconnect keeps the sheet open with its row's details.
+  ([#1751](https://github.com/devswha/ovis/pull/1751))
+- Read finishes shared with other browsers now retry network and proxy errors with shared backoff,
+  and resume after signing in again through one authentication check for all pending finishes,
+  without resending on every sidebar update.
+  ([#1747](https://github.com/devswha/ovis/pull/1747))
+- A finish read on another device no longer turns unread again in a browser where another tab
+  removed its record while no sidebar was open: the read record is written back instead of
+  being skipped as already stored.
+  ([#1797](https://github.com/devswha/ovis/pull/1797))
+- A server run as a service now offers and starts OmO and Gajae Code when they are installed only on
+  its user's login-shell PATH (such as `~/.local/bin`), and starts the same executable it offered.
+  The login shell runs only when the agent list or a start needs it, at most once a minute, and
+  the server logs why when it gives no PATH.
+  ([#1597](https://github.com/devswha/ovis/pull/1597))
+- Keyboard shortcut changes now reach other already-open tabs of the same browser without a reload.
+  ([#1827](https://github.com/devswha/ovis/pull/1827))
+- Custom sidebar token rows are kept when herdr's config contains a byte-order mark at the start of
+  a later line. Oversized or non-regular config files are ignored without waiting on a pipe.
+  ([#1722](https://github.com/devswha/ovis/pull/1722))
+- Bound skill and custom-command discovery by directory entries and file reads as well as folder
+  visits, so linked folder lattices cannot repeatedly scan and read the same files without limit.
+  Claude and Devin now share those limits across all skill and command roots in one discovery.
+  Missing optional ignore files do not consume read allowances, and reaching the command read
+  limit preserves the completed visible rows.
+  ([#1746](https://github.com/devswha/ovis/pull/1746))
+- A message sent right after the page connects, before the PC says what it supports, is no longer typed into the
+  pane as raw input past the checks a send makes: it stays in the composer, marked not sent, to send again.
+  ([#1805](https://github.com/devswha/ovis/pull/1805))
+- A message not sent because the PC had not yet said what it supports now says so, instead of saying the
+  connection dropped.
+  ([#1808](https://github.com/devswha/ovis/pull/1808))
+- The desktop terminal follows herdr's `[ui] copy_on_select` on the PC serving Ovis, for local and
+  remote panes alike. With it off, letting go of a drag only selects, the selection stays when the
+  pointer moves over the terminal, and Ctrl+C or Copy copies it; with it on (herdr's default),
+  letting go copies as before. A Ctrl+C or Copy made before herdr has sent the text of a drag
+  still copies that whole text, not only the rows on screen.
+  ([#1810](https://github.com/devswha/ovis/pull/1810))
+- On a phone the terminal input line and the key bar are evenly spaced: the field and its send
+  button no longer sit on the key bar's edge, and the keys no longer touch the bottom of the screen;
+  every key keeps a 44px touch target.
+  ([#1527](https://github.com/devswha/ovis/pull/1527) by @adnankassem)
+- The terminal's input line and grid now ask an Android keyboard for no word suggestions: they say
+  `autocomplete="off"`, which Chrome turns into the keyboard's no-suggestions flag, and a keyboard
+  that honors it hides its suggestion strip there. Gboard 18.4 ignores it and keeps the strip. The
+  chat composer keeps its suggestions.
+  ([#1530](https://github.com/devswha/ovis/pull/1530) by @adnankassem)
+- A long voice-typing or IME composition in Direct typing no longer scrolls the terminal sideways,
+  on a phone or a computer: the grid stays in place, and the composition stays inside the visible
+  terminal.
+  ([#1800](https://github.com/devswha/ovis/pull/1800))
+- A line typed from the terminal's input line, or a chat message typed into a pane without an agent,
+  is no longer typed or entered when the device that sent it is revoked, or switches to watching, while
+  it is on its way to herdr.
+  ([#1796](https://github.com/devswha/ovis/pull/1796))
+- Updating in the app from 0.4.13 starts the new release's own supervisor instead of falling back to
+  0.4.13's with an "updated supervisor failed to start" notice: while the launcher from before the
+  rename runs, the state stays in `~/.config/herdr-web-ui`, where that launcher finds the installed
+  release, and moves to `~/.config/ovis` once the app starts from an updated checkout or plugin.
+  ([#1723](https://github.com/devswha/ovis/pull/1723))
+- Starting Ovis on Windows with Bun installed through npm no longer opens its PowerShell shim
+  in Notepad and hangs. Plugin commands use a runnable Bun application and report when none is found.
+  ([#1721](https://github.com/devswha/ovis/pull/1721))
+
+### Maintenance
+- The iOS app is ready for its first App Store submission: it carries a privacy manifest (no
+  tracking; the PC's anonymous usage counts declared for analytics), asks for arm64 instead of the long-gone armv7, and
+  `app/store/ios.md` lists the App Store Connect steps, listing text, privacy and age answers and
+  review notes, with iPhone and iPad screenshots beside it.
+  ([#1737](https://github.com/devswha/ovis/pull/1737))
+- A self-hosted CI runner host can raise its own herdr-backed slots, integration shards and browser
+  and unit workers with `run.sh --env-file` (`CHECK_HOST_*`), so a large host shards wider while
+  other hosts keep `ci.yml`'s values.
+  ([#1839](https://github.com/devswha/ovis/pull/1839))
+- Pushes to main can run their Linux CI jobs on self-hosted runners of their own (`run.sh
+  --reserved` and the `CI_MAIN_SELF_HOSTED_LABELS` repository variable), so a merge's CI no longer
+  queues behind pull request runs.
+  ([#1906](https://github.com/devswha/ovis/pull/1906))
+- Remote PC settings recovery logs now distinguish filesystem error codes from invalid JSON
+  without exposing settings content or raw error messages.
+  ([#1731](https://github.com/devswha/ovis/pull/1731))
+- The package, source comments and test fixtures now use the Ovis name; the isolated test herdr
+  session is `ovis-test` and the README media session is `ovis-demo`.
+  ([#1579](https://github.com/devswha/ovis/pull/1579))
+- The Android app's Google Play closed test is ready to set up: `app/store/android.md` holds the
+  upload key steps, the release build, the store listing and App content answers and the Play
+  Console steps, with the icon, feature graphic and screenshots beside it.
+  ([#1736](https://github.com/devswha/ovis/pull/1736))
+- The push relay drops an Android phone's endpoints when FCM calls its token invalid, as it already
+  did for an iPhone's token Apple calls invalid, and `push-relay/test-push.ts` checks a real push
+  through FCM too. The relay's tests run in Fast checks instead of a workflow of their own.
+  ([#1816](https://github.com/devswha/ovis/pull/1816))
+- The phone app's push relay, a Cloudflare Worker for `push.ovis.sh`, is in `push-relay/` with its
+  tests: it forwards the PC's end-to-end encrypted alerts to Apple's push service (iOS) or
+  Firebase Cloud Messaging (Android) without being able to read them, pins each endpoint to the
+  key of the PC it was registered for, rate-limits every endpoint, every phone and every
+  registering address, and deletes endpoints unused for 60 days. It is not deployed yet.
+  ([#1695](https://github.com/devswha/ovis/pull/1695))
+- CI builds the Rust PTY host and runs its checks and the PTY session checks on it in a job of
+  its own.
+  ([#1829](https://github.com/devswha/ovis/pull/1829))
+- The **Rust PTY host binaries** workflow builds the host for each platform, runs `cargo test`, and
+  on Linux runs the PTY session checks on the built binary; Release attaches its output before it
+  publishes.
+  ([#1859](https://github.com/devswha/ovis/pull/1859))
+- An experimental Rust PTY host (`crates/pty-sidecar`) speaks the Node sidecar's protocol; the
+  server first ran it in place of the Node sidecar only with `OVIS_PTY_SIDECAR=rust` and a built
+  binary; by this release it is the default (see Changed).
+  ([#1785](https://github.com/devswha/ovis/pull/1785))
+
+## [0.4.13] - 2026-10-22
+
+### Added
+- Claude Code, grok and Antigravity messages in Chat offer Rewind in terminal: it sends nothing,
+  preserves your draft and opens the pane's terminal with a hint to run the agent's own `/rewind`.
+  Chat follows the native conversation when the agent records its new branch.
+  ([#1500](https://github.com/devswha/herdr-web-ui/pull/1500))
+- Chat sends wait while Claude Code's rewind dialog is open in the terminal, so a message cannot
+  land in the dialog's own text field.
+  ([#1500](https://github.com/devswha/herdr-web-ui/pull/1500))
+- Sending a bare `/goal` to Claude Code from Chat now shows its goal status (the condition and how
+  long it has run, or that no goal is set) in a card with Close, instead of leaving the dialog in
+  the terminal.
+  ([#1450](https://github.com/devswha/herdr-web-ui/pull/1450))
+- Command Code (`cmd`) agent panes now show their conversation in the web UI: transcript
+  resolution from `~/.commandcode/projects/`, `/tree` branch projection, model and context
+  window from Command Code's catalog, permission prompts, and skill discovery.
+  ([#1399](https://github.com/devswha/herdr-web-ui/pull/1399) by @diegolhambi)
+- An ordinary command sent from Chat says what became of it under its bubble, from evidence only:
+  accepted, waiting for your answer (with a way to the card), done with what showed it, runs in
+  the terminal (with Open Terminal), or no result seen. A command the agent keeps no transcript
+  turn for still shows its sent row. A terminal screen that
+  changed after the send folds under the chip as an unconfirmed preview, never proof that the
+  command finished. Terminal-only commands instead leave one quiet row with Ran in terminal and
+  Open Terminal, without outcome chips or unconfirmed previews. Hermes informational result cards
+  keep showing what the agent printed.
+  ([#1450](https://github.com/devswha/herdr-web-ui/pull/1450))
+- Settings → Terminal → Follow herdr's focus: when herdr moves to another pane (a click in its
+  window, `herdr tab focus`, a script), this device opens that pane too. Off by default, and set per
+  device, so a phone open on another pane stays there.
+  ([#1432](https://github.com/devswha/herdr-web-ui/pull/1432))
+- Hermes `/help`, `/status`, `/version`, `/profile` and `/reload-skills` sent from Chat show what
+  Hermes printed in a card closed with Dismiss, which sends nothing to the pane.
+  ([#1450](https://github.com/devswha/herdr-web-ui/pull/1450))
+- Chat lists the commands and skills an OpenCode v2 pane's own background service reports for its
+  folder, refreshed when they change, and settles a command it sent from that session's own events.
+  The service is only read, never started, and only when it is the process its service.json names.
+  ([#1489](https://github.com/devswha/herdr-web-ui/pull/1489))
+- An `@skill` sent from Chat to OpenCode v2, at once or queued, is typed through OpenCode's own
+  autocomplete so the skill is attached; when the row does not show, the message says the skill
+  went as plain text and points to the terminal.
+  ([#1489](https://github.com/devswha/herdr-web-ui/pull/1489))
+- An OpenCode 1.x question is a card in Chat with each option and its description, answered from
+  the card.
+  ([#1489](https://github.com/devswha/herdr-web-ui/pull/1489))
+- Chat lists a Codex pane's skills as the running Codex daemon of that pane's own Codex home reports
+  them (Codex 0.157 or later; on Linux, or when the server's Codex home is set), and a gjc pane's
+  skills as the SDK broker it is bound to reports them, asked through the gjc CLI in the background.
+  The daemon and the broker are never started for this; without one, the skills read from disk stay.
+  ([#1489](https://github.com/devswha/herdr-web-ui/pull/1489))
+- New workspace and New tab start an agent with its model, effort and first message where the
+  agent's command line takes them (Claude Code and Codex: `--model` and the effort level; Codex also
+  takes the message as its own argument, behind `--` so a message like `logout` is never a command).
+  For Claude Code and every other agent the message is queued on the PC as the pane's first pending
+  message and sent once when the agent is ready, through the page that started it; it shows as a
+  pending message that can be discarded or sent now. If that page disconnects, reloads or leaves the tab
+  first, the message is held, never sent on its own, until someone sends it now or discards it. A message the PC
+  could not queue, or one an older PC ignores, stays in the new tab's message box and the dialog says
+  so. Pending first messages are kept in memory: restarting the web UI's server drops them. A Codex
+  message with a tab or a line break is sent as the first message rather than on its command line,
+  and the PC refuses launch arguments with control characters, an unknown effort level or a model
+  that is not one word. Under the message, the agent's skills in the
+  folder are listed before it runs, each a chip that puts the skill as the agent types it into the
+  message (`$name`, `/name`, or `@name` for OpenCode 2). A first message to OpenCode attaches its
+  `@skill` as any Chat send does; before OpenCode has a session nothing tells its version, so the `@`
+  is sent as the plain text it is.
+  In a desktop window the chat's composer can show a New tab with an agent… button that opens the
+  dialog on the pane's workspace; it is off until turned on in Settings → Chat → Composer (New tab
+  button), and the tab menu opens the dialog either way.
+  ([#1512](https://github.com/devswha/herdr-web-ui/pull/1512))
+- omp's `/handoff` runs from Chat, with or without focus instructions: while omp writes the
+  handoff document, Chat shows a card that cancels it, and afterwards Chat stays on the same
+  conversation, which omp compacts in place.
+  ([#1450](https://github.com/devswha/herdr-web-ui/pull/1450))
+- omp's model picker shows in the chat as a card, as Claude Code's, Codex's and OmO's lists do: pick
+  a model and it is picked for the session, the model in use named on the card. `/model` sent from
+  an omp chat opens it: the chat sends it as `/switch`, because omp's own `/model` opens its role
+  hub, whose picks are saved as the default for later sessions.
+  ([#1377](https://github.com/devswha/herdr-web-ui/pull/1377) by @evanwy0223)
+- OpenCode 2.0 or later: its questions are answered from the chat's prompt card through OpenCode's
+  own background service instead of keystrokes, one question at a time with Back to change an earlier
+  answer, and sent together after the last. Permissions, OpenCode 1 and other prompts keep the
+  existing generic fallback card and Terminal.
+  ([#1257](https://github.com/devswha/herdr-web-ui/pull/1257) by @bardiz12)
+- HTTP requests and WebSocket handshakes now carry request IDs and write bounded completion
+  records in the app's state directory, so the owner can correlate a response with its request.
+  ([#1558](https://github.com/devswha/herdr-web-ui/pull/1558))
+- A workspace's row menu has Earlier sessions…: the sessions each agent kept for the workspace's
+  folder, read from the agent's own store on the PC, newest first with the title, the first prompt
+  and the time. Resume starts the agent on that session in a new tab of the workspace; a session a
+  pane already shows is opened by selecting that pane instead. Picking `/resume` in the chat's menu
+  opens the same list, and the terminal command's row offers it. A PC whose bridge cannot list
+  sessions yet has no such item.
+  ([#1494](https://github.com/devswha/herdr-web-ui/pull/1494))
+- Agent rows show what herdr plugins report on a pane, such as the Quota plugin's usage left or a
+  task's progress, in a small dim line under the row. They follow the `$name` tokens of your herdr
+  `[ui.sidebar.agents]` rows (every token where none are set), change live, and say a long value
+  whole in the tooltip and in a phone's ⋯ sheet. A line a plugin reports for the agent now updates
+  as soon as herdr says it.
+  ([#1341](https://github.com/devswha/herdr-web-ui/pull/1341))
+- `HERDR_WEB_TAILSCALE_HTTPS_PORT` names the HTTPS port the installer publishes the app on with
+  `tailscale serve`, so 443 can stay free for something else. Settings → Phone & devices suggests
+  that port too. When another service already uses it, the installer stops and says so instead of
+  taking another port, which would move the address an installed app opens.
+  ([#1433](https://github.com/devswha/herdr-web-ui/pull/1433))
+
+### Changed
+- The chat's `/` menu lists the commands that run in the terminal apart, last, under Terminal
+  commands, each with a Terminal badge, as the PC's command catalog describes them. Pick or type
+  one and send it normally: once accepted, the pane's own terminal opens over the chat, in this
+  browser only, while the chat stays where you were reading and the pane stays on Chat. A head
+  says what ran, with Back to Chat and Keep Terminal; the header's Chat, Ctrl/Cmd+Shift+J and a
+  phone's Back return too, and Escape goes to the agent. On a desktop the message box stays under
+  the terminal, dimmed; on a phone the key bar takes its place. Claude Code's panels (`/config`,
+  `/permissions`, `/theme` and the like) can bring the chat back by themselves when you close them,
+  once Claude records it; other agents' recorded screens do once their input row is back, and the
+  rest return by hand. A Ran in terminal row's
+  Open Terminal shows the terminal over the chat again. Busy commands stay queued; only an
+  explicit Send now opens the terminal, never automatic delivery. Refused sends keep their draft
+  and note. Watch-only devices never send or open it, and /resume still opens Earlier sessions.
+  Commands the agent's own menu hides are not listed, but still go when typed by hand.
+  ([#1441](https://github.com/devswha/herdr-web-ui/pull/1441))
+- For an OpenCode pane whose skills are `@` attachments, the `@` menu lists them under Skills
+  before the files, and picking one inserts the skill's id.
+  ([#1441](https://github.com/devswha/herdr-web-ui/pull/1441))
+- Growing OMP and Claude Code tasks now parse appended transcript records incrementally, reducing
+  repeated work when long chats refresh while preserving tool results, notices and history resets.
+  Live parser state shares Codex's bounded cache; earlier responses stay unchanged as new records arrive.
+  ([#1561](https://github.com/devswha/herdr-web-ui/pull/1561) by @Yoonwoo-Ha)
+- The app is now called Ovis across the browser, install messages and documentation, matching
+  the phone apps. Existing installs, settings, plugin identifiers and update channels stay the same.
+  ([#1454](https://github.com/devswha/herdr-web-ui/pull/1454))
+- A question card whose screen reads keep failing now says it may be out of date ("Not updated: the
+  question on screen may have changed.") until a read answers again. Answering stays safe: the
+  server reads the screen again first and refuses a changed question (#1335).
+  ([#1360](https://github.com/devswha/herdr-web-ui/pull/1360) by @Noobear)
+- The Earlier sessions dialog picks the agent from the same list as the New tab and New worktree
+  dialogs, each agent with its icon and the chevron spaced as the app's other controls, instead of
+  a plain select whose arrow sat at the far edge.
+  ([#1573](https://github.com/devswha/herdr-web-ui/pull/1573))
+- A finished agent opened in one browser is read in every browser of the same server: opening it
+  on the phone clears its DONE dot on the desktop too, and the other way around.
+  ([#1463](https://github.com/devswha/herdr-web-ui/pull/1463))
+- Remove PC has a restrained red background and border before and after its confirmation step,
+  retaining visible keyboard focus and the explicit second click to remove the registration.
+  ([#1394](https://github.com/devswha/herdr-web-ui/pull/1394) by @snowykr)
+- After a terminal command sent from Chat, Codex, omp, pi, gjc, OmO, Hermes (classic CLI), Devin,
+  agy and Grok bring the chat back by themselves when you close the picker or panel it opened,
+  once the agent's own empty input row is back on the screen. Only the commands each agent was
+  recorded doing that for count (Codex's `/permissions`, omp's `/settings`, Grok's `/resume` and
+  the like); print forms, toggles, editor handoffs, Codex's `/side` and `/btw`, OpenCode and
+  anything unrecorded still return by hand.
+  ([#1637](https://github.com/devswha/herdr-web-ui/pull/1637))
+
+### Fixed
+- The New session and History pickers show Hermes, Grok, Antigravity, Devin and Command Code by
+  their own names instead of their lowercase ids.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- The terminal attach process and its Node host no longer inherit the server's `HERDR_WEB_TOKEN`
+  environment variable; they keep the socket path and the rest of their environment.
+  ([#1562](https://github.com/devswha/herdr-web-ui/pull/1562))
+- Choosing Jump to latest remembers bottom-follow before the virtual list scroll completes.
+  Switching to Terminal immediately after that choice and returning to Chat no longer restores
+  the older reading position. This fixes explicit Jump-to-latest intent, not arbitrary upward
+  restoration on long, active or reasoning-heavy tabs.
+  ([#1346](https://github.com/devswha/herdr-web-ui/pull/1346) by @Yoonwoo-Ha)
+- Remember bottom-follow without measuring rendered rows or looking up a turn anchor; readers away
+  from the end retain the existing paragraph-and-offset restoration.
+  ([#1346](https://github.com/devswha/herdr-web-ui/pull/1346) by @Yoonwoo-Ha)
+- Selecting and copying chat text now preserves the text as shown instead of adding Markdown
+  syntax. Rich-text paste and the whole-answer MD and TXT copy actions remain available.
+  ([#1409](https://github.com/devswha/herdr-web-ui/pull/1409))
+- Chat no longer treats a command that leaves the agent waiting in a screen Chat cannot show as an
+  ordinary send. Claude Code's `/usage`, `/cost`, `/status`, `/help`, `/memory`, `/mcp` and
+  `/add-dir`, Codex's `/new` and `/fork` in a repository, `/cd`, `/usage`, `/copy` and `/side`,
+  and the panels, pickers, confirmations and editors of omp, gjc, OmO, Hermes, Devin,
+  Antigravity, OpenCode and Command Code are now Terminal commands: sent, they open Terminal with
+  Back to Chat. A value typed with a picker command, such as `/fast off` or `/export notes.md`,
+  stays an ordinary send.
+  ([#1596](https://github.com/devswha/herdr-web-ui/pull/1596))
+- A Claude Code skill or custom command named like a built-in command (`/compact`, say) is listed
+  once in the composer's command menu, as the skill Claude runs, instead of beside the built-in.
+  ([#1441](https://github.com/devswha/herdr-web-ui/pull/1441))
+- Reconnects and unconfirmed sends can leave a bounded browser-side diagnostic trail on this
+  server, without recording messages, credentials, addresses or terminal output.
+  ([#1357](https://github.com/devswha/herdr-web-ui/pull/1357) by @christi4nity)
+- The chat and the session history now apply one rule to Codex rollouts: a subagent's rollout (one
+  naming a parent thread or an agent role), an exec run's, or one whose ids are null or contradict
+  its file name is no longer read as a pane's conversation or offered to resume, while older
+  rollouts without those fields still are. A rollout whose first line is longer than the chat or
+  the history reads is left out instead of read unchecked.
+  ([#1592](https://github.com/devswha/herdr-web-ui/pull/1592))
+- Two Codex panes in one folder whose answers are short each show their own chat again with Codex
+  0.163, which starts a thread in the same second as its process; before, both said the
+  conversation was unavailable about as often as not.
+  ([#1522](https://github.com/devswha/herdr-web-ui/pull/1522) by @jiaoew1991)
+- A Codex pane with only short answers still finds its chat after another pane in the same folder
+  runs `/new`: a thread that pane shows a long answer of under its first prompt, is bound to, or
+  that herdr reports for it no longer leaves this pane unsure.
+  ([#1522](https://github.com/devswha/herdr-web-ui/pull/1522) by @jiaoew1991)
+- Of two Codex panes in one folder with short answers, the one started first finds its chat too
+  once the other shows its own first exchange, where it said the conversation was unavailable.
+  ([#1522](https://github.com/devswha/herdr-web-ui/pull/1522) by @jiaoew1991)
+- On a phone, a composer notice's actions (such as the `/resume` notice's Earlier sessions, Open
+  Terminal and Run in Terminal) wrap onto their own line, and its dismiss button stays visible
+  instead of being cut off at the edge.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- Wrapped and multiline message drafts are sized with an out-of-flow measurement field instead of
+  collapsing the live input, preserving transcript spacing and the paragraph being read (#1337).
+  ([#1347](https://github.com/devswha/herdr-web-ui/pull/1347) by @Yoonwoo-Ha)
+- The measurement field shares the live input's Korean, Japanese and Chinese line-breaking rules,
+  including Korean placeholder wrapping, so localized drafts keep their natural height.
+  ([#1347](https://github.com/devswha/herdr-web-ui/pull/1347) by @Yoonwoo-Ha)
+- Local Herdr timeouts, machine connection failures and recoveries, and abnormal WebSocket closes
+  now leave timestamped, rate-limited diagnostic records without logging input or credentials.
+  ([#1356](https://github.com/devswha/herdr-web-ui/pull/1356) by @christi4nity)
+- The browser connection trace no longer re-posts a batch the server refuses with a 4xx status,
+  resumes reporting after you sign in again on the same page, and malformed reports can no longer
+  use up the server's shared report quota.
+  ([#1423](https://github.com/devswha/herdr-web-ui/pull/1423))
+- Pairing a device, renaming or revoking one, and the web push key and subscriptions are now
+  flushed to disk before they replace the previous file, so a crash or power cut right after the
+  change is much less likely to bring back a revoked device or make every phone subscribe to
+  alerts again. How much survives a power cut still depends on the disk and filesystem honouring
+  the flush; on Windows the folder itself is not flushed.
+  ([#1568](https://github.com/devswha/herdr-web-ui/pull/1568))
+- File search and path lookup no longer run a repository's fsmonitor hook, follow Git variables
+  the server was started with, or wait on a Git listing that never ends: a listing past 16 MiB
+  or 3 seconds, or one cut off mid-name, falls back to the folder walk.
+  ([#1570](https://github.com/devswha/herdr-web-ui/pull/1570))
+- **Files → Changes** no longer runs a program named `false` found on `PATH` with Git 2.35 or
+  older, and reads the repository asked about even when the server was started with
+  `GIT_COMMON_DIR` set.
+  ([#1570](https://github.com/devswha/herdr-web-ui/pull/1570))
+- Keep sidebar status updates responsive after many completed turns by caching read finishes and
+  bounding their in-memory history instead of repeatedly scanning browser storage.
+  ([#1536](https://github.com/devswha/herdr-web-ui/pull/1536))
+- A first message from New workspace or New tab no longer waits forever when the agent started for
+  it quits before the message goes: it is held for Send now or Discard. The same happens when an
+  agent of the same kind that the user starts later comes up instead, and when the page that sent it
+  leaves the pane while it is being typed, so the pane's other queued messages are not stuck behind it.
+  On native Windows the PC sees only the pane's shell, so it cannot tell that the agent quit: there the
+  message keeps waiting until you discard it.
+  ([#1532](https://github.com/devswha/herdr-web-ui/pull/1532))
+- GJC Chat hides internal agent-to-agent IRC messages and automatic replies, while keeping user
+  messages that quote them visible.
+  ([#1535](https://github.com/devswha/herdr-web-ui/pull/1535))
+- GJC questions using the Nerd Font selection cursor now show their actual choices in chat
+  instead of only Up, Down, Enter and Esc controls. Moving the cursor preserves the question's
+  identity and uses the current selection when answering.
+  ([#1553](https://github.com/devswha/herdr-web-ui/pull/1553) by @Kinetic27)
+- GJC chats on a busy machine give cold session lookups up to five seconds per command and
+  ten seconds overall instead of timing out after two seconds per command. Session snapshots
+  retain the shorter status lookup budget; failed status lookups
+  are held for 30 seconds without preventing chat reads from retrying.
+  ([#1364](https://github.com/devswha/herdr-web-ui/pull/1364) by @sskys18)
+- GJC chat and status reuse their verified session binding when other sessions write heartbeats,
+  instead of restarting the SDK lookup for every pane. Session changes still require SDK validation.
+  ([#1343](https://github.com/devswha/herdr-web-ui/pull/1343))
+- Grok keeps Chat with older sessions open and uses Terminal when the session is uncertain.
+  ([#1352](https://github.com/devswha/herdr-web-ui/pull/1352) by @infowolfe)
+- One failed health check no longer shows herdr offline or switches a Windows PC's panes to the
+  terminal lens: the header says Status unknown with the last herdr it saw, and herdr unavailable only
+  after a second failure in a row.
+  ([#1581](https://github.com/devswha/herdr-web-ui/pull/1581))
+- A malformed, oversized or misaddressed answer from herdr now fails only the request it answers,
+  with a clear error, instead of hanging until the timeout, growing the server's memory or being
+  taken as another request's answer; event subscriptions report such a frame and close.
+  ([#1584](https://github.com/devswha/herdr-web-ui/pull/1584))
+- Hermes `/status` sent from Chat now shows its result card on the first send in a new pane too, even
+  when the computer is busy. A send whose result was missed no longer leaves every later `/status` in
+  that pane without a card for ten minutes. The same holds when another device has the terminal
+  scrolled up.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- Sending Hermes `/status` (or another informational command) from Chat again now shows that send's
+  own result card each time, instead of "Runs in the terminal" once earlier identical results fill
+  the terminal.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- Slow API requests can return their result or timeout error instead of losing the HTTP connection
+  while bounded Herdr calls are still running.
+  ([#1355](https://github.com/devswha/herdr-web-ui/pull/1355) by @christi4nity)
+- The app can be installed behind a reverse proxy that signs in every request (Authelia,
+  oauth2-proxy and the like): the browser now sends its cookies with the manifest request.
+  ([#1332](https://github.com/devswha/herdr-web-ui/pull/1332) by @ascandroli)
+- Mouse wheel and phone swipes scroll terminal history on Windows and other mirrored panes;
+  read-only connections still only pan their local grid.
+  ([#1446](https://github.com/devswha/herdr-web-ui/pull/1446) by @Davesaggio)
+- A Codex started in a terminal shows its model and reasoning level before the first message,
+  from Codex's live footer, while the chat shows the terminal output.
+  ([#1374](https://github.com/devswha/herdr-web-ui/pull/1374) by @evanwy0223)
+- Before the first message, a model switched in the terminal shows in the message box once the
+  supported agent draws it. omp still waits for its transcript to record the model; the bridge
+  never runs `omp models`, which can refresh the CLI's OAuth credentials.
+  ([#1374](https://github.com/devswha/herdr-web-ui/pull/1374) by @evanwy0223)
+- A pane that runs OmO is now treated as OmO by the composer even while herdr labels it Claude
+  (OmO's Claude child is running): sending a message no longer stops on a Claude input-box draft
+  refusal or tries to clear a Claude draft there.
+  ([#1441](https://github.com/devswha/herdr-web-ui/pull/1441))
+- A multi-line message sent to an OmO pane that herdr has no agent label for is now pasted as one
+  bracketed paste instead of line by line, so its first line is no longer sent alone.
+  ([#1441](https://github.com/devswha/herdr-web-ui/pull/1441))
+- An OmO pick list (an extension's select, such as the init-deep advisor's "Run now / Skip this
+  time / Never…") shows in the chat as a card with its own options again, instead of a "Waiting for
+  input" card offering only ↑, ↓, Enter and Esc. A pick list that counts down in its title keeps
+  the same card while it ticks, so an answer tapped a second later is not refused as stale.
+  ([#1495](https://github.com/devswha/herdr-web-ui/pull/1495) by @nahwan-kim)
+- An omp pane started with an absolute `--cwd` shows its chat when herdr names no session file
+  and the directory herdr reports is not omp's own, such as the shell's or a symlink's real path:
+  the session is still looked up in the directory herdr reports first, then under that `--cwd`.
+  ([#1594](https://github.com/devswha/herdr-web-ui/pull/1594))
+- A message or command sent from the chat to an omp that is still starting no longer stays typed
+  in its input box: omp shows the box before it takes an Enter, so the send waits until herdr's omp
+  integration reports the session (omp does so once it takes input), for an omp started moments ago.
+  ([#1475](https://github.com/devswha/herdr-web-ui/pull/1475))
+- A new OpenCode 2 pane offers your project and user skills as `@` attachments before its first
+  session starts, using the OpenCode version the PC's install reports, instead of listing them as
+  OpenCode 1 `/` commands. Once the pane has a session, that session's version decides as before.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- Native question answers stay bound to the current pane, session and form. Local service discovery
+  rejects stale or non-loopback endpoints, bypasses environment proxies, and bounds slow requests.
+  ([#1257](https://github.com/devswha/herdr-web-ui/pull/1257) by @bardiz12)
+- Polling does not invalidate an unchanged question or turn an acknowledged answer into an error.
+  A temporary service outage keeps an already displayed native card and its unsent edits.
+  ([#1257](https://github.com/devswha/herdr-web-ui/pull/1257) by @bardiz12)
+- Back and question tabs preserve unsent edits, and multiselect submissions include both checks
+  and custom text. Abandoned drafts are bounded and expire after 30 minutes.
+  ([#1257](https://github.com/devswha/herdr-web-ui/pull/1257) by @bardiz12)
+- OpenCode question cards keep edits and allow immediate retries after a failed reply, and optional
+  questions can be skipped. Unrelated service metadata no longer resets a form's progress.
+  ([#1421](https://github.com/devswha/herdr-web-ui/pull/1421))
+- Answers sent from the message box show the translated warning when OpenCode has not confirmed
+  delivery. Native service connections accept only the loopback addresses 127.0.0.1 and [::1].
+  ([#1421](https://github.com/devswha/herdr-web-ui/pull/1421))
+- Subscription usage reads OpenCode 2's own credential store before the `auth.json` OpenCode 1
+  wrote. OpenCode 2 keeps its provider sign-ins in `opencode.db` and leaves that file standing with
+  the key it has since replaced, so the OpenCode card reported "Sign-in expired" for a CLI that was
+  signed in and working. The store's active key answers first, and a store without one (signed out of
+  OpenCode 2) shows no card; the file still answers beside OpenCode 1's store, or with none.
+  ([#1329](https://github.com/devswha/herdr-web-ui/pull/1329) by @krish-kant)
+- `GET /api/pane/read` takes `lines` only as plain decimal digits from 0 to 4294967295 and refuses
+  any other value (blank, signed, fractional, exponent or too large) with 400 `invalid_lines`
+  instead of passing it to herdr; a blank value is no longer read as zero. Every count herdr
+  takes still goes through unchanged.
+  ([#1571](https://github.com/devswha/herdr-web-ui/pull/1571))
+- A pasted or dropped PNG, JPEG, GIF or WebP image is saved with the extension of what its bytes
+  are, not the one its file name suggests, and a file that only claims to be one of those images
+  is refused with its reason instead of being saved for the agent to read.
+  ([#1599](https://github.com/devswha/herdr-web-ui/pull/1599))
+- The phone header's Chat/Terminal switch keeps clear of the bar's top and bottom edges in both
+  densities: its options take the density's segmented height, so its track is 34px tall in the 52px bar
+  and 32px in the compact density's 46px bar, which it used to nearly touch.
+  ([#1519](https://github.com/devswha/herdr-web-ui/pull/1519) by @adnankassem)
+- On a phone, the header's Chat/Terminal switch centers its icons and no longer touches the header's
+  bottom rule (in compact density it was as tall as the bar). The buttons still take a full
+  44 px tap.
+  ([#1367](https://github.com/devswha/herdr-web-ui/pull/1367) by @Noobear)
+- A pi chat now shows its context ring for models pi lists in its commandcode cache or model
+  store, not only for providers defined in `models.json`.
+  ([#1391](https://github.com/devswha/herdr-web-ui/pull/1391) by @diegolhambi)
+- Model and effort pickers no longer confirm a stale choice when the agent stops waiting for the
+  answer during the final screen read.
+  ([#1435](https://github.com/devswha/herdr-web-ui/pull/1435))
+- A Portal that stops on its own after its address was up is started again once, on the same relay
+  and address, and Settings → Phone & devices says Recovering… meanwhile; a second stop shows the
+  error with Portal's output instead of leaving the address down without a word or restarting it
+  again.
+  ([#1587](https://github.com/devswha/herdr-web-ui/pull/1587))
+- When the server cannot save a shared setting or pin, Settings now says the change is not on the
+  server yet, that reloading or closing the page can undo it, and offers Retry. After three failed
+  saves in a row the browser resends less often (after a minute, then up to every five minutes)
+  until you press Retry or the connection reopens, and edits made meanwhile are kept. A late resend
+  of a refused change no longer overwrites a newer value another device saved meanwhile, while a
+  setting you pick again after the refusal still wins. While the connection is lost it waits for it
+  to come back instead of resending, and a connection the browser gives up on (for example a proxy
+  error while the server restarts) is opened again, so alerts and other devices' changes no longer
+  stop arriving until a reload.
+  ([#1595](https://github.com/devswha/herdr-web-ui/pull/1595))
+- A damaged or unreadable shared preferences or read-finish file is no longer lost to the next
+  change. Reading never touches it; the first change moves the damaged file, byte for byte, to
+  `preferences.json.bad` or `seen.json.bad` (private to you, the latest damaged copy only), a file
+  repaired by hand while the server runs is kept with the change added to it, and a file that
+  cannot be read or set aside is not written over, so the change fails instead.
+  ([#1564](https://github.com/devswha/herdr-web-ui/pull/1564))
+- A server or remote bridge that crashed no longer blocks its restart when its old process number
+  now belongs to another program: startup locks and the bridge registry record the owner's start
+  identity, and that other program is never signalled.
+  ([#1567](https://github.com/devswha/herdr-web-ui/pull/1567))
+- Attaching to a terminal once again waits for input to be ready before signalling completion,
+  preserving queued keys, clicks and text and the order of Stop followed by a message.
+  ([#1342](https://github.com/devswha/herdr-web-ui/pull/1342))
+- Opening a finished agent's terminal while its connection to herdr is being restored no longer
+  clears its DONE dot from the screen left over from before: it clears once the terminal shows
+  current output.
+  ([#1472](https://github.com/devswha/herdr-web-ui/pull/1472))
+- An oversized or unreadable answer from another PC's bridge is now refused at a fixed size
+  instead of being held whole in memory: connecting, refreshing and the PC proxy stop reading it,
+  report a short error in the user's language that repeats none of it, and a watching device
+  never gets a prompt that could not be redacted.
+  ([#1588](https://github.com/devswha/herdr-web-ui/pull/1588))
+- Opening a pane in another tab or on a phone, or reconnecting, no longer copies again to the
+  clipboard what a program in the pane copied before; its new copies still reach the clipboard.
+  ([#1600](https://github.com/devswha/herdr-web-ui/pull/1600))
+- Update and restart, and the header's Update, install exactly the release they offered: a release
+  published in the meantime installs nothing and is shown to be checked first, and a server whose
+  supervisor cannot install by revision asks for a restart instead of installing.
+  ([#1590](https://github.com/devswha/herdr-web-ui/pull/1590))
+- In macOS Safari, Backspace in a terminal no longer skips a press after deleting the last letter of
+  a Korean syllable: 한 then four Backspaces now also deletes the character before it.
+  ([#1363](https://github.com/devswha/herdr-web-ui/pull/1363))
+- Chat shows only the current agent session's command results: after an agent restarts in the same
+  pane, the earlier session's commands no longer appear. A `/clear`, `/new` or resume sent from Chat
+  keeps its own row in the conversation it starts, without claiming that it finished. Commands sent
+  before an agent's first reply stay with that agent while it keeps running, also through a moment
+  in the background (Ctrl+Z on Linux and macOS); once a different agent takes over the pane, they
+  are hidden, even if Chat was not open when it happened. A command sent to a restarted agent while
+  the pane still shows the previous session stays once the agent's own session appears within a
+  minute, unless Chat started another session after it. Within that minute, a session change typed
+  in the terminal of an agent that resumed the same session can still keep such a command. Where
+  Chat cannot find the agent's program at all (native Windows, or an agent started under another
+  program name), such a command stays with the session that the same agent starts in the same
+  terminal; a later session, another agent or terminal still hides it. Outside Linux, an agent
+  restarted under the same process number cannot be told apart from the one before it.
+  ([#1543](https://github.com/devswha/herdr-web-ui/pull/1543))
+- SSH PC management controls now stay within narrow sidebars: the rename field and action buttons
+  reflow in place, and long labels wrap without clipping.
+  ([#1392](https://github.com/devswha/herdr-web-ui/pull/1392) by @snowykr)
+- Opening a finished pane clears its DONE dot only after its answer or terminal output is
+  actually visible. Covered panes, loading or failed chats, and terminal reconnections keep
+  unread finishes marked.
+  ([#1342](https://github.com/devswha/herdr-web-ui/pull/1342))
+- Reading older chat keeps the finish unread. Jumping to the latest answer clears it only
+  after the jump arrives; small scrolls above the end show the way back. Resizing and restoring
+  a short chat work without an extra scroll.
+  ([#1342](https://github.com/devswha/herdr-web-ui/pull/1342))
+- An older answer cannot clear a newer finish. Agents whose chat cannot prove completion keep
+  the dot conservatively; opening their Terminal view can acknowledge the output.
+  ([#1342](https://github.com/devswha/herdr-web-ui/pull/1342))
+- Read finishes stay read across pane switches and browser tabs on the same device. Every
+  web-server restart or update brings read DONE dots back; read records are not carried across
+  server restarts.
+  ([#1342](https://github.com/devswha/herdr-web-ui/pull/1342))
+- The sidebar's PC control buttons are the standard control height again, Rename shares the name
+  field's row in a wide sidebar, Remove PC dims like its neighbours while a rename or disconnect
+  runs, and danger buttons keep their red tint on hover everywhere in the app.
+  ([#1422](https://github.com/devswha/herdr-web-ui/pull/1422))
+- Documents opened through copied read links keep their own scroll area at desktop widths,
+  rather than expanding beyond the window and leaving scrolling to the page.
+  ([#1586](https://github.com/devswha/herdr-web-ui/pull/1586) by @Kinetic27)
+- A Markdown table whose separator has a one- or two-dash cell (`|---|:-:|`) shows as a table in the
+  chat, as on GitHub, instead of as its pipe-separated source.
+  ([#1361](https://github.com/devswha/herdr-web-ui/pull/1361) by @Noobear)
+- Going back to the chat while a terminal command's screen is still open (Claude Code's `/btw`
+  answer, a picker left up) no longer lets the next message from the message box be typed into
+  that screen and do nothing, for Claude Code and the agents above (not OpenCode): the composer
+  says the command is still open in the terminal, with Show terminal, and Send (or a queued
+  message's Send now) keeps the message until the screen closes or you choose Send anyway.
+  ([#1637](https://github.com/devswha/herdr-web-ui/pull/1637))
+- Opening the app no longer flashes the dark amber default before your saved theme: the saved light,
+  dark or single-mode theme (Dracula on the light side stays dark), including System and older saved
+  palettes, is drawn from the first frame, and the installed app's title bar color matches it at once.
+  ([#1569](https://github.com/devswha/herdr-web-ui/pull/1569))
+- Settings → Updates no longer tells you to switch to main when the server was started from an
+  installed update's folder instead of its source checkout: it now says to restart the app from
+  the source checkout, which is what lets updates run again.
+  ([#1417](https://github.com/devswha/herdr-web-ui/pull/1417))
+- Typing or composing text in a wide mirrored terminal no longer pulls the view sideways.
+  Windows terminal wheel panning stays in place when output arrives, and tapping the terminal
+  without scrolling no longer changes shared history.
+  ([#1534](https://github.com/devswha/herdr-web-ui/pull/1534))
+- Loading the page no longer sends about 33 requests per workspace folder to find its project icon:
+  each folder is asked once (`GET /api/fs/favicon`), and a folder without an icon is an answer, not
+  a 404. A reverse proxy with a rate limit no longer answers 429 to the burst, and the browser
+  console no longer fills with red 404 lines on every load. A 429 is no longer remembered as "no
+  icon" either: the folder is asked again when its row next appears.
+  ([#1339](https://github.com/devswha/herdr-web-ui/pull/1339))
+- A dragged workspace order no longer jumps back while its moves are still landing: a roster read
+  before the move, a cached roster or another PC's update cannot undo it, and the first roster
+  read after the move (another browser's later order included) replaces it. A remote PC does this
+  once its bridge is updated to the next release; until then it keeps the earlier behaviour.
+  ([#1593](https://github.com/devswha/herdr-web-ui/pull/1593))
+
+### Maintenance
+- Composer geometry regressions freeze the demo conversation while keeping it idle, so turn
+  completion cannot change the transcript during measurements on phone and desktop.
+  ([#1347](https://github.com/devswha/herdr-web-ui/pull/1347) by @Yoonwoo-Ha)
+- Settings and PWA draft checks target the visible input explicitly; locale regressions cover
+  native draft and placeholder heights on phone and desktop.
+  ([#1347](https://github.com/devswha/herdr-web-ui/pull/1347) by @Yoonwoo-Ha)
+
 ## [0.4.12] - 2026-10-18
 
 ### Added
@@ -4759,7 +5844,11 @@ First public version.
 - Installable PWA, a mobile key bar, web push alerts and optional token auth.
 - Distribution as a herdr plugin.
 
-[Unreleased]: https://github.com/devswha/herdr-web-ui/compare/v0.4.12...HEAD
+[Unreleased]: https://github.com/devswha/ovis/compare/v0.4.16...HEAD
+[0.4.16]: https://github.com/devswha/ovis/compare/v0.4.15...v0.4.16
+[0.4.15]: https://github.com/devswha/ovis/compare/v0.4.14...v0.4.15
+[0.4.14]: https://github.com/devswha/ovis/compare/v0.4.13...v0.4.14
+[0.4.13]: https://github.com/devswha/herdr-web-ui/compare/v0.4.12...v0.4.13
 [0.4.12]: https://github.com/devswha/herdr-web-ui/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/devswha/herdr-web-ui/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/devswha/herdr-web-ui/compare/v0.4.9...v0.4.10

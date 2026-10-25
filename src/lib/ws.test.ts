@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, expect, it, jest } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, it, jest } from "bun:test";
 import { HerdrSocket } from "./ws.ts";
-import type { PendingMessage } from "../../shared/protocol.ts";
+import type { ClientConnectionTrace, PendingMessage } from "../../shared/protocol.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../../shared/terminal-flow.ts";
 
 /** A WebSocket the test drives: it opens, receives and records what the client sends. */
@@ -56,6 +56,30 @@ it("refuses clear-and-send on a legacy bridge without sending payload or Enter",
   }
 });
 
+it("sends nothing when the bridge has not said what it supports by the end of the wait (#1591)", async () => {
+  jest.useFakeTimers();
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  try {
+    // no snapshot yet: whether this bridge takes `submit` is unknown, not "an older bridge"
+    const result = client.submit("w1:p1", "chat message", "chat message");
+    jest.advanceTimersByTime(2_000);
+    // not a dropped connection: the socket is open, only its snapshot is late (#1806)
+    expect(await result).toMatchObject({ ok: false, code: "capabilities_unknown" });
+    expect(submissions(socket)).toEqual([]);
+    // an Insert behind the same late snapshot is not told to update the PC: its bridge is unknown, not old
+    const inserted = client.insert("w1:p1", "one line");
+    jest.advanceTimersByTime(2_000);
+    expect(await inserted).toMatchObject({ ok: false, code: "capabilities_unknown" });
+    expect(socket.sent.filter((frame) => frame.type === "insert")).toEqual([]);
+  } finally {
+    client.close();
+    jest.useRealTimers();
+  }
+});
+
 it("keeps ordinary immediate sends working on a legacy bridge", async () => {
   const client = new HerdrSocket("ws://test/ws");
   client.connect();
@@ -63,7 +87,7 @@ it("keeps ordinary immediate sends working on a legacy bridge", async () => {
   socket.open();
   socket.receive(snapshot([]));
   try {
-    expect(await client.submit("w1:p1", "chat message", "chat message")).toEqual({ ok: true });
+    expect(await client.submit("w1:p1", "chat message", "chat message")).toEqual({ ok: true, unconfirmed: true });
     expect(submissions(socket)).toEqual([{ type: "input", pane_id: "w1:p1", text: "chat message\r" }]);
   } finally {
     client.close();
@@ -77,7 +101,7 @@ it("control: a held-copy id on a legacy bridge keeps its existing immediate inpu
   socket.open();
   socket.receive(snapshot([]));
   try {
-    expect(await client.submit("w1:p1", "held copy", "held copy", false, "immediate", undefined, false, "stable-copy-id")).toEqual({ ok: true });
+    expect(await client.submit("w1:p1", "held copy", "held copy", false, "immediate", undefined, false, "stable-copy-id")).toEqual({ ok: true, unconfirmed: true });
     expect(submissions(socket)).toEqual([{ type: "input", pane_id: "w1:p1", text: "held copy\r" }]);
   } finally { client.close(); }
 });
@@ -371,7 +395,7 @@ it("keeps existing Enter submits and the older bridge's input fallback compatibl
       expect(submissions(socket)).toEqual([{ type: "submit", id: 1, pane_id: "w1:p1", text: "steer now", payload: "steer now", typed: true }]);
       socket.receive({ type: "submit-result", id: 1, pane_id: "w1:p1", ok: true });
     } else expect(submissions(socket)).toEqual([{ type: "input", pane_id: "w1:p1", text: "steer now\r" }]);
-    expect(await result).toEqual({ ok: true });
+    expect(await result).toEqual(features.includes("submit") ? { ok: true } : { ok: true, unconfirmed: true });
     client.close();
   }
 });
@@ -1803,4 +1827,269 @@ it("ends the connection when the page is left, and connects again only when it i
     client.close();
     jest.useRealTimers();
   }
+});
+
+/** Capture metadata only, retaining the actual socket/lifecycle code and its context callback. */
+const traceGlobals = globalThis as unknown as { document?: unknown; fetch?: unknown };
+const traceBefore = { document: traceGlobals.document, fetch: traceGlobals.fetch };
+afterEach(() => { traceGlobals.document = traceBefore.document; traceGlobals.fetch = traceBefore.fetch; });
+
+function tracedClient(features: string[]) {
+  const reports: ClientConnectionTrace[] = [];
+  // The public browser transport: a document makes the trace POST through window.fetch (here the global).
+  traceGlobals.document = { createElement() {}, visibilityState: "visible", addEventListener() {}, removeEventListener() {} };
+  traceGlobals.fetch = async (_url: string, init: RequestInit) => { reports.push(JSON.parse(init.body as string)); return new Response(null, { status: 204 }); };
+  const client = new HerdrSocket("ws://test/ws?machine_id=local");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open(); socket.receive(snapshot(features));
+  return { client, socket, reports };
+}
+
+it("records the missed-heartbeat path and distinguishes a late old-socket close, without replaying input", async () => {
+  jest.useFakeTimers();
+  const { client, socket, reports } = tracedClient(["ping", "submit"]);
+  try {
+    client.wake();
+    jest.advanceTimersByTime(3000);
+    expect(reports[0]!.events.map((event) => event.kind)).toContain("probe_retry");
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    jest.advanceTimersByTime(3000);
+    const fresh = FakeSocket.last;
+    expect(fresh).not.toBe(socket);
+    fresh.open(); fresh.receive(snapshot(["ping", "submit"]));
+    jest.advanceTimersByTime(10_000);
+    socket.closeEvent(1005);
+    expect(reports.at(-1)!.events.at(-1)).toMatchObject({ kind: "close", connection: 1, socket_state: 3, code: 1005 });
+    expect(reports.at(-1)!.events.map((event) => event.kind)).toContain("probe_drop");
+    expect(submissions(fresh)).toEqual([]);
+  } finally { client.close(); jest.useRealTimers(); }
+});
+
+it("records pagehide versus a send receipt interruption without retaining the message or resending it", async () => {
+  jest.useFakeTimers();
+  const { client, socket, reports } = tracedClient(["submit"]);
+  try {
+    const frame = socket.nextSubmission();
+    const pending = client.submit("private-pane", "private-message", "private-payload")!;
+    await frame;
+    (client as unknown as { onLeave(): void }).onLeave();
+    expect(await pending).toMatchObject({ ok: false, code: "disconnected" });
+    expect(reports[0]!.events.at(-1)).toMatchObject({ kind: "pagehide", pending: 1 });
+    expect(reports[0]!.events.map((event) => event.kind)).toContain("submit_sent");
+    expect(JSON.stringify(reports)).not.toContain("private-");
+    (client as unknown as { onWake(event: Event): void }).onWake(new Event("pageshow"));
+    const fresh = FakeSocket.last; fresh.open(); fresh.receive(snapshot(["submit"]));
+    expect(submissions(fresh)).toEqual([]);
+  } finally { client.close(); jest.useRealTimers(); }
+});
+
+it("records a socket stuck closing without forcing a new connection or bypassing authority", () => {
+  jest.useFakeTimers();
+  const { client, socket, reports } = tracedClient(["ping"]);
+  try {
+    socket.closing();
+    jest.advanceTimersByTime(5000);
+    expect(reports[0]!.events.at(-1)).toMatchObject({ kind: "closing_wait", socket_state: 2 });
+    expect(FakeSocket.last).toBe(socket);
+    expect(client.sendInput("w1:p1", "private-draft")).toBe(false);
+  } finally { client.close(); jest.useRealTimers(); }
+});
+
+it("records an unanswered submit deadline without its input or an automatic retry", async () => {
+  jest.useFakeTimers();
+  const { client, socket, reports } = tracedClient(["submit"]);
+  try {
+    const frame = socket.nextSubmission();
+    const result = client.submit("private-pane", "private-message", "private-payload")!;
+    const sent = await frame;
+    jest.advanceTimersByTime(90_000);
+    expect(await result).toMatchObject({ ok: false, code: "timeout" });
+    expect(reports[0]!.events.at(-1)).toMatchObject({ kind: "submit_timeout", request_id: sent.id });
+    expect(JSON.stringify(reports)).not.toContain("private-");
+    expect(submissions(socket)).toHaveLength(1);
+  } finally { client.close(); jest.useRealTimers(); }
+});
+
+it("records actual probe-blocked input once, not readiness polling or the text/chord", () => {
+  jest.useFakeTimers();
+  const { client, socket, reports } = tracedClient(["ping", "input-ready"]);
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1", ready: true });
+    expect(client.canInput("w1:p1")).toBe(true);
+    client.wake();
+    for (let i = 0; i < 100; i++) expect(client.canInput("w1:p1")).toBe(false);
+    expect(reports).toHaveLength(0);
+    expect(client.sendInput("w1:p1", "private-typed-text")).toBe(false);
+    expect(client.sendKeys("w1:p1", ["private-chord"])).toBe(false);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]!.events.at(-1)).toMatchObject({ kind: "probe_input_blocked", socket_state: 1 });
+    expect(JSON.stringify(reports)).not.toContain("private-");
+    expect(submissions(socket)).toEqual([]);
+    socket.receive({ type: "pong", id: pings(socket).at(-1)!.id });
+    expect(client.canInput("w1:p1")).toBe(true);
+  } finally { client.close(); jest.useRealTimers(); }
+});
+
+// ---- insert without Enter (feature "terminal-insert") ----------------------------------------
+
+/** every frame the client sent that could carry text into the pane */
+const inputs = (socket: FakeSocket) => socket.sent.filter((frame) => ["insert", "submit", "input", "keys"].includes(frame.type));
+
+it("insert waits for matching acknowledgement", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(["submit", "input-ready", "terminal-insert"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    const frame = new Promise<{ id: number }>((resolve) => socket.addEventListener("sent", (sent) => { if (sent.type === "insert") resolve(sent); }));
+    const result = client.insert("w1:p1", "git status")!;
+    let settled = false;
+    void result.then(() => { settled = true; });
+    const sent = await frame;
+    expect(inputs(socket)).toEqual([{ type: "insert", id: sent.id, pane_id: "w1:p1", text: "git status" }]);
+    // another pane's answer, another request's answer, and a submit's answer with this id say nothing about it
+    socket.receive({ type: "insert-result", id: sent.id, pane_id: "w1:p2", ok: true });
+    socket.receive({ type: "insert-result", id: sent.id + 1, pane_id: "w1:p1", ok: true });
+    socket.receive({ type: "submit-result", id: sent.id, pane_id: "w1:p1", ok: true });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    socket.receive({ type: "insert-result", id: sent.id, pane_id: "w1:p1", ok: true });
+    expect(await result).toEqual({ ok: true });
+    // a refusal comes back as it was said, and no Enter or input follows it
+    const refused = client.insert("w1:p1", "line one\rline two")!;
+    const second = await new Promise<{ id: number }>((resolve) => socket.addEventListener("sent", (sent) => { if (sent.type === "insert" && sent.text === "line one\rline two") resolve(sent); }));
+    socket.receive({ type: "insert-result", id: second.id, pane_id: "w1:p1", ok: false, code: "unsafe_multiline", message: "no paste mode" });
+    expect(await refused).toEqual({ ok: false, code: "unsafe_multiline", message: "no paste mode" });
+    expect(inputs(socket)).toHaveLength(2);
+  } finally { client.close(); }
+});
+
+it("old bridge sends nothing", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  // a bridge that submits but does not insert: no input or submit stands in for the insert
+  socket.receive(snapshot(["submit", "input-ready"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    expect(await client.insert("w1:p1", "git status")).toMatchObject({ ok: false, code: "unsupported" });
+    expect(inputs(socket)).toEqual([]);
+    expect(client.canInsert()).toBe(false);
+  } finally { client.close(); }
+});
+
+it("disconnect never replays insert", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(["submit", "input-ready", "terminal-insert"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    const frame = new Promise<{ id: number }>((resolve) => socket.addEventListener("sent", (sent) => { if (sent.type === "insert") resolve(sent); }));
+    const result = client.insert("w1:p1", "rm -rf build")!;
+    await frame;
+    socket.disconnect();
+    // not confirmed, never "sent": the draft stays with its uncertainty, and nothing is queued
+    expect(await result).toMatchObject({ ok: false, code: "disconnected" });
+    // the reconnect replays the role and the attach, never the insert
+    client.wake();
+    const next = FakeSocket.last;
+    expect(next).not.toBe(socket);
+    next.open();
+    next.receive(snapshot(["submit", "input-ready", "terminal-insert"]));
+    next.receive({ type: "input-ready", pane_id: "w1:p1" });
+    expect(inputs(next)).toEqual([]);
+    expect(next.sent.map((sent) => sent.type)).toEqual(["role", "attach"]);
+    // a late answer to the old request on the new connection settles nothing and sends nothing
+    next.receive({ type: "insert-result", id: 1, pane_id: "w1:p1", ok: true });
+    expect(inputs(next)).toEqual([]);
+    // disconnected, an insert goes nowhere at all: null, like a submit
+    next.disconnect();
+    expect(client.insert("w1:p1", "again")).toBeNull();
+  } finally { client.close(); }
+});
+
+it("an insert waiting on a probe is dropped when the pane's input changed meanwhile", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(["submit", "input-ready", "terminal-insert", "ping"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    client.wake();
+    const result = client.insert("w1:p1", "rm -rf build")!;
+    // the pane loses its input and gets it back (a detach and reattach) before the pong comes back
+    socket.receive({ type: "input-ready", pane_id: "w1:p1", ready: false });
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    socket.receive({ type: "pong", id: pings(socket).at(-1)!.id });
+    expect(await result).toMatchObject({ ok: false, code: "input_not_ready" });
+    expect(socket.sent.filter((frame) => frame.type === "insert")).toEqual([]);
+  } finally { client.close(); }
+});
+
+it("an input lease changes with every readiness or role of the pane's connection, even one that came back", () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(["submit", "input-ready", "terminal-insert"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    const first = client.inputLease("w1:p1");
+    // the pane's output, and another pane's readiness, leave it alone
+    socket.receive({ type: "pty-data", pane_id: "w1:p1", data: "$ " });
+    socket.receive({ type: "input-ready", pane_id: "w1:p2" });
+    expect(client.inputLease("w1:p1")).toBe(first);
+    // readiness lost and given back: ready as before, but another lease
+    socket.receive({ type: "input-ready", pane_id: "w1:p1", ready: false });
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    const cycled = client.inputLease("w1:p1");
+    expect(cycled).not.toBe(first);
+    // a held attach that let go, and a role that went and came back
+    socket.receive({ type: "error", code: "attach_held", message: "held", pane_id: "w1:p1" });
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    const released = client.inputLease("w1:p1");
+    expect(released).not.toBe(cycled);
+    socket.receive({ type: "role-ack", mode: "observe" });
+    socket.receive({ type: "role-ack", mode: "interact" });
+    expect(client.inputLease("w1:p1")).not.toBe(released);
+  } finally { client.close(); }
+});
+
+it("an observing connection and a liveness probe never carry an insert", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(["submit", "input-ready", "terminal-insert", "ping"]));
+  try {
+    client.attach("w1:p1", 80, 24);
+    socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+    client.setMode("observe");
+    socket.receive({ type: "role-ack", mode: "observe" });
+    expect(client.insert("w1:p1", "text")).toBeNull();
+    client.setMode("interact");
+    socket.receive({ type: "role-ack", mode: "interact" });
+    // a probe in flight: the insert waits for the pong, and a drop ends it as not transmitted
+    client.wake();
+    const result = client.insert("w1:p1", "text")!;
+    await Promise.resolve();
+    expect(inputs(socket)).toEqual([]);
+    socket.receive({ type: "pong", id: pings(socket).at(-1)!.id });
+    const sent = await new Promise<{ id: number }>((resolve) => socket.addEventListener("sent", (frame) => { if (frame.type === "insert") resolve(frame); }));
+    socket.receive({ type: "insert-result", id: sent.id, pane_id: "w1:p1", ok: true });
+    expect(await result).toEqual({ ok: true });
+  } finally { client.close(); }
 });

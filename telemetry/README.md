@@ -68,10 +68,19 @@ edit to `telemetry/worker.ts` or `shared/telemetry.ts` counts, comments included
 changes nothing is sometimes the price.
 
 The Worker answers at `https://herdr-web-ui-telemetry.<account>.workers.dev/v1/events`, and
-`TELEMETRY_URL` in `server/telemetry.ts` must name that address. `HERDR_WEB_TELEMETRY_URL` does not
+`TELEMETRY_URL` in `server/telemetry.ts` must name that address. `OVIS_TELEMETRY_URL` does not
 exist on purpose: an install cannot be pointed elsewhere by its environment.
 
+The Worker and its D1 database keep the `herdr-web-ui-telemetry` name they had before Ovis took its
+name: installs already send to that address, and a D1 database cannot be renamed.
+
 ## Reading the counts
+
+After `bunx wrangler login` from `telemetry/`, run
+`bun scripts/telemetry-report.ts --out <file.md>` from the repository root. It runs the weekly installs, DAU, WAU, MAU,
+agent-kind and country queries below, plus daily actives per country for the last 28 days, and
+writes them as one report. The script selects `telemetry/` as Wrangler's working directory.
+For the individual queries below, stay in `telemetry/`:
 
 ```sh
 bunx wrangler d1 execute herdr-web-ui-telemetry --remote --command "<query>"

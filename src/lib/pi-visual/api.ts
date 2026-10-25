@@ -47,7 +47,7 @@ export async function checkSession(machine: string,pane: string,session: string,
   if(result.session!==session) throw new Error("Pi session changed; reopen visual tools");
 }
 export function addDraft(machine: string,pane: string,text: string): void {
-  const key=`herdr-web-ui:composer-draft:${paneStorageId(machine,pane)}`;
+  const key=`ovis:composer-draft:${paneStorageId(machine,pane)}`;
   composerDrafts.refresh(key); const draft=composerDrafts.read(key);
   if(draft.sending) throw new Error("A message is being sent. Try again afterwards.");
   const next=appendQuote(draft.text,text,MAX_COMPOSER_CHARS);

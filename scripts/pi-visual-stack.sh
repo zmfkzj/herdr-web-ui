@@ -19,7 +19,7 @@ GUACD_HOST=127.0.0.1
 GUACD_PORT=${HERDR_STACK_GUACD_PORT:-4822}
 WEB_HOST=${HOST:-127.0.0.1}
 WEB_PORT=${PORT:-7318}
-STATE_ROOT=${HERDR_WEB_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-web-ui}
+STATE_ROOT=${OVIS_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-web-ui}
 STACK_DIR=${HERDR_STACK_DIR:-$STATE_ROOT/pi-visual-stack}
 START_TIMEOUT=${HERDR_STACK_START_TIMEOUT:-30}
 STOP_TIMEOUT=${HERDR_STACK_STOP_TIMEOUT:-15}
@@ -369,9 +369,9 @@ Usage: $SELF [start|status|stop|restart|logs]
 
 Environment: PORT (web UI port, default 7318), HOST (bind address, default 127.0.0.1),
 HERDR_STACK_GUACD_BIN (default /opt/herdr-guacd/sbin/guacd), HERDR_STACK_DIR (logs and records,
-default \${HERDR_WEB_STATE_DIR:-~/.config/herdr-web-ui}/pi-visual-stack),
+default \${OVIS_STATE_DIR:-~/.config/herdr-web-ui}/pi-visual-stack),
 HERDR_STACK_START_TIMEOUT / HERDR_STACK_STOP_TIMEOUT (seconds, default 30 / 15).
-Other server variables (HERDR_SOCKET, HERDR_WEB_TOKEN, ...) pass through unchanged.
+Other server variables (HERDR_SOCKET, OVIS_TOKEN, ...) pass through unchanged.
 EOF
 }
 

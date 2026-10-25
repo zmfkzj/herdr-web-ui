@@ -1,0 +1,49 @@
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { createServer } from "./index.ts";
+import { herdrRpc, workspaceClose, workspaceCreate } from "./herdr/client.ts";
+import type { ConversationResponse } from "../shared/protocol.ts";
+
+// A terminal-started Codex with no reported session names its model through its live footer.
+const root = mkdtempSync(join(tmpdir(), "ovis-start-screen-contract-"));
+const originalHome = process.env["HOME"];
+const workspaces: string[] = [];
+let codexPane: string;
+let server: ReturnType<typeof createServer>;
+
+beforeAll(async () => {
+  const codex = await workspaceCreate({ cwd: root, label: "ovis-test-start-screen-codex" });
+  workspaces.push(codex.workspace.workspace_id);
+  codexPane = codex.root_pane.pane_id;
+  await herdrRpc("pane.report_agent", { pane_id: codexPane, source: "manual", agent: "codex", state: "idle" });
+  const codexReady = herdrRpc("pane.wait_for_output", {
+    pane_id: codexPane, source: "visible", match: { type: "substring", value: "codex_ready_contract" }, timeout_ms: 10000,
+  }, undefined, 12000);
+  await herdrRpc("pane.send_text", { pane_id: codexPane, text: `clear; printf '%s\\n' '  >_ OpenAI Codex (v0.163.0)' '' '› Ask Codex to do anything' '' '  GPT-6.1-Sol low · /tmp/project'; printf '? for shortcuts codex_%s\\n' ready_contract; exec cat\n` });
+  await codexReady;
+  process.env["HOME"] = root;
+  server = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(root, "state"), codexHome: join(root, ".codex") });
+}, 15000);
+
+afterAll(async () => {
+  server?.stop();
+  if (originalHome === undefined) delete process.env["HOME"];
+  else process.env["HOME"] = originalHome;
+  for (const id of workspaces) await workspaceClose(id);
+  rmSync(root, { recursive: true, force: true });
+});
+
+const read = async (paneId: string): Promise<ConversationResponse> => {
+  const response = await fetch(`http://127.0.0.1:${server.port}/api/pane/conversation?pane_id=${encodeURIComponent(paneId)}`);
+  expect(response.status).toBe(200);
+  return await response.json() as ConversationResponse;
+};
+
+it("carries the model a Codex without a session states with the scrollback standing in", async () => {
+  expect(await read(codexPane)).toEqual({
+    source: "scrollback", turns: [], screen: true, metadata: { model: "gpt-6.1-sol", reasoning_effort: "low" },
+  });
+});

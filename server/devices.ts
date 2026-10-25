@@ -3,17 +3,19 @@
  * instead of the shared token. The owner starts a pairing on the PC and gets a short code
  * that lives ten minutes; the device sends the code once and receives a token of its own
  * in an HttpOnly cookie. Only a hash of that token is stored, so devices.json in the state
- * dir (0600, written whole) reveals nothing if read. Revocation also closes that device's
+ * dir (0600, written whole, and flushed before it replaces the old list whenever access
+ * changes: private-state.ts) reveals nothing if read. Revocation also closes that device's
  * active streams. A device is either allowed to drive (type, answer, manage) or only to watch.
  */
 import { createHash, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { DeviceRole, PairedDevice } from "../shared/protocol.ts";
 import type { Access } from "./access.ts";
-import { deviceCookie, isSecureRequest, noContent } from "./auth.ts";
-import { badRequest, isJsonObject, jsonResponse } from "./http.ts";
+import { CLEAR_LEGACY_DEVICE_COOKIE, deviceCookie, isSecureRequest, noContent } from "./auth.ts";
+import { badRequest, isJsonObject, jsonResponse, setRequestRoute } from "./http.ts";
 import { sameOrigin } from "./machine-security.ts";
+import { writePrivateState } from "./private-state.ts";
 
 const CODE_TTL_MS = 10 * 60_000;
 const CODE_ATTEMPTS = 5;
@@ -21,7 +23,7 @@ const LAST_SEEN_WRITE_MS = 60_000;
 const UNCONFIRMED_FIRST_PAIR_LIMIT = 8;
 const LABEL_MAX = 48;
 
-interface StoredDevice {
+export interface StoredDevice {
   id: string;
   label: string;
   role: DeviceRole;
@@ -63,12 +65,27 @@ export function isDeviceRole(value: unknown): value is DeviceRole {
   return value === "drive" || value === "watch";
 }
 
-/** Owner-only, and written whole: a crash mid-write must not leave half a device list. */
-function writeJsonPrivate(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+/**
+ * A devices.json as it is on disk: absent, a valid registry, or one that cannot be read or is not valid.
+ * `placeholder`: written only to close the gate where there was no registry (state-merge.ts); it says
+ * nothing about which devices were revoked. The store's next save drops the mark.
+ */
+export type DeviceRegistry = { kind: "missing" } | { kind: "ok"; gateClosedAt: string | null; devices: StoredDevice[]; placeholder: boolean } | { kind: "bad" };
+
+export function readDeviceRegistry(path: string): DeviceRegistry {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "missing" } : { kind: "bad" };
+  }
+  if (!isJsonObject(parsed) || !Array.isArray(parsed.devices)
+    || !(parsed.gate_closed_at === null || typeof parsed.gate_closed_at === "string")
+    || !parsed.devices.every((d) => isJsonObject(d) && typeof d.id === "string"
+      && typeof d.token_hash === "string" && isDeviceRole(d.role)
+      && typeof d.label === "string" && typeof d.created_at === "string"
+      && (d.last_seen_at === null || typeof d.last_seen_at === "string"))) return { kind: "bad" };
+  return { kind: "ok", gateClosedAt: parsed.gate_closed_at, devices: parsed.devices as StoredDevice[], placeholder: parsed.placeholder === true && parsed.devices.length === 0 };
 }
 
 export class DeviceStore {
@@ -82,25 +99,25 @@ export class DeviceStore {
   private readonly revocations = new Map<string, Set<() => void>>();
   readonly error: string | null = null;
 
-  constructor(stateDir: string) {
+  /**
+   * `blocked`: why the registry may lack devices that must stay paired (state-merge.ts could not
+   * take over the other state dir's): the store then stays gated and changes nothing, as for a
+   * damaged registry, while the devices it holds still get in.
+   */
+  constructor(stateDir: string, blocked: string | null = null) {
     this.path = join(stateDir, "devices.json");
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(this.path, "utf8"));
-      if (!isJsonObject(parsed) || !Array.isArray(parsed.devices)
-        || !(parsed.gate_closed_at === null || typeof parsed.gate_closed_at === "string")
-        || !parsed.devices.every((d) => isJsonObject(d) && typeof d.id === "string"
-          && typeof d.token_hash === "string" && isDeviceRole(d.role)
-          && typeof d.label === "string" && typeof d.created_at === "string"
-          && (d.last_seen_at === null || typeof d.last_seen_at === "string"))) {
-        throw new Error("invalid device registry");
-      }
-      this.gateClosedAt = parsed.gate_closed_at;
-      this.devices = parsed.devices as StoredDevice[];
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    const read = readDeviceRegistry(this.path);
+    if (read.kind === "ok") {
+      this.gateClosedAt = read.gateClosedAt;
+      this.devices = read.devices;
+    } else if (read.kind === "bad") {
       // A damaged registry is not a first installation. Keep it intact for recovery and
       // let the existing local/token/Tailscale routes provide access to the owner.
       this.error = `Cannot read ${this.path}. Restore a valid devices.json or fix its permissions, then restart the server. External access without a token or trusted Tailscale login remains blocked.`;
+      console.error(this.error);
+    }
+    if (blocked !== null && this.error === null) {
+      this.error = blocked;
       console.error(this.error);
     }
   }
@@ -197,6 +214,7 @@ export class DeviceStore {
       if (now - seen >= LAST_SEEN_WRITE_MS) {
         try {
           const next = this.devices.map((d) => d === device ? { ...d, last_seen_at: new Date(now).toISOString() } : d);
+          // devices.json is also the authorization registry: a torn write here would lock every device out
           this.save(next);
           this.devices = next;
         } catch { /* last-seen telemetry must not deny an otherwise valid credential */ }
@@ -245,7 +263,7 @@ export class DeviceStore {
   }
 
   private save(devices = this.devices, gateClosedAt = this.gateClosedAt): void {
-    writeJsonPrivate(this.path, { gate_closed_at: gateClosedAt, devices });
+    writePrivateState(this.path, { gate_closed_at: gateClosedAt, devices });
   }
 }
 
@@ -263,25 +281,29 @@ export async function handleDeviceRequest(request: Request, pathname: string, st
     } catch { return badRequest("invalid_json", "request body must be JSON"); }
   };
   if (pathname === "/api/devices/pair") {
+    setRequestRoute(pathname);
     if (request.method !== "POST") return badRequest("method_not_allowed", "use POST");
     const body = await json();
     if (body instanceof Response) return body;
     if (typeof body["code"] !== "string") return badRequest("missing_code", "code is required");
     const paired = store.pair(body["code"], normalizeLabel(body["label"], "Device"), "drive");
     if (paired === null) return jsonResponse({ error: { code: "invalid_code", message: "the code is wrong, spent or expired; start a new pairing on the PC" } }, 401);
-    return noContent(deviceCookie(paired.token, isSecureRequest(request)));
+    return noContent(deviceCookie(paired.token, isSecureRequest(request)), CLEAR_LEGACY_DEVICE_COOKIE);
   }
   if (pathname === "/api/devices") {
+    setRequestRoute(pathname);
     if (request.method !== "GET") return badRequest("method_not_allowed", "use GET");
     return jsonResponse({ devices: store.list(access.level === "full" ? access.device?.id ?? null : null) }, 200, { "cache-control": "no-store" });
   }
   if (!sameOrigin(request) || request.headers.get("x-herdr-machine") !== "1") return jsonResponse({ error: { code: "invalid_origin", message: "Manage devices from this app" } }, 403);
   if (access.level === "full" && access.role === "watch") return jsonResponse({ error: { code: "read_only", message: "this device can only watch" } }, 403);
   if (pathname === "/api/devices/pair/start") {
+    setRequestRoute(pathname);
     if (request.method !== "POST") return badRequest("method_not_allowed", "use POST");
     return jsonResponse(store.startPairing(), 200, { "cache-control": "no-store" });
   }
   const id = pathname.slice("/api/devices/".length);
+  setRequestRoute("/api/devices/:device_id");
   if (!/^[0-9a-f]{16}$/.test(id)) return badRequest("invalid_device", "no such device");
   if (request.method === "DELETE") return store.revoke(id) ? noContent() : jsonResponse({ error: { code: "not_found", message: "no such device" } }, 404);
   if (request.method === "PATCH") {

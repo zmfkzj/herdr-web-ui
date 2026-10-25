@@ -125,7 +125,7 @@ try {
   result["reconnect"] = { local: placements("reconnect"), sequences: [...new Set([...views["reconnect"]!.bytes.matchAll(/\x1b\[[0-9;?]*[A-Za-z@`]|\x1b[A-Z78=>c]|\n|\r/g)].map((m) => m[0].replace(/\d+/g, "n")))] };
   writeFileSync(join(root, "go-end"), "");
   result["chunks"] = { local: views["local"]!.chunks, relay: views["relay"]!.chunks };
-  result["herdr"] = Bun.spawnSync([process.env["HERDR_WEB_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
+  result["herdr"] = Bun.spawnSync([process.env["OVIS_HERDR_BIN"] || "herdr", "--version"]).stdout.toString().trim();
   writeFileSync(join(out, "result.json"), JSON.stringify(result, null, 2));
   console.log(JSON.stringify(result, null, 2));
   console.log(`terminal image attach probe: ${out}`);

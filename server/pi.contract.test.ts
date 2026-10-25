@@ -9,7 +9,7 @@ import { herdrRpc, sessionSnapshot, workspaceClose, workspaceCreate } from "./he
 import type { ConversationResponse } from "../shared/protocol.ts";
 
 // Real herdr metadata + HTTP + native files, all under an owned workspace/store.
-const root = mkdtempSync(join(tmpdir(), "herdr-web-ui-pi-contract-"));
+const root = mkdtempSync(join(tmpdir(), "ovis-pi-contract-"));
 const sessionDir = join(root, ".pi", "agent", "sessions");
 const slug = join(sessionDir, `--${root.replaceAll("/", "-")}--`);
 const transcript = join(slug, "session.jsonl");
@@ -39,7 +39,7 @@ const turns = (prompt: string, answer: string) => page([
 ]);
 
 async function createPiPane(): Promise<string> {
-  const created = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-pi-contract" });
+  const created = await workspaceCreate({ cwd: root, label: "ovis-test-pi-contract" });
   workspaces.push(created.workspace.workspace_id);
   const target = created.root_pane.pane_id;
   await herdrRpc("pane.send_text", { pane_id: target, text: `${fakePi}\n` });
@@ -91,7 +91,7 @@ it.skipIf(process.platform !== "linux")("serves a fresh Pi session in its pane-o
   writeFileSync(profilePi, `#!/bin/bash\nexport PI_CODING_AGENT_DIR='${profileDir}'\nexec -a pi /bin/sleep 600\n`);
   chmodSync(profilePi, 0o755);
 
-  const created = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-pi-custom-profile" });
+  const created = await workspaceCreate({ cwd: root, label: "ovis-test-pi-custom-profile" });
   workspaces.push(created.workspace.workspace_id);
   const target = created.root_pane.pane_id;
   await herdrRpc("pane.send_text", { pane_id: target, text: `${profilePi}\n` });
@@ -110,10 +110,23 @@ it.skipIf(process.platform !== "linux")("serves a fresh Pi session in its pane-o
 
   mkdirSync(dirname(fresh), { recursive: true });
   writeFileSync(fresh, turns("Synthetic new profile session", "First response in the profile session"));
-  const afterMessage = await read(target);
-  expect(afterMessage.source).toBe("pi-transcript");
-  expect(afterMessage.turns.map((turn) => turn.role)).toEqual(["user", "assistant"]);
-  expect(afterMessage.turns[0]!.parts).toEqual([{ kind: "text", text: "Synthetic new profile session" }]);
+  // the window comes from the profile's own catalog, not from the one the bridge's env names
+  writeFileSync(join(profileDir, "models.json"), JSON.stringify({ providers: { test: { models: [{ id: "pi-contract-model", contextWindow: 400_000 }] } } }));
+  const bridgeDir = join(root, "bridge-agent-dir");
+  mkdirSync(bridgeDir, { recursive: true });
+  writeFileSync(join(bridgeDir, "models.json"), JSON.stringify({ providers: { test: { models: [{ id: "pi-contract-model", contextWindow: 200_000 }] } } }));
+  const previous = process.env["PI_CODING_AGENT_DIR"];
+  process.env["PI_CODING_AGENT_DIR"] = bridgeDir;
+  try {
+    const afterMessage = await read(target);
+    expect(afterMessage.source).toBe("pi-transcript");
+    expect(afterMessage.turns.map((turn) => turn.role)).toEqual(["user", "assistant"]);
+    expect(afterMessage.turns[0]!.parts).toEqual([{ kind: "text", text: "Synthetic new profile session" }]);
+    expect(afterMessage.metadata?.context).toEqual({ used: 35, window: 400_000 });
+  } finally {
+    if (previous === undefined) delete process.env["PI_CODING_AGENT_DIR"]; else process.env["PI_CODING_AGENT_DIR"] = previous;
+    forgetPiModels();
+  }
 });
 
 it("serves a pi pane's native transcript over HTTP", async () => {
@@ -271,7 +284,7 @@ it("serves provider-composite tool call ids (call_…|fc_…) to the chat and to
 
 it("serves a pasted picture's file to a terminal marker only, bound to the pi session and the digest of its bytes", async () => {
   writeFileSync(transcript, turns("Check chat", "Answer one"));
-  const folder = join(root, ".herdr-web-ui");
+  const folder = join(root, ".ovis");
   mkdirSync(folder, { recursive: true });
   // what herdr-web-ui's upload names a paste, plus Korean, spaces, `#` and `%` the marker percent-encodes
   const pasted = join(folder, "붙여넣기 #1 100%.png");
@@ -308,7 +321,7 @@ it("serves a pasted picture's file to a terminal marker only, bound to the pi se
     expect((await bound(join(folder, "gone.png"))).status).toBe(404);
     expect((await bound(folder)).status).toBe(404);
     expect((await get({ ref: "file:shot.png", session: "session", digest: digestOf(bytes) })).status).toBe(404);
-    expect((await bound(`${folder}/../.herdr-web-ui/photo.png`, digestOf(JPEG))).status).toBe(404);
+    expect((await bound(`${folder}/../.ovis/photo.png`, digestOf(JPEG))).status).toBe(404);
     // past the browser's own bound
     const large = join(folder, "large.png");
     const big = Buffer.concat([PNG, Buffer.alloc(8 * 1024 * 1024)]);
@@ -329,10 +342,19 @@ it("resolves pi's context window from the agent dir pi reads its models from", a
   const previous = process.env["PI_CODING_AGENT_DIR"];
   process.env["PI_CODING_AGENT_DIR"] = agentDir;
   try {
-    // the window is read as the metadata is rebuilt, so a new answer carries it
+    // no pi process is identified here (the stand-in is not pi), and the session store is shared
+    // (PI_CODING_AGENT_SESSION_DIR), not the one inside that agent dir: its catalogs are no pane's
     writeFileSync(transcript, turns("Check chat twice", "Answer two"));
+    expect((await read()).metadata?.context).toEqual({ used: 35, window: null });
+    // the store inside the bridge's own agent dir: the session was written by that profile
+    const owner = dirname(sessionDir);
+    writeFileSync(join(owner, "models.json"), JSON.stringify({ providers: { test: { models: [{ id: "pi-contract-model", contextWindow: 200_000 }] } } }));
+    process.env["PI_CODING_AGENT_DIR"] = owner;
+    // the window is read as the metadata is rebuilt, so a new answer carries it
+    writeFileSync(transcript, turns("Check chat three times", "Answer three"));
     const withWindow = await read();
     expect(withWindow.metadata?.context).toEqual({ used: 35, window: 200_000 });
+    rmSync(join(owner, "models.json"));
   } finally {
     if (previous === undefined) delete process.env["PI_CODING_AGENT_DIR"]; else process.env["PI_CODING_AGENT_DIR"] = previous;
     forgetPiModels();
