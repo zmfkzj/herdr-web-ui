@@ -163,6 +163,17 @@ it names what is missing instead of installing or building it. It refuses to run
   `/api/health` also pings herdr.
 - It is an on-demand launcher, not a boot service: nothing starts it again after a reboot or a
   crash.
+- **Linux and macOS.** On Linux it uses `setsid`, `flock` and `ss` (util-linux, iproute2) and
+  `/proc`. On macOS, which has none of them, it uses tools that ship with the system: perl (for
+  setsid and flock(2)), `ps`, `lsof`, `netstat` and `sysctl`; the system's Bash 3.2 runs it. macOS's
+  `ps` shows no session ids, so there the launcher tracks each launched process's process group
+  (setsid makes the process its leader; its children inherit it) instead of its session: a child
+  that moves itself into another process group is not stopped with it. Start times come from `ps`
+  lstart, to the second. No guacd installer exists for macOS: build Apache guacd 1.6+ with FreeRDP 3
+  H.264 decoding and point `HERDR_STACK_GUACD_BIN` at it. A local guacd serves only desktops on
+  this Mac, and pi-gui's private desktops need Linux (above); desktops of remote PCs go through
+  each PC's own guacd, so for those alone `HERDR_PI_GUACD_ENABLED=1 PORT=7318 bun run server` is
+  enough.
 
 In Pi, run `/gui view W1` (or `/gui view main`) in the pane this web UI shows: the desktop opens
 here at once (next section). The **Open private desktop** form in the worker panel stays for a
