@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { formatWorkDuration, splitTurn, todoGroups, visibleWorkParts, workFailed, workStartsOpen, workSummary, type ToolPart } from "./workBlocks.ts";
+import { formatWorkDuration, runNames, splitTurn, todoGroups, turnSegments, visibleWorkParts, workBlockStartsOpen, workFailed, workStartsOpen, workSummary, type ToolPart } from "./workBlocks.ts";
 import type { ConversationPart } from "../../shared/protocol.ts";
 
 const tool = (name: string, summary = name): Extract<ConversationPart, { kind: "tool" }> => ({ kind: "tool", name, summary, input: "{}", output: "" });
@@ -8,9 +8,10 @@ const text = (value: string): Extract<ConversationPart, { kind: "text" }> => ({ 
 const thinking = (value: string): Extract<ConversationPart, { kind: "thinking" }> => ({ kind: "thinking", text: value });
 
 describe("splitTurn", () => {
-  it("folds every action and the narration between them into the work; the trailing prose is the answer", () => {
-    const split = splitTurn([thinking("hm"), tool("read"), text("looking…"), tool("edit"), text("done"), text("really")]);
-    expect(split.work).toEqual([thinking("hm"), tool("read"), text("looking…"), tool("edit")]);
+  it("folds actions and explicit narration into work while every assistant response stays in the answer", () => {
+    const narration = { ...text("looking…"), phase: "commentary" as const };
+    const split = splitTurn([thinking("hm"), tool("read"), narration, tool("edit"), text("done"), text("really")]);
+    expect(split.work).toEqual([thinking("hm"), tool("read"), narration, tool("edit")]);
     expect(split.answer).toEqual([text("done"), text("really")]);
   });
 
@@ -18,8 +19,8 @@ describe("splitTurn", () => {
     expect(splitTurn([text("  \n"), text("hi")])).toEqual({ work: [], answer: [text("hi")] });
   });
 
-  it("is all work when the turn ends on an action (still running)", () => {
-    expect(splitTurn([text("on it"), tool("bash")])).toEqual({ work: [text("on it"), tool("bash")], answer: [] });
+  it("keeps an unphased response visible when a tool follows it", () => {
+    expect(splitTurn([text("The substantive answer"), tool("bash")])).toEqual({ work: [tool("bash")], answer: [text("The substantive answer")] });
   });
 
   it("keeps Codex commentary inside work even after the last tool or with no tools", () => {
@@ -31,6 +32,71 @@ describe("splitTurn", () => {
   it("honors an explicit final answer even if a later record contains an action", () => {
     const final = { ...text("Done"), phase: "final_answer" as const };
     expect(splitTurn([tool("exec_command"), final, tool("cleanup")])).toEqual({ work: [tool("exec_command"), tool("cleanup")], answer: [final] });
+  });
+
+  it("keeps a multi-step answer and later closing sentence outside the work block", () => {
+    const answer = text("The report contains three sections.\n\n1. Summary.\n2. Details.\n3. Next steps.");
+    const check = { ...tool("bash"), summary: "bun test report" };
+    const closing = text("The report is ready.");
+    const parts = [answer, check, closing];
+    expect(splitTurn(parts)).toEqual({ work: [check], answer: [answer, closing] });
+    expect(workStartsOpen(true, parts)).toBe(true);
+    expect(workStartsOpen(false, parts)).toBe(false);
+  });
+});
+
+describe("turnSegments", () => {
+  it("keeps words written before a tool above it, and each run of work where it happened", () => {
+    const parts = [thinking("hm"), text("I'll check."), tool("eval"), tool("eval"), text("  \n"), text("Found it."), tool("edit"), text("Done.")];
+    expect(turnSegments(parts)).toEqual([
+      { kind: "work", start: 0, parts: [thinking("hm")] },
+      { kind: "answer", start: 1, parts: [text("I'll check.")] },
+      { kind: "work", start: 2, parts: [tool("eval"), tool("eval")] },
+      { kind: "answer", start: 5, parts: [text("Found it.")] },
+      { kind: "work", start: 6, parts: [tool("edit")] },
+      { kind: "answer", start: 7, parts: [text("Done.")] },
+    ]);
+  });
+
+  it("names each run by its first part, so a run that splits keeps the later run's name", () => {
+    const before = turnSegments([tool("A"), text(""), tool("B"), text("between"), tool("C")]);
+    const after = turnSegments([tool("A"), text("arrived"), tool("B"), text("between"), tool("C")]);
+    const runs = (segments: typeof before) => segments.flatMap((segment) => segment.kind === "work" ? [segment.start] : []);
+    expect(runs(before)).toEqual([0, 4]);
+    expect(runs(after)).toEqual([0, 2, 4]);
+  });
+
+  it("keeps commentary inside its run of work and a tools-then-answer turn as one run", () => {
+    const narration = { ...text("looking\u2026"), phase: "commentary" as const };
+    expect(turnSegments([tool("read"), narration, tool("edit"), text("done")])).toEqual([
+      { kind: "work", start: 0, parts: [tool("read"), narration, tool("edit")] },
+      { kind: "answer", start: 3, parts: [text("done")] },
+    ]);
+    expect(turnSegments([])).toEqual([]);
+  });
+});
+
+describe("runNames", () => {
+  // what Turn keeps between draws: each part's run name, by part index
+  const draw = (parts: ConversationPart[], previous: ReadonlyMap<number, string>) => {
+    const runs = turnSegments(parts).flatMap((segment) => segment.kind === "work" ? [segment] : []);
+    const names = runNames(runs, new Map(parts.map((part, index) => [part, index])), previous);
+    return { names, next: new Map(runs.flatMap((run, index) => run.parts.map((part) => [parts.indexOf(part), names[index]!] as const))) };
+  };
+
+  it("names a run by its first part the first time, and keeps the name while its parts change", () => {
+    const narration = { ...text("Checking."), phase: "commentary" as const };
+    const first = draw([text("Checking."), tool("ls")], new Map());
+    expect(first.names).toEqual(["work:1"]);
+    expect(draw([narration, tool("ls")], first.next).names).toEqual(["work:1"]);
+  });
+
+  it("gives a split run's first part the old name and never hands a shown name to a new run", () => {
+    const shown = draw([tool("A"), text(""), tool("B"), text("between"), tool("C")], new Map());
+    expect(shown.names).toEqual(["work:0", "work:4"]);
+    expect(draw([tool("A"), text("arrived"), tool("B"), text("between"), tool("C")], shown.next).names).toEqual(["work:0", "work:2", "work:4"]);
+    // the run named work:0 now starts at 2; a new run at 0 must not take its name
+    expect(draw([tool("new"), text("between"), tool("A")], new Map([[2, "work:0"]])).names).toEqual(["work:0+", "work:0"]);
   });
 });
 
@@ -50,10 +116,10 @@ describe("workStartsOpen", () => {
     expect(workStartsOpen(false, [commentary("Checking."), tool("exec_command"), final("Done"), tool("cleanup")])).toBe(false);
   });
 
-  it("keeps a settled turn open when its words are followed by an action and no answer: the fold would hide all of them", () => {
-    expect(workStartsOpen(false, [text("on it"), tool("bash")])).toBe(true);
+  it("folds a settled turn when an unphased answer is followed by an action because the answer remains visible", () => {
+    expect(workStartsOpen(false, [text("The answer"), tool("bash")])).toBe(false);
     // a todo update after the closing summary is not even counted in the header
-    expect(workStartsOpen(false, [tool("read"), text("Here is the full answer."), tool("TodoWrite")])).toBe(true);
+    expect(workStartsOpen(false, [tool("read"), text("Here is the full answer."), tool("TodoWrite")])).toBe(false);
   });
 
   it("keeps a settled turn open when it ends in Codex commentary: folding would hide its last text", () => {
@@ -72,6 +138,33 @@ describe("workStartsOpen", () => {
     expect(workStartsOpen(false, [])).toBe(false);
     expect(workStartsOpen(false, [thinking("hm")])).toBe(false);
     expect(workStartsOpen(false, [tool("bash"), text("  ")])).toBe(false);
+  });
+});
+
+describe("workBlockStartsOpen", () => {
+  const commentary = (value: string) => ({ ...text(value), phase: "commentary" as const });
+  const running = { live: true, waiting: false, last: true };
+  const settled = { live: false, waiting: false, last: true };
+  const endsInWords = [tool("exec_command"), commentary("Still investigating")];
+
+  it("starts as it always has while Collapse work is off", () => {
+    expect(workBlockStartsOpen(running, [tool("bash")], false)).toBe(true);
+    expect(workBlockStartsOpen({ ...running, waiting: true }, [tool("bash")], false)).toBe(true);
+    expect(workBlockStartsOpen(settled, [tool("read"), text("done")], false)).toBe(false);
+    expect(workBlockStartsOpen(settled, endsInWords, false)).toBe(true);
+    // a run before the turn's last part: what follows it is still to read
+    expect(workBlockStartsOpen({ ...settled, last: false }, endsInWords, false)).toBe(false);
+    expect(workBlockStartsOpen({ ...running, live: false, last: false }, [tool("bash")], false)).toBe(false);
+  });
+
+  it("folds every block with Collapse work on, the running one and one ending in the agent's words included (#2228)", () => {
+    expect(workBlockStartsOpen(running, [tool("bash")], true)).toBe(false);
+    expect(workBlockStartsOpen(settled, endsInWords, true)).toBe(false);
+    expect(workBlockStartsOpen(settled, [tool("read"), text("done")], true)).toBe(false);
+  });
+
+  it("keeps the block that waits on the user open with Collapse work on: it may hold what they answer", () => {
+    expect(workBlockStartsOpen({ ...running, waiting: true }, [tool("bash")], true)).toBe(true);
   });
 });
 
@@ -125,6 +218,15 @@ it("keeps an approval-blocked assistant turn live, including with a last-activit
   expect(isLiveWorkTurn(turn, false, "blocked")).toBe(false);
   expect(isLiveWorkTurn(turn, true, "idle")).toBe(false);
   expect(isLiveWorkTurn({ ...turn, role: "user" }, true, "blocked")).toBe(false);
+});
+
+it("does not title a turn that ended on its final answer as running when the agent begins another by itself", async () => {
+  const { isLiveWorkTurn } = await import("./workBlocks.ts");
+  const answered = { role: "assistant" as const, ts: null, parts: [tool("Glob"), { kind: "text" as const, text: "The subagent is still running.", phase: "final_answer" as const }] };
+  // a background task ended: herdr says working, the new turn has no row yet, and nothing was sent from here
+  expect(isLiveWorkTurn(answered, true, "working")).toBe(false);
+  // words that are no final answer yet are the running turn's own
+  expect(isLiveWorkTurn({ ...answered, parts: [answered.parts[0]!, { kind: "text" as const, text: "Let me look." }] }, true, "working")).toBe(true);
 });
 
 it("does not title a finished turn as running after a message was sent over it", async () => {

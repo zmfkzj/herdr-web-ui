@@ -27,7 +27,7 @@ type Frame<T extends ClientMessage["type"]> = Extract<ClientMessage, { type: T }
  * they are called through: only a frame calls them. herdr's attach answer comes later than the
  * lane too, so `terminalAttachKnown` reads it as it is now.
  */
-export function createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight, poke, terminalAttach, terminalAttachKnown, mayType, authorizeSocket, gui }: {
+export function createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight, poke, terminalAttach, terminalAttachKnown, mayType, authorizeSocket, gui = { typed() {} } }: {
   TYPED_SETTLE_MS: number;
   KEY_SETTLE_MS: number;
   clients: Set<Client>;
@@ -37,8 +37,8 @@ export function createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight
   terminalAttachKnown: () => boolean | null;
   mayType: (client: Client) => boolean;
   authorizeSocket: (client: Client) => void;
-  /** `/gui view` typed into a terminal (gui-view.ts): told what each connection's typing delivered */
-  gui: Pick<GuiViews, "typed">;
+  /** `/gui view` typed into a terminal (gui-view.ts): told what each connection's typing delivered; none without the Pi visual tools */
+  gui?: Pick<GuiViews, "typed">;
 }) {
   /** each pane's input while a composer message is in flight, one step after another */
   const paneQueues = new Map<string, Promise<unknown>>();

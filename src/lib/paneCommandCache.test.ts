@@ -1,7 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 
 import type { SlashCommand } from "../../shared/protocol.ts";
-import { cachedPaneCommands, invalidatePaneCommands, onPaneCommandsInvalidated } from "./paneCommandCache.ts";
+import { cachedPaneCommands, invalidatePaneCommands, onPaneCommandsInvalidated, paneCommandsNow } from "./paneCommandCache.ts";
 
 describe("cachedPaneCommands", () => {
   test("answers once a minute per PC, pane and agent, and asks again for another agent in the same pane", async () => {
@@ -22,6 +22,16 @@ describe("cachedPaneCommands", () => {
     await cachedPaneCommands("w1:p1", "studio", "omo", fetchCommands);
     await cachedPaneCommands("w1:p2", "local", "omo", fetchCommands);
     expect(fetched).toEqual(["w1:p1", "w1:p1", "w1:p1", "w1:p2"]);
+  });
+
+  test("a pane with no agent named lists no commands, and asks nothing (a new tab's chat mounts before the roster names its agent)", async () => {
+    let asked = 0;
+    const fetchCommands = async (): Promise<SlashCommand[]> => { asked += 1; return [{ name: "help", description: "", source: "builtin" }]; };
+    expect(await cachedPaneCommands("w0:p1", "local", null, fetchCommands)).toEqual([]);
+    expect(await cachedPaneCommands("w0:p1", "local", undefined, fetchCommands)).toEqual([]);
+    expect(asked).toBe(0);
+    expect(await cachedPaneCommands("w0:p1", "local", "claude", fetchCommands)).toHaveLength(1);
+    expect(asked).toBe(1);
   });
 
   test("an invalidated pane asks again for every agent, tells its listeners, and leaves other panes cached", async () => {
@@ -62,5 +72,45 @@ describe("cachedPaneCommands", () => {
     // the list the catalog change made is what the pane keeps for the next minute
     expect(await cachedPaneCommands("w3:p1", "local", "omo", fetchCommands)).toBe(freshRows);
     expect(resolvers.length).toBe(2);
+  });
+
+  test("the components of a pane that mount together share one read, and a call after an invalidation starts a fresh one", async () => {
+    const resolvers: ((commands: SlashCommand[]) => void)[] = [];
+    const fetchCommands = (): Promise<SlashCommand[]> => new Promise((resolve) => { resolvers.push(resolve); });
+    // the terminal, the chat, its skill chips and the composer
+    const mounted = [1, 2, 3, 4].map(() => cachedPaneCommands("w4:p1", "local", "claude", fetchCommands));
+    expect(resolvers.length).toBe(1);
+    invalidatePaneCommands("w4:p1", "local");
+    const fresh = [1, 2].map(() => cachedPaneCommands("w4:p1", "local", "claude", fetchCommands));
+    expect(resolvers.length).toBe(2);
+    const freshRows: SlashCommand[] = [{ name: "fresh", description: "", source: "builtin" }];
+    resolvers[1]!(freshRows);
+    for (const read of fresh) expect(await read).toBe(freshRows);
+    const staleRows: SlashCommand[] = [{ name: "stale", description: "", source: "builtin" }];
+    resolvers[0]!(staleRows);
+    for (const read of mounted) expect(await read).toBe(staleRows);
+    expect(paneCommandsNow("w4:p1", "local", "claude")).toBe(freshRows);
+  });
+
+  test("paneCommandsNow serves the last list at any age while a new read is on its way, until an invalidation", async () => {
+    const rows: SlashCommand[] = [{ name: "review", description: "", source: "skill" }];
+    try {
+      await cachedPaneCommands("w5:p1", "local", "claude", async () => rows);
+      expect(paneCommandsNow("w5:p1", "local", "pi")).toBeNull();
+      expect(paneCommandsNow("w5:p1", "studio", "claude")).toBeNull();
+      setSystemTime(new Date(Date.now() + 61_000));
+      // a chat opened again a minute later draws its skill chips with the list it has, while it asks again
+      let answer!: (commands: SlashCommand[]) => void;
+      const fresh = cachedPaneCommands("w5:p1", "local", "claude", () => new Promise((resolve) => { answer = resolve; }));
+      expect(paneCommandsNow("w5:p1", "local", "claude")).toBe(rows);
+      const freshRows: SlashCommand[] = [{ name: "deploy", description: "", source: "skill" }];
+      answer(freshRows);
+      expect(await fresh).toBe(freshRows);
+      expect(paneCommandsNow("w5:p1", "local", "claude")).toBe(freshRows);
+      invalidatePaneCommands("w5:p1", "local");
+      expect(paneCommandsNow("w5:p1", "local", "claude")).toBeNull();
+    } finally {
+      setSystemTime();
+    }
   });
 });

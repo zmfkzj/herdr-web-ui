@@ -21,6 +21,8 @@ import { actualSizeFactor, arrowAction, wrapIndex, zoomPercent, type GalleryImag
 import { usePhoneSheetBack } from "../lib/sheetHistory.ts";
 import { useSheetSwipe } from "../lib/sheets.ts";
 import { nativeModalOver, useFocusTrap } from "../lib/useFocusTrap.ts";
+import { useResourceUrl } from "../lib/useResourceUrl.ts";
+import { getTransport } from "../lib/transport.ts";
 import { FIT, MAX_ZOOM, MIN_ZOOM, PAN_STEP, STEP, zoomAt, type View } from "./MermaidLightbox.tsx";
 
 export function ImageLightbox({ images, index, onClose, onReview }: { images: GalleryImage[]; index: number; onClose: () => void; onReview?: (image: GalleryImage) => void }) {
@@ -43,6 +45,9 @@ export function ImageLightbox({ images, index, onClose, onReview }: { images: Ga
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const count = images.length;
   const image = images[current];
+  const src = useResourceUrl(image?.src ?? null);
+  const download = useResourceUrl(image?.src.startsWith("/api/") && getTransport().kind === "relay"
+    ? `${image.src}${image.src.includes("?") ? "&" : "?"}download=1` : image?.src ?? null);
   const many = count > 1;
   const copyable = canCopyImage();
 
@@ -168,7 +173,7 @@ export function ImageLightbox({ images, index, onClose, onReview }: { images: Ga
             {copied === "done" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
           </button>}
           {onReview && <button type="button" className="icon-button" disabled={unavailable} onClick={() => onReview(image)} aria-label={t("Image comments")} title={t("Image comments")}><MessageSquare aria-hidden="true" /></button>}
-          <a className="icon-button" href={image.src} download={image.file} aria-label={t("Download")} title={t("Download")}><Download aria-hidden="true" /></a>
+          <a className="icon-button" href={download ?? undefined} download={image.file} aria-label={t("Download")} title={t("Download")}><Download aria-hidden="true" /></a>
           <button ref={close} type="button" className="icon-button" onClick={onClose} aria-label={t("Close")} title={t("Close")}><X aria-hidden="true" /></button>
         </div>
         <div
@@ -184,7 +189,7 @@ export function ImageLightbox({ images, index, onClose, onReview }: { images: Ga
             {!unavailable && <img
               ref={picture}
               key={image.src}
-              src={image.src}
+              src={src ?? undefined}
               alt={image.name}
               draggable={false}
               onLoad={measure}

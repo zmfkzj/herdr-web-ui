@@ -85,7 +85,7 @@ try {
   const manager = { endpoint: () => endpoint, trackTerminal: () => () => {} } as unknown as MachineManager;
   proxy = Bun.serve<{ relay: MachineRelay }>({ port: 0, hostname: "127.0.0.1", async fetch(request, app) {
     if (new URL(request.url).pathname !== "/ws") return new Response("not found", { status: 404 });
-    const relay = new MachineRelay(manager, "fixture-pc"); relays.add(relay);
+    const relay = new MachineRelay(manager, "fixture-pc", false, (snapshot) => snapshot); relays.add(relay);
     try { await relay.ready; } catch { relay.close(); return new Response("upstream failed", { status: 502 }); }
     if (app.upgrade(request, { data: { relay } })) return;
     relay.close(); return new Response("upgrade failed", { status: 400 });

@@ -1,6 +1,6 @@
-import { MachineContext, useMachineApi, useMachineId } from "../lib/machineContext.tsx";
+import { useAppLayout, MachineContext, useMachineApi, useMachineId } from "../lib/machineContext.tsx";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ComponentType, type FocusEvent as ReactFocusEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from "react";
-import { Bell, Columns2, CornerLeftUp, Folder, FolderOpen, FolderSearch, History, LoaderCircle, Maximize2, MessageSquarePlus, Minimize2, Monitor, PanelLeft, Pin, Plus, Puzzle, RefreshCw, Rows2, Settings, SunMoon, SwitchCamera, X } from "lucide-react";
+import { Bell, Columns2, CornerLeftUp, Folder, FolderInput, FolderOpen, FolderSearch, History, ListFilter, LoaderCircle, Maximize2, MessageSquarePlus, Minimize2, Monitor, PanelLeft, Pencil, Pin, Plus, Puzzle, RefreshCw, Rows2, Settings, SunMoon, SwitchCamera, X } from "lucide-react";
 
 import "./CommandPalette.css";
 
@@ -20,11 +20,13 @@ import { displayPaneTitle, StatusBadge } from "./Sidebar.tsx";
 import { PAGES } from "./SettingsDialog.tsx";
 import { folderName, placeLine } from "../lib/paneName.ts";
 import { agentTabName } from "../lib/sidebarAgents.ts";
-import { tabLabel } from "../lib/tabName.ts";
+import { autoTabLabel, tabLabel } from "../lib/tabName.ts";
+import { shownTabLabels, subscribeTabLabels } from "../lib/tabLabels.ts";
 import { useT } from "../lib/i18n.ts";
 import { useFocusTrap } from "../lib/useFocusTrap.ts";
 import { useSheetSwipe } from "../lib/sheets.ts";
 import { usePhoneSheetBack } from "../lib/sheetHistory.ts";
+import { CRAMPED_QUERY, loneTabHidden } from "../lib/paneCanvas.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
 import { useWorktreeBranches } from "../lib/useWorktreeBranches.ts";
 import { worktreeLabel } from "../lib/worktreeName.ts";
@@ -50,6 +52,8 @@ interface CommandPaletteProps {
   selectedPaneId: string | null;
   view: PaneView;
   actions: AppActions;
+  /** this device may only watch: the PCs refuse it their checkouts, so no branch is read (#2250) */
+  watching?: boolean;
 }
 
 interface PaletteAction {
@@ -148,11 +152,14 @@ function ShortcutHint({ shortcutId }: { shortcutId?: ShortcutId }) {
   return <span className="palette-shortcut" aria-label={keys.join(" + ")}>{keys.map((key) => <kbd className="kbd" key={key}>{key}</kbd>)}</span>;
 }
 
-export function CommandPalette({ open, initialQuery = "", onClose, machines, onSelect, snapshot, online, selectedPaneId, view, actions }: CommandPaletteProps) {
+export function CommandPalette({ open, initialQuery = "", onClose, machines, onSelect, snapshot, online, selectedPaneId, view, actions, watching = false }: CommandPaletteProps) {
   const t = useT();
+  const { settings } = useSettings();
+  const firstLines = useSyncExternalStore(subscribeTabLabels, shownTabLabels, shownTabLabels);
   const machineId = useMachineId();
   const api = useMachineApi();
   const touch = useMediaQuery("(pointer: coarse)");
+  const cramped = useMediaQuery(CRAMPED_QUERY);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<PaletteStatusFilter>("all");
   const [selection, setSelection] = useState<PaletteSelection>(NO_SELECTION);
@@ -196,10 +203,12 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
       return new Map(previous).set(id, inventory);
     });
   }, []);
-  const branches = useMemo<MachineBranches>(() => new Map(machines.flatMap((machine) => {
+  // the palette stays mounted while closed: what it read while driving is dropped when the device turns to watching
+  useEffect(() => { if (watching) setInventories((previous) => previous.size === 0 ? previous : new Map()); }, [watching]);
+  const branches = useMemo<MachineBranches>(() => watching ? new Map() : new Map(machines.flatMap((machine) => {
     const inventory = inventories.get(machine.id);
     return inventory?.signature === worktreeWorkspaceSignature(machine.snapshot?.workspaces ?? []) ? [[machine.id, inventory.branches] as const] : [];
-  })), [inventories, machines]);
+  })), [inventories, machines, watching]);
 
   // Terminal attachment can move focus after the palette opens. Escape belongs to
   // this modal even then, and must not leak through to the underlying terminal.
@@ -293,15 +302,23 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
   // the mode the zoom item names, never a toggle (lib/layoutMap.ts): herdr focuses the pane and
   // then sets the tab's flag, so a toggle on a pane other than the one shown alone would unzoom the tab
   const zoom = tabLayout !== undefined && selectedPaneId !== null ? zoomMode(tabLayout, selectedPaneId) : null;
-  const { splitPane, zoomPane } = actions;
+  // on a PC the Herdr app's window lays out (lib/machineContext.tsx) the tab's name and workspace are the
+  // app's; App already gives no split or zoom there (lib/layoutActions.ts)
+  const appLayout = useAppLayout();
+  const splitPane = actions.splitPane;
+  const zoomPane = actions.zoomPane;
   // browsing starts in the selected pane's folder, home without one
   const selectedPane = snapshot?.panes.find((pane) => pane.pane_id === selectedPaneId);
   const browseStart = selectedPane && panePath(selectedPane) ? panePath(selectedPane) : null;
+  // Rename tab opens the tab strip's name field: not offered where the strip is left out (a lone tab on a cramped screen)
+  const tabCount = selectedPane ? snapshot?.tabs.filter((tab) => tab.workspace_id === selectedPane.workspace_id).length ?? 0 : 0;
+  const stripDrawn = selectedPane !== undefined && !loneTabHidden(cramped, tabCount);
 
   const paletteActions = useMemo<PaletteAction[]>(() => [
     { id: "new", label: t("New workspace"), icon: MessageSquarePlus, shortcut: "new-session", run: actions.openNewSession },
     // in the selected pane's workspace: nothing to add a tab to without one
     ...(selectedPaneId !== null ? [{ id: "new-tab", label: t("New tab"), icon: Plus, shortcut: "new-tab", run: () => actions.openNewTab() }] satisfies PaletteAction[] : []),
+    ...(selectedPaneId !== null && stripDrawn && !appLayout ? [{ id: "rename-tab", label: t("Rename tab"), icon: Pencil, shortcut: "rename-tab", run: actions.renameTab }] satisfies PaletteAction[] : []),
     // herdr's prefix+v and prefix+-: the new pane is opened here only when asked, as herdr's --focus
     ...(splitPane ? [
       { id: "split-right", label: t("Split pane right"), icon: Columns2, shortcut: "split-right", run: () => splitPane("right") },
@@ -312,6 +329,8 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
     ...(zoomPane && zoom && tabPanes > 1 ? [{ id: "zoom", label: t(zoom === "off" ? "Unzoom pane" : "Zoom pane"), icon: zoom === "off" ? Minimize2 : Maximize2, run: () => zoomPane(zoom) }] : []),
     { id: "view", label: t(view === "chat" ? "Switch to terminal" : "Switch to chat"), icon: SwitchCamera, shortcut: "toggle-view", run: actions.toggleView },
     { id: "sidebar", label: t("Toggle sidebar"), icon: PanelLeft, shortcut: "toggle-sidebar", run: actions.toggleSidebar },
+    // the sidebar's Filter field, also where Settings → Appearance → Sidebar filter leaves it out
+    { id: "filter-sidebar", label: t("Filter workspaces and agents"), icon: ListFilter, run: actions.openSidebarFilter },
     { id: "theme", label: t("Toggle theme"), icon: SunMoon, run: actions.toggleTheme },
     { id: "settings", label: t("Settings"), icon: Settings, shortcut: "settings", run: actions.openSettings },
     { id: "add-pc", label: t("Add PC"), icon: Monitor, run: actions.openAddPc },
@@ -319,7 +338,7 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
     ...(actions.openFiles ? [{ id: "files", label: t("Browse files"), icon: FolderOpen, run: actions.openFiles }] : []),
     ...(online ? [{ id: "browse-folders", label: t("Browse folders"), icon: FolderSearch, keepOpen: true, run: () => browseTo(browseStart ?? home ?? "~") }] : []),
     { id: "refresh", label: t("Refresh"), icon: RefreshCw, run: actions.refresh },
-  ], [actions, splitPane, zoomPane, tabPanes, zoom, view, t, selectedPaneId, online, browseTo, browseStart, home]);
+  ], [actions, splitPane, zoomPane, tabPanes, zoom, view, t, selectedPaneId, stripDrawn, appLayout, online, browseTo, browseStart, home]);
 
   // Settings pages and groups are found by a query only, and open on the page itself, a group's
   // scrolled to and focused: the dialog reads the request as it mounts
@@ -336,6 +355,14 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
     } satisfies PaletteAction, aliases }));
   }, [actions, t]);
   const aliasesByAction = useMemo(() => actionAliases(t), [t]);
+  // the selected one-pane tab to another workspace of its PC, one row each, found by a query only as Settings pages are
+  const selectedWorkspace = selectedPane?.workspace_id ?? null;
+  const moveActions = useMemo<PaletteAction[]>(() => selectedTab === null || tabPanes !== 1 || appLayout ? [] : (snapshot?.workspaces ?? [])
+    .filter((entry) => entry.workspace_id !== selectedWorkspace)
+    .map((entry) => ({ id: `move-tab-${entry.workspace_id}`, label: t("Move tab to {workspace}", { workspace: entry.label }), icon: FolderInput,
+      // a refusal is said over the pane (App): the palette has closed by then
+      run: () => { void actions.moveTabToWorkspace({ machineId, tabId: selectedTab, workspaceId: entry.workspace_id, notice: true }).catch(() => undefined); } })),
+  [actions, appLayout, machineId, selectedTab, selectedWorkspace, snapshot?.workspaces, t, tabPanes]);
 
   const allPanes = useMemo(() => machines.flatMap((machine) => machine.state === "connected" ? machine.snapshot?.panes ?? [] : []), [machines]);
   const multiMachine = machines.length > 1;
@@ -384,7 +411,7 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
     }
     if (actionsOnly || filter === "all") {
       // a name found only through an alias comes after the titles that hold the query
-      const visible = rankByTitle(text, paletteActions.map((action) => ({ item: action, title: action.label, aliases: aliasesByAction[action.id] })));
+      const visible = rankByTitle(text, [...paletteActions, ...(text === "" ? [] : moveActions)].map((action) => ({ item: action, title: action.label, aliases: aliasesByAction[action.id] })));
       if (visible.length > 0) list.push({ id: "actions", heading: t("Actions"), machineName: multiMachine ? selectedMachineName : undefined, branch: null, placeNamesWorkspace: false, rows: visible.map((action) => ({ kind: "action", action })) });
       const pages = text === "" ? [] : rankByTitle(text, settingsActions.map(({ action, aliases }) => ({ item: action, title: action.label, aliases })));
       if (pages.length > 0) list.push({ id: "settings-pages", heading: t("Settings"), machineName: multiMachine ? selectedMachineName : undefined, branch: null, placeNamesWorkspace: false, rows: pages.map((action) => ({ kind: "action", action })) });
@@ -392,7 +419,7 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
       if (offered.length > 0) list.push({ id: "plugins", heading: t("Plugin actions"), machineName: multiMachine ? selectedMachineName : undefined, branch: null, placeNamesWorkspace: false, rows: offered.map((item) => ({ kind: "plugin", offered: item })) });
     }
     return list;
-  }, [actionsOnly, text, filter, machines, multiMachine, selectedMachineName, machineId, branches, recentPaneIds, selectedPaneId, paletteActions, aliasesByAction, settingsActions, plugins, t, folder?.directory, folder?.filter, query, browse, home, pins, recentFolders, snapshot, actions]);
+  }, [actionsOnly, text, filter, machines, multiMachine, selectedMachineName, machineId, branches, recentPaneIds, selectedPaneId, paletteActions, moveActions, aliasesByAction, settingsActions, plugins, t, folder?.directory, folder?.filter, query, browse, home, pins, recentFolders, snapshot, actions]);
 
   const rows = useMemo(() => sections.flatMap((section) => section.rows), [sections]);
   const rowKeys = useMemo(() => sections.flatMap((section) => section.rows.map((row) => rowKey(section.id, row))), [sections]);
@@ -599,11 +626,15 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
     const { tab, all } = tabOf(row);
     return agentTabName(tab, all, t);
   };
+  // the footer names a tab as the strip draws it, a label from its first message included (lib/tabName.ts)
+  const placeTabName = ({ machine }: MachinePane, tab: TabInfo, place: number): string => (settings.autoTabNames
+    ? autoTabLabel(tab, machine.snapshot?.panes.filter((pane) => pane.tab_id === tab.tab_id) ?? [], machine.id, firstLines, place) : null)
+    ?? tabLabel(tab, t, place);
   const activeRow = rows[activeIndex];
   const activeWorkspace = activeRow?.kind === "pane" ? activeRow.machine.snapshot?.workspaces.find((workspace) => workspace.workspace_id === activeRow.pane.workspace_id) : undefined;
   const activeTab = activeRow?.kind === "pane" ? tabOf(activeRow) : undefined;
   const footerPlace = activeRow?.kind === "pane"
-    ? [multiMachine ? activeRow.machine.name : null, activeWorkspace?.label ?? t("Unknown workspace"), activeTab?.tab ? tabLabel(activeTab.tab, t, activeTab.place) : null].filter(Boolean).join(" › ")
+    ? [multiMachine ? activeRow.machine.name : null, activeWorkspace?.label ?? t("Unknown workspace"), activeTab?.tab ? placeTabName(activeRow, activeTab.tab, activeTab.place) : null].filter(Boolean).join(" › ")
     : activeRow?.kind === "action" ? activeRow.action.label
     : activeRow?.kind === "folder" ? activeRow.label
     : activeRow?.offered.action.title ?? "";
@@ -622,7 +653,7 @@ export function CommandPalette({ open, initialQuery = "", onClose, machines, onS
   let rowIndex = 0;
   return (
     <div className="modal-scrim palette-scrim" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      {machines.filter((machine) => machine.state === "connected").map((machine) => <MachineContext.Provider key={machine.id} value={machine.id}><PaletteBranchReader machine={machine} onChange={onInventory} /></MachineContext.Provider>)}
+      {!watching && machines.filter((machine) => machine.state === "connected").map((machine) => <MachineContext.Provider key={machine.id} value={machine.id}><PaletteBranchReader machine={machine} onChange={onInventory} /></MachineContext.Provider>)}
       <section ref={surface} className="menu command-palette" role="dialog" aria-modal="true" aria-label={t("Command palette")} onKeyDown={onSurfaceKeyDown} onFocus={onSurfaceFocus}>
         <div className="palette-search">
           <input ref={inputRef} className="input" type="search" value={query} placeholder={t("Search panes and actions…")} aria-label={t("Search panes and actions")} aria-controls="palette-results" aria-activedescendant={itemCount ? `palette-item-${activeIndex}` : undefined} onKeyDown={onInputKeyDown} onChange={(event) => { setQuery(event.target.value); setSelection(NO_SELECTION); }} />

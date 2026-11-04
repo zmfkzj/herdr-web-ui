@@ -9,6 +9,7 @@
  * Read only, on purpose: an OAuth token is never refreshed here. Claude, Codex, Cursor and Grok
  * rotate refresh tokens, so a refresh the CLI did not make logs the CLI out. An expired token is
  * reported as `expired` instead; the CLI refreshes its own file the next time it runs.
+ * Antigravity uses its official CLI only when HTTP omits Gemini quotas; the CLI owns its authentication.
  *
  * Nothing runs in the background: a provider is asked only when a client asks this server, at
  * most every FRESH_MS unless the client forces it, which is still limited to one ask per
@@ -17,10 +18,12 @@
 
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { closeSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { readStatusline, type StatuslinePayload } from "./statusline.ts";
+import { installStatusline, removeStatusline, StatuslineInstallError, statuslineInstallState, type StatuslineInstallState } from "./statusline-install.ts";
 import type { ProviderUsage, UsageProblem, UsageProviderId, UsageReport, UsageWindow } from "../shared/protocol.ts";
 import { jsonResponse } from "./http.ts";
 import { opencodeDatabasePath } from "./opencode.ts";
@@ -45,7 +48,9 @@ export interface UsageContext {
   fetch(url: string, init: RequestInit): Promise<Response>;
   keychain(service: string, account?: string): Promise<KeychainRead>;
   /** a command's trimmed stdout, or null when it is missing, fails or hangs */
-  run(argv: string[]): Promise<string | null>;
+  run(argv: string[], timeoutMs?: number): Promise<string | null>;
+  /** whether a command is installed on this server's PATH */
+  has(command: string): boolean;
   now(): number;
 }
 
@@ -77,21 +82,34 @@ interface SignIn {
  * across reads; one PC can hold several, each of its own account. `locked`: a keychain item this
  * session cannot read.
  */
-type Found = { source: string } & (SignIn | { locked: true; account?: Account | null });
+type Found = { source: string; home?: CredentialHome } & (SignIn | { locked: true; account?: Account | null });
+
+/**
+ * Where a Claude or Codex sign-in lives, as its CLI is told to sign in there again: the default home
+ * (no variable set, the keychain item the CLI names by default), or a directory, as it was configured.
+ * A tag, not a source string: a configured directory may well be named `default` or `keychain`.
+ */
+export type CredentialHome = { readonly kind: "default" } | { readonly kind: "dir"; readonly dir: string };
 
 interface Reading {
   plan: string | null;
   windows: UsageWindow[];
   /** whose numbers these are, when the answer says and the sign-in did not */
   account?: Account | null;
+  /** when a local reading was taken (epoch ms); an endpoint's answer is taken now */
+  checkedAt?: number;
 }
 
 export interface UsageProvider {
   id: UsageProviderId;
   /** every sign-in of this provider on this PC; none when not signed in here */
   signIns(ctx: UsageContext): Promise<Found[]>;
+  /** A token-free reading matched to this sign-in; checked before endpoint expiry/backoff gates. */
+  readLocal?(ctx: UsageContext, signIn: SignIn): Reading | null;
   /** null: signed in, but to an account without this plan */
   read(ctx: UsageContext, signIn: SignIn): Promise<Reading | null>;
+  /** the command a sign-in may be kept behind that this PC lacks, so `signIns` could not look there; null when none */
+  missingCommand?(ctx: UsageContext): string | null;
 }
 
 /** an answer past MAX_READ_BYTES */
@@ -273,14 +291,26 @@ function claudeAccount(path: string): Account | null {
  * pointed at (CLAUDE_CONFIG_DIR, and ~/.claude-* for the usual second account). For such a
  * directory it names the keychain item after the directory's hash, and keeps .claude.json in it.
  */
-function claudeHomes(ctx: UsageContext): Array<{ source: string; service: string; dir: string; config: string }> {
-  const homes = [{ source: "default", service: "Claude Code-credentials", dir: join(ctx.home, ".claude"), config: join(ctx.home, ".claude.json") }];
+function claudeHomes(ctx: UsageContext): ClaudeHome[] {
   const dirs = [ctx.env["CLAUDE_CONFIG_DIR"], ...siblingDirs(ctx.home, ".claude-")].filter((dir): dir is string => Boolean(dir));
-  for (const dir of new Set(dirs)) {
-    const hash = createHash("sha256").update(dir).digest("hex").slice(0, 8);
-    homes.push({ source: dir, service: `Claude Code-credentials-${hash}`, dir, config: join(dir, ".claude.json") });
-  }
-  return homes;
+  return [claudeHome(ctx, { kind: "default" }), ...[...new Set(dirs)].map((dir) => claudeHome(ctx, { kind: "dir", dir }))];
+}
+
+interface ClaudeHome { source: string; service: string; dir: string; config: string; home: CredentialHome }
+
+function claudeHome(ctx: UsageContext, home: CredentialHome): ClaudeHome {
+  if (home.kind === "default") return { source: "default", service: "Claude Code-credentials", dir: join(ctx.home, ".claude"), config: join(ctx.home, ".claude.json"), home };
+  const hash = createHash("sha256").update(home.dir).digest("hex").slice(0, 8);
+  return { source: home.dir, service: `Claude Code-credentials-${hash}`, dir: home.dir, config: join(home.dir, ".claude.json"), home };
+}
+
+/** the sign-in one Claude home holds: its keychain item or its credentials file, whichever is later */
+async function claudeFound(ctx: UsageContext, home: ClaudeHome): Promise<Found[]> {
+  const user = ctx.env["USER"];
+  const account = claudeAccount(home.config);
+  const keychain = await fromKeychain(ctx, home.service, user ? [user, undefined] : [undefined], claudeSignIn);
+  const file = claudeSignIn(readText(join(home.dir, ".credentials.json")));
+  return keychainOrFile(keychain, file, home.source, account).map((found) => ({ ...found, home: home.home }));
 }
 
 function claudeSignIn(source: string | null): SignIn | null {
@@ -297,17 +327,28 @@ function claudeWindow(value: unknown, kind: UsageWindow["kind"], scope: string |
   return used === null ? null : { kind, scope, used_percent: percent(used), resets_at: resetsAt, starts_at: startOf(resetsAt, seconds) };
 }
 
+/**
+ * Claude's windows from the payload its own status line draws (server/statusline.ts): the five-hour
+ * session and the week, exactly the numbers the CLI shows, with no request and no token. The API
+ * below stays the fallback for a machine whose status line has not written a payload yet.
+ */
+function claudeStatuslineWindows(payload: StatuslinePayload): UsageWindow[] {
+  const windows: UsageWindow[] = [];
+  if (payload.fiveHour) windows.push({ kind: "session", scope: null, used_percent: percent(payload.fiveHour.usedPercent), resets_at: payload.fiveHour.resetsAt, starts_at: startOf(payload.fiveHour.resetsAt, FIVE_HOURS) });
+  if (payload.sevenDay) windows.push({ kind: "week", scope: null, used_percent: percent(payload.sevenDay.usedPercent), resets_at: payload.sevenDay.resetsAt, starts_at: startOf(payload.sevenDay.resetsAt, SEVEN_DAYS) });
+  return windows;
+}
+
 const claude: UsageProvider = {
   id: "claude",
   async signIns(ctx) {
-    const user = ctx.env["USER"];
-    const found = await Promise.all(claudeHomes(ctx).map(async (home) => {
-      const account = claudeAccount(home.config);
-      const keychain = await fromKeychain(ctx, home.service, user ? [user, undefined] : [undefined], claudeSignIn);
-      const file = claudeSignIn(readText(join(home.dir, ".credentials.json")));
-      return keychainOrFile(keychain, file, home.source, account);
-    }));
-    return found.flat();
+    return (await Promise.all(claudeHomes(ctx).map((home) => claudeFound(ctx, home)))).flat();
+  },
+  readLocal(ctx, signIn) {
+    const local = readStatusline(ctx.home, ctx.now());
+    if (!local?.account || local.account.id !== signIn.account?.id) return null;
+    const windows = claudeStatuslineWindows(local);
+    return windows.length > 0 ? { plan: signIn.plan ?? null, windows, checkedAt: local.readAt } : null;
   },
   async read(ctx, signIn) {
     const body = await requestJson(ctx, "https://api.anthropic.com/api/oauth/usage", {
@@ -356,17 +397,25 @@ function codexWindow(value: unknown, now: number): UsageWindow | null {
   return { kind: kindOf(seconds, "session"), scope: null, used_percent: percent(used), resets_at: resetsAt, starts_at: startOf(resetsAt, seconds) };
 }
 
+/** the sign-in a Codex home's auth.json holds, listed as that directory */
+function codexFileFound(home: string): Found[] {
+  const signIn = codexSignIn(readText(join(home, "auth.json")));
+  return signIn ? [{ ...signIn, source: home, home: { kind: "dir", dir: home } }] : [];
+}
+
+/** the `Codex Auth` keychain item, which Codex's default home may keep its sign-in in instead of a file */
+async function codexKeychainFound(ctx: UsageContext): Promise<Found[]> {
+  return keychainFound(await fromKeychain(ctx, "Codex Auth", [undefined], codexSignIn), "keychain")
+    .map((found): Found => ({ ...found, home: { kind: "default" } }));
+}
+
 const codex: UsageProvider = {
   id: "codex",
   async signIns(ctx) {
     // CODEX_HOME points Codex elsewhere; ~/.codex-* is where a second account usually lives
     const homes = [ctx.env["CODEX_HOME"], join(ctx.home, ".config", "codex"), join(ctx.home, ".codex"), ...siblingDirs(ctx.home, ".codex-")];
-    const found: Found[] = [];
-    for (const home of new Set(homes.filter((home): home is string => Boolean(home)))) {
-      const signIn = codexSignIn(readText(join(home, "auth.json")));
-      if (signIn) found.push({ ...signIn, source: home });
-    }
-    return found.length ? found : keychainFound(await fromKeychain(ctx, "Codex Auth", [undefined], codexSignIn), "keychain");
+    const found = [...new Set(homes.filter((home): home is string => Boolean(home)))].flatMap(codexFileFound);
+    return found.length ? found : codexKeychainFound(ctx);
   },
   async read(ctx, signIn) {
     const body = await requestJson(ctx, "https://chatgpt.com/backend-api/wham/usage", {
@@ -627,6 +676,21 @@ const ANTIGRAVITY_BUCKETS: Record<string, { kind: UsageWindow["kind"]; scope: st
   "3p-weekly": { kind: "week", scope: "Other models" },
 };
 
+function antigravityWindows(groups: unknown): UsageWindow[] {
+  const windows: UsageWindow[] = [];
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const buckets = record(group)["buckets"];
+    for (const bucket of Array.isArray(buckets) ? buckets : []) {
+      const value = record(bucket);
+      const shape = ANTIGRAVITY_BUCKETS[text(value["bucketId"] ?? value["id"]) ?? ""];
+      const remaining = number(value["remainingFraction"] ?? value["remaining_fraction"]);
+      // Missing fractions are unknown, not exhausted; bucket names do not state a start time.
+      if (shape && remaining !== null) windows.push({ ...shape, used_percent: percent((1 - remaining) * 100), resets_at: isoTime(value["resetTime"] ?? value["reset_time"]), starts_at: null });
+    }
+  }
+  return windows;
+}
+
 const antigravity: UsageProvider = {
   id: "antigravity",
   async signIns(ctx) {
@@ -637,6 +701,8 @@ const antigravity: UsageProvider = {
       : await fromKeychain(ctx, "gemini", ["antigravity"], antigravitySignIn);
     return keychainOrFile(keychain, file, "keychain");
   },
+  // Linux: the CLI keeps its sign-in in the Secret Service keyring, read here only through secret-tool
+  missingCommand: (ctx) => ctx.platform === "linux" && !ctx.has("secret-tool") ? "secret-tool" : null,
   async read(ctx, signIn) {
     const init: RequestInit = {
       method: "POST",
@@ -650,18 +716,13 @@ const antigravity: UsageProvider = {
       if (error instanceof UsageHttpError && (error.status === 401 || error.status === 403 || error.status === 429)) throw error;
       body = await requestJson(ctx, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary", init);
     }
-    const groups = body["groups"] ?? record(body["response"])["groups"];
-    const windows: UsageWindow[] = [];
-    for (const group of Array.isArray(groups) ? groups : []) {
-      const buckets = record(group)["buckets"];
-      for (const bucket of Array.isArray(buckets) ? buckets : []) {
-        const value = record(bucket);
-        const shape = ANTIGRAVITY_BUCKETS[text(value["bucketId"]) ?? ""];
-        const remaining = number(value["remainingFraction"]);
-        // no fraction is left out, as OpenUsage does, rather than shown as 0% or 100% used
-        // no start: a bucket's name gives a length, not whether its reset ends a fixed window or refills it
-        if (shape && remaining !== null) windows.push({ ...shape, used_percent: percent((1 - remaining) * 100), resets_at: isoTime(value["resetTime"]), starts_at: null });
-      }
+    const windows = antigravityWindows(body["groups"] ?? record(body["response"])["groups"]);
+    if (windows.some((window) => window.scope === null)) return { plan: null, windows };
+    // Only pay the CLI startup cost when HTTP omits Gemini quotas for this account.
+    const cli = record(parseJson(await ctx.run(["agy", "--print", "/usage", "--output-format", "json", "--print-timeout", "30s"], 35_000).catch(() => null)));
+    if (cli["status"] === "SUCCESS") {
+      const cliWindows = antigravityWindows(record(record(cli["command"])["data"])["groups"]);
+      if (cliWindows.length > 0) return { plan: null, windows: cliWindows };
     }
     return { plan: null, windows };
   },
@@ -843,7 +904,9 @@ async function readKeychainInLoginSession(service: string, account?: string): Pr
   const plist = join(dir, "job.plist");
   let pipe: FileHandle | undefined;
   try {
-    if (Bun.spawnSync(["mkfifo", "-m", "600", fifo]).exitCode !== 0) return null;
+    // awaited, not waited for: a stalled mkfifo must not hold every other request (#1404)
+    const mkfifo = Bun.spawn(["mkfifo", "-m", "600", fifo], { stdin: "ignore", stdout: "ignore", stderr: "ignore", timeout: COMMAND_TIMEOUT_MS, killSignal: "SIGKILL" });
+    if (await mkfifo.exited !== 0) return null;
     writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>Label</key><string>${xml(label)}</string><key>ProgramArguments</key><array>${args.map((a) => `<string>${xml(a)}</string>`).join("")}</array><key>StandardOutPath</key><string>${xml(fifo)}</string><key>StandardErrorPath</key><string>/dev/null</string><key>RunAtLoad</key><true/></dict></plist>
@@ -881,11 +944,11 @@ async function readKeychainInLoginSession(service: string, account?: string): Pr
   }
 }
 
-export async function runCommand(argv: string[]): Promise<string | null> {
+export async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promise<string | null> {
   if (!Bun.which(argv[0]!)) return null;
   try {
     const child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
-    const timer = setTimeout(() => child.kill(), COMMAND_TIMEOUT_MS);
+    const timer = setTimeout(() => child.kill(), timeoutMs);
     try {
       const output = await readCapped(child.stdout);
       if (output === null) child.kill();
@@ -905,6 +968,7 @@ export function systemUsageContext(): UsageContext {
     fetch: (url, init) => fetch(url, init),
     keychain: readKeychain,
     run: runCommand,
+    has: (command) => Bun.which(command) !== null,
     now: Date.now,
   };
 }
@@ -927,6 +991,34 @@ interface Search {
 export class UsageService {
   /** A local CLI login ended: rediscover sign-ins, preserving account rate-limit backoffs. */
   invalidate(): void { this.searches.clear(); this.entries.clear(); }
+  /** Whether Claude's status line is wrapped here (server/statusline-install.ts), on this server's home and CLAUDE_CONFIG_DIR. */
+  statusline(): StatuslineInstallState {
+    return statuslineInstallState(this.statuslineOptions());
+  }
+
+  /** Turns the status-line reading on or off; Claude's next reading comes from where it now can. */
+  setStatusline(enabled: boolean): StatuslineInstallState {
+    try {
+      if (enabled) installStatusline(this.statuslineOptions());
+      else removeStatusline(this.statuslineOptions());
+    } finally {
+      this.invalidate();
+    }
+    return this.statusline();
+  }
+
+/** Whether a Claude sign-in found at `source` (claudeHomes) lives in the config directory the switch changes. */
+  private switchesConfigOf(source: string): boolean {
+    const configured = this.ctx.env["CLAUDE_CONFIG_DIR"]?.trim();
+    // "default" is ~/.claude: the same sign-in found there and under CLAUDE_CONFIG_DIR is kept once, as "default"
+    const defaultDir = join(this.ctx.home, ".claude");
+    // the label "default" is a source's only: a configured directory is a path, whatever its name
+    return resolve(source === "default" ? defaultDir : source) === resolve(configured || defaultDir);
+  }
+
+  private statuslineOptions() {
+    return { home: this.ctx.home, configDir: this.ctx.env["CLAUDE_CONFIG_DIR"] };
+  }
   private readonly searches = new Map<UsageProviderId, Search>();
   /** by provider and source */
   private readonly entries = new Map<string, Entry>();
@@ -954,7 +1046,8 @@ export class UsageService {
 
   private async collect(refresh: boolean): Promise<UsageReport> {
     const now = this.ctx.now();
-    const usages = await Promise.all(this.providers.map((provider) => this.collectProvider(provider, now, refresh)));
+    const missing = new Map(this.providers.flatMap((provider) => { const command = provider.missingCommand?.(this.ctx) ?? null; return command === null ? [] : [[provider.id, command] as const]; }));
+    const usages = await Promise.all(this.providers.map((provider) => this.collectProvider(provider, now, refresh, missing.has(provider.id))));
     // one account found in two places is listed once: the reading without a problem, else the first
     const byKey = new Map<string, ProviderUsage>();
     for (const usage of usages.flat()) {
@@ -968,15 +1061,18 @@ export class UsageService {
       if (group.length < 2) continue;
       group.sort((a, b) => a.key.localeCompare(b.key)).forEach((usage, i) => byKey.set(usage.key, { ...usage, account: `#${i + 1}` }));
     }
-    return { providers: [...byKey.values(), ...await this.additional(refresh)] };
+    // a provider with an account found here needs nothing more; one with none names what it could not look with (a hub's accounts are not this PC's)
+    const missingCommands = [...missing].filter(([id]) => !usages.flat().some((usage) => usage.id === id)).map(([provider, command]) => ({ provider, command }));
+    return { providers: [...byKey.values(), ...await this.additional(refresh)], ...(missingCommands.length > 0 ? { missing_commands: missingCommands } : {}) };
   }
 
-  private async collectProvider(provider: UsageProvider, now: number, refresh: boolean): Promise<ProviderUsage[]> {
+  /** `incomplete`: a command it looks with is missing, so the search is not kept: the next report looks again, finding a sign-in once it is installed */
+  private async collectProvider(provider: UsageProvider, now: number, refresh: boolean, incomplete: boolean): Promise<ProviderUsage[]> {
     const search = this.searches.get(provider.id);
     // an account's readAt is never later than its provider's, so a forced search may ask each again
     const forced = refresh && search !== undefined && now - search.readAt >= MIN_REFRESH_MS;
     const usages = (sources: readonly string[]) => sources.map((source) => this.entries.get(source)?.usage ?? null).filter((usage): usage is ProviderUsage => usage !== null);
-    if (search && now < search.nextAt && !forced) return usages(search.sources);
+    if (search && now < search.nextAt && !forced && !incomplete) return usages(search.sources);
 
     let found: Found[];
     try { found = await provider.signIns(this.ctx); } catch { found = []; }
@@ -992,7 +1088,7 @@ export class UsageService {
     for (const source of search?.sources ?? []) if (!read.some(([found]) => found === source)) this.entries.delete(source);
     for (const [source, entry] of read) this.entries.set(source, entry);
     const sources = read.map(([source]) => source);
-    this.searches.set(provider.id, { readAt: now, nextAt: Math.min(now + FRESH_MS, ...read.map(([, entry]) => entry.nextAt)), sources });
+    this.searches.set(provider.id, { readAt: now, nextAt: incomplete ? now : Math.min(now + FRESH_MS, ...read.map(([, entry]) => entry.nextAt)), sources });
     return usages(sources);
   }
 
@@ -1002,8 +1098,7 @@ export class UsageService {
     // the key reaches the browser, the credential's path must not)
     const identity = (account: Account | null | undefined) => {
       const known = account ?? found.account ?? null;
-      const place = createHash("sha256").update(found.source).digest("hex").slice(0, 12);
-      return { key: known ? `${provider.id}:${known.id}` : `${provider.id}@${place}`, account: known?.label ?? null };
+      return { key: accountKey(provider.id, known, found.source), account: known?.label ?? null };
     };
     // the last numbers stay, named by what went wrong since - unless the place now holds another
     // account's sign-in: those numbers and that name were someone else's
@@ -1014,11 +1109,22 @@ export class UsageService {
     }, wait);
     if ("locked" in found) return keep("locked", null, FRESH_MS);
     const signIn: SignIn = found;
-    if (signIn.expiresAt !== null && signIn.expiresAt <= now) return keep("expired", signIn.plan ?? null, RETRY_MS);
+    const local = provider.readLocal?.(this.ctx, signIn) ?? null;
+    const fromLocal = (reading: Reading): Entry => {
+      const resets = reading.windows.flatMap((window) => window.resets_at === null ? [] : [Date.parse(window.resets_at)]);
+      return settle({ id: provider.id, ...identity(reading.account), plan: reading.plan ?? signIn.plan ?? null,
+        windows: reading.windows, problem: null, checked_at: new Date(reading.checkedAt ?? now).toISOString() }, Math.min(FRESH_MS, ...resets.map((reset) => reset - now)));
+    };
+    // a local reading as recent as the endpoint's own cache stands for it; an older one only when the
+    // endpoint cannot answer (an expired token, a refusal, a blocked network), with its own time
+    if (local && now - (local.checkedAt ?? now) < FRESH_MS) return fromLocal(local);
+    // a fallback never replaces a newer endpoint answer kept from before: that one stays, named by the problem
+    const fallback = local !== null && !(kept?.checked_at && Date.parse(kept.checked_at) > (local.checkedAt ?? now)) ? local : null;
+    if (signIn.expiresAt !== null && signIn.expiresAt <= now) return fallback ? fromLocal(fallback) : keep("expired", signIn.plan ?? null, RETRY_MS);
     // a 429 holds for the account, not the place: a sign-in moved or copied elsewhere waits too
     const backoff = found.account ? `${provider.id}:${found.account.id}` : `${provider.id}#${createHash("sha256").update(signIn.token).digest("hex")}`;
     const until = this.backoffs.get(backoff);
-    if (until !== undefined && now < until) return keep("rate_limited", signIn.plan ?? null, until - now);
+    if (until !== undefined && now < until) return fallback ? fromLocal(fallback) : keep("rate_limited", signIn.plan ?? null, until - now);
     this.backoffs.delete(backoff);
     try {
       const reading = await provider.read(this.ctx, signIn);
@@ -1027,19 +1133,171 @@ export class UsageService {
         id: provider.id, ...identity(reading.account), plan: reading.plan ?? signIn.plan ?? null, windows: reading.windows, problem: null, checked_at: new Date(now).toISOString(),
       }, FRESH_MS);
     } catch (error) {
-      if (error instanceof UsageHttpError && (error.status === 401 || error.status === 403)) return keep("expired", signIn.plan ?? null, RETRY_MS);
-      if (error instanceof UsageHttpError && error.status === 429) {
-        const wait = Math.max(RETRY_MS, error.retryAfterMs ?? FRESH_MS);
-        this.backoffs.set(backoff, now + wait);
-        return keep("rate_limited", signIn.plan ?? null, wait);
+      const wait = Math.max(RETRY_MS, error instanceof UsageHttpError ? error.retryAfterMs ?? FRESH_MS : 0);
+      if (error instanceof UsageHttpError && error.status === 429) this.backoffs.set(backoff, now + wait);
+      if (fallback) return fromLocal(fallback);
+      if (error instanceof UsageHttpError && (error.status === 401 || error.status === 403)) {
+        const expired = keep("expired", signIn.plan ?? null, RETRY_MS);
+        // a 403 for a token that has not expired is a refusal, not an expiry: the status line can stand in
+        const refused = provider.id === "claude" && error.status === 403 && (signIn.expiresAt === null || signIn.expiresAt > now);
+        const statusline = this.statusline();
+        // offered only where it can be turned on (never on Windows, never once it is on), and only for the
+        // sign-in in the config directory the switch changes: another one's status line is not wrapped
+        if (refused && expired.usage && statusline.supported && !statusline.installed && this.switchesConfigOf(found.source)) {
+          expired.usage = { ...expired.usage, statusline_offer: true };
+        }
+        return expired;
       }
+      if (error instanceof UsageHttpError && error.status === 429) return keep("rate_limited", signIn.plan ?? null, wait);
       console.warn(`usage: ${provider.id} could not be read: ${error instanceof Error ? error.message : String(error)}`);
       return keep("failed", signIn.plan ?? null, RETRY_MS);
     }
   }
 }
 
-export async function handleUsageRequest(request: Request, url: URL, service: UsageService): Promise<Response> {
+/** The key an account is listed by: its id, or, for a sign-in that names none, where it was found, hashed. */
+function accountKey(id: UsageProviderId, account: Account | null | undefined, source: string): string {
+  return account ? `${id}:${account.id}` : `${id}@${createHash("sha256").update(source).digest("hex").slice(0, 12)}`;
+}
+
+/**
+ * Where the Claude or Codex account listed as `key` keeps its sign-in now (its CredentialHome),
+ * read from its files without asking any provider: a key is all the browser names,
+ * never a place. Their reading names no account, so the key the list showed is the one its files
+ * give. Null when no sign-in here has that key now: a hub's, another provider's, or one whose home
+ * holds another account since. One account signed in in several homes (each its own token) is
+ * `ambiguous`: the list shows it once, so which home the user meant cannot be told.
+ */
+export async function localSignInPlace(ctx: UsageContext, key: string): Promise<{ provider: "claude" | "codex"; home: CredentialHome } | { provider: "claude" | "codex"; ambiguous: true } | null> {
+  for (const provider of [claude, codex]) {
+    const id = provider.id === "claude" ? "claude" : "codex";
+    if (!key.startsWith(`${id}:`) && !key.startsWith(`${id}@`)) continue;
+    // the same token in two places is one sign-in, as the list counts it
+    const tokens = new Set<string>();
+    const places = (await provider.signIns(ctx))
+      .filter((found) => "locked" in found || (!tokens.has(found.token) && Boolean(tokens.add(found.token))))
+      .filter((found) => accountKey(id, found.account, found.source) === key);
+    if (places.length > 1) return { provider: id, ambiguous: true };
+    if (places[0]?.home) return { provider: id, home: places[0].home };
+  }
+  return null;
+}
+
+/** Whether a credential's text is JSON at all: one that is not cannot be told from a sign-in. */
+function isJson(text: string): boolean {
+  try { JSON.parse(text); return true; } catch { return false; }
+}
+
+/**
+ * A credential file's sign-in; none when there is no file or it holds no sign-in (a Codex API key, a Claude
+ * file with only MCP sign-ins); "unknown" when it will not read, is too large or is not JSON.
+ */
+function credentialFile(path: string, parse: (source: string | null) => SignIn | null): SignIn | "unknown" | null {
+  try { statSync(path); }
+  catch (error) { return error instanceof Error && "code" in error && error.code === "ENOENT" ? null : "unknown"; }
+  const text = readText(path);
+  return text === null || !isJson(text) ? "unknown" : parse(text);
+}
+
+/**
+ * A keychain service's sign-ins, read under each account name the CLI may use: `inUse` the first that holds
+ * one (as fromKeychain takes it), `all` every one found, whichever is in use; "unknown" when any item is
+ * locked or is not JSON, even if another one reads.
+ */
+async function keychainState(ctx: UsageContext, service: string, accounts: Array<string | undefined>, parse: (value: string) => SignIn | null): Promise<{ inUse: SignIn | null; all: SignIn[] } | "unknown"> {
+  const all: SignIn[] = [];
+  if (ctx.platform !== "darwin") return { inUse: null, all };
+  for (const account of accounts) {
+    const found = await ctx.keychain(service, account);
+    if (found.status === "locked") return "unknown";
+    if (found.status !== "found") continue;
+    if (!isJson(found.value)) return "unknown";
+    const signIn = parse(found.value);
+    if (signIn !== null) all.push(signIn);
+  }
+  return { inUse: all[0] ?? null, all };
+}
+
+const tokenDigest = (token: string): string => createHash("sha256").update(token).digest("hex");
+
+/** A followed sign-in's home as its CLI left it: the account as the list keys and names it, never a token or a path. */
+export interface HomeSignIn {
+  readonly key: string;
+  readonly label: string | null;
+  /** a digest of the token in use: a sign-in the CLI wrote has a token of its own, one it left keeps one from before */
+  readonly digest: string;
+  /** the digests of every token the home's sources hold (its file and its keychain item), the one in use among them */
+  readonly digests: readonly string[];
+  readonly expiresAt: number | null;
+}
+
+/**
+ * The sign-in a Claude or Codex CLI keeps in `home`, read from there alone as that CLI writes it, never
+ * refreshed: Claude's default home or directory, each with its keychain item; Codex's default home
+ * (~/.codex, or its keychain item when that has no auth.json) or directory. Null when it holds none;
+ * "unknown" when any of its sources cannot be read (a keychain item locked or not JSON, a credential file
+ * that will not read, is too large or is not JSON), even when another source reads: then it can be told
+ * from neither none nor another sign-in. A source that reads but holds no sign-in holds none.
+ * Other homes are not looked at: their sign-ins are no login's into this one.
+ */
+export async function homeSignIn(ctx: UsageContext, provider: "claude" | "codex", home: CredentialHome): Promise<HomeSignIn | "unknown" | null> {
+  // every source of the home is read on its own: one that cannot be read leaves the home unknown, whatever
+  // another gives, and only then are they weighed as the list weighs them
+  let signIn: (SignIn & { source: string }) | undefined;
+  // every token a source holds, whichever one is in use: a token only moved between sources is not new
+  const held: SignIn[] = [];
+  if (provider === "claude") {
+    const claudeAt = claudeHome(ctx, home);
+    const user = ctx.env["USER"];
+    const keychain = await keychainState(ctx, claudeAt.service, user ? [user, undefined] : [undefined], claudeSignIn);
+    const file = credentialFile(join(claudeAt.dir, ".credentials.json"), claudeSignIn);
+    if (keychain === "unknown" || file === "unknown") return "unknown";
+    held.push(...keychain.all, ...(file === null ? [] : [file]));
+    signIn = keychainOrFile(keychain.inUse, file, claudeAt.source, claudeAccount(claudeAt.config)).find((entry): entry is Found & SignIn => !("locked" in entry));
+  } else {
+    const dir = home.kind === "dir" ? home.dir : join(ctx.home, ".codex");
+    const file = credentialFile(join(dir, "auth.json"), codexSignIn);
+    // the default home's keychain item is read too, file or not: a file in use does not make it readable
+    const keychain = home.kind === "default" ? await keychainState(ctx, "Codex Auth", [undefined], codexSignIn) : { inUse: null, all: [] };
+    if (file === "unknown" || keychain === "unknown") return "unknown";
+    held.push(...(file === null ? [] : [file]), ...keychain.all);
+    if (file !== null) signIn = { ...file, source: dir };
+    else if (keychain.inUse !== null) signIn = { ...keychain.inUse, source: "keychain" };
+  }
+  if (signIn === undefined) return null;
+  return {
+    key: accountKey(provider, signIn.account, signIn.source),
+    label: signIn.account?.label ?? signIn.account?.id ?? null,
+    digest: tokenDigest(signIn.token),
+    digests: held.map((entry) => tokenDigest(entry.token)),
+    expiresAt: signIn.expiresAt,
+  };
+}
+
+export async function handleUsageRequest(request: Request, url: URL, service: Pick<UsageService, "report">): Promise<Response> {
   if (request.method !== "GET") return jsonResponse({ error: { code: "method_not_allowed", message: "Use GET /api/usage" } }, 405, { allow: "GET" });
   return jsonResponse(await service.report(url.searchParams.get("refresh") === "1"), 200, { "cache-control": "no-store" });
+}
+
+/**
+ * GET /api/usage/statusline: whether Claude's limits are read from its status line on this PC.
+ * POST /api/usage/statusline `{ "enabled": boolean }`: turns that on or off. The body names nothing
+ * else (no path, no command): what is installed and where is this server's own decision.
+ */
+export async function handleStatuslineRequest(request: Request, service: UsageService): Promise<Response> {
+  if (request.method === "GET") return jsonResponse(service.statusline(), 200, { "cache-control": "no-store" });
+  if (request.method !== "POST") return jsonResponse({ error: { code: "method_not_allowed", message: "Use GET or POST /api/usage/statusline" } }, 405, { allow: "GET, POST" });
+  const body: unknown = await request.json().catch(() => null);
+  if (typeof body !== "object" || body === null || Array.isArray(body) || Object.keys(body).length !== 1 || typeof (body as Record<string, unknown>)["enabled"] !== "boolean") {
+    return jsonResponse({ error: { code: "invalid_body", message: "Send { \"enabled\": true } or { \"enabled\": false }" } }, 400);
+  }
+  try {
+    return jsonResponse(service.setStatusline((body as { enabled: boolean }).enabled), 200, { "cache-control": "no-store" });
+  } catch (error) {
+    // only the installer's own refusals are told: anything else (a settings.json that will not parse, a
+    // filesystem error) could quote the user's settings, and a saved command can carry a secret
+    if (error instanceof StatuslineInstallError) return jsonResponse({ error: { code: "statusline_failed", message: error.message } }, 409);
+    console.warn(`usage: Claude's status line could not be changed: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonResponse({ error: { code: "statusline_failed", message: "Claude's status line could not be changed; the server's log says why" } }, 500);
+  }
 }

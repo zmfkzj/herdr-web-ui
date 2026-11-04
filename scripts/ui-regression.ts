@@ -18,6 +18,7 @@ import { checkTerminalFileInput } from "./terminal-file-input-regression.ts";
 import { checkTerminalInput } from "./terminal-input-regression.ts";
 import { checkSafariIme } from "./terminal-safari-ime-regression.ts";
 import { checkIpadIme } from "./terminal-ipad-ime-regression.ts";
+import { checkLinuxIme } from "./terminal-linux-ime-regression.ts";
 import { checkHeldDraftPaneSwitch } from "./terminal-draft-regression.ts";
 import { checkCommandBackspace } from "./terminal-command-backspace-regression.ts";
 import { checkCtrlEnter } from "./terminal-ctrl-enter-regression.ts";
@@ -26,7 +27,8 @@ import { checkCommandArrows } from "./terminal-command-arrows-regression.ts";
 import { checkFolderFilter, checkNewFolder } from "./folder-filter-regression.ts";
 import { checkPaletteKeys } from "./palette-keys-regression.ts";
 import { checkFollowHerdrFocus } from "./follow-focus-regression.ts";
-import { UsageService } from "../server/usage.ts";
+import { checkRelayPanel } from "./relay-panel-regression.ts";
+import { systemUsageContext, UsageService } from "../server/usage.ts";
 import { openSettingsPage } from "./settings-page.ts";
 import { assertCspClean, watchCsp } from "./csp-violations.ts";
 import type { CspWatch } from "./csp-violations.ts";
@@ -85,7 +87,7 @@ try {
   }
   const [paneA, paneB] = panes as [string, string];
   // no provider is asked with the test machine's own sign-ins
-  server = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(root, "push"), usage: new UsageService(undefined, []) });
+  server = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(root, "push"), usage: new UsageService({ ...systemUsageContext(), home: root, env: {} }, []) });
   const origin = `http://127.0.0.1:${server.port}`;
   browser = await chromium.launch({
     executablePath: chromePath(),
@@ -124,8 +126,10 @@ try {
   csp.push(await watchCsp(page));
   let holdSubmitResult = false;
   let releaseSubmitResult: (() => void) | null = null;
-  // a connection's first frame held back: what the page does between a reconnect and its snapshot
+  // a connection's first frames held back: what the page does between a reconnect and the frame that
+  // says what the bridge supports (features), and then its snapshot
   let holdSnapshot = false;
+  let releaseFeatures: (() => void) | null = null;
   let releaseSnapshot: (() => void) | null = null;
   const routed: Array<{ close: () => Promise<void> }> = [];
   await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => {
@@ -133,7 +137,11 @@ try {
     const upstream = socket.connectToServer();
     upstream.onMessage((raw) => {
       const message = JSON.parse(String(raw));
-      if (holdSnapshot && message.type === "snapshot") {
+      if (holdSnapshot && message.type === "features") {
+        const release = () => { socket.send(raw); releaseFeatures = null; };
+        releaseFeatures = release;
+        releases.push(release);
+      } else if (holdSnapshot && message.type === "snapshot") {
         holdSnapshot = false;
         const release = () => { socket.send(raw); releaseSnapshot = null; };
         releaseSnapshot = release;
@@ -390,26 +398,21 @@ try {
   await page.getByTitle("Chat transcript (⌘⇧J)", { exact: true }).click();
   console.log("PASS delayed machines poll preserves newer status; unavailable chat keeps DONE until terminal content is presented");
 
-  // Agents is global to the sidebar, so collapsing a PC's Spaces does not hide
-  // its reported agents or prevent explicit pane selection from that list.
+  // Agents is global to the sidebar: explicit pane selection from that list keeps its machine and pane target.
+  // The test session's only PC is the Host, drawn without its header: no caret folds it, and its + is the New
+  // workspace row under the workspaces. A PC's fold over Agents, with two PCs, is in sidebar-spacing-demo-regression.ts.
   await herdrRpc("pane.report_agent", { pane_id: paneB, source: "manual", agent: "codex", state: "idle" });
   await agentRow(paneB).waitFor();
-  const machineToggle = page.locator(".machine-group .machine-toggle");
-  // the PC's fold is the caret beside its +
-  assert.equal(await page.locator(".machine-group .machine-toggle + .machine-new").count(), 1);
-  await machineToggle.click();
-  await workspaceGroup(workspaces[0]!).waitFor({ state: "detached" });
-  assert.equal(await agentRow(paneA).isVisible(), true, "PC folding leaves Agents visible");
+  assert.equal(await page.locator(".machine-group .machine-header").count(), 0, "the lone Host is drawn without its header");
+  assert.equal(await page.locator(".machine-group .machine-new-row").count(), 1, "its + is the New workspace row");
   await agentRow(paneB).locator(".agent-select").click();
   await agentRow(paneB).locator('.agent-select[aria-current="true"]').waitFor();
   assert.deepEqual(await page.evaluate(() => JSON.parse(sessionStorage.getItem("ovis:selection") ?? "null")),
     { machine_id: "local", pane_id: paneB }, "Agent selection retains its machine and pane target");
-  assert.equal(await machineToggle.getAttribute("aria-expanded"), "false", "Agent selection preserves the user's PC fold");
   painted.delete(paneA);
   await agentRow(paneA).locator(".agent-select").click();
   await agentRow(paneA).locator('.agent-select[aria-current="true"]').waitFor();
   await until(() => painted.has(paneA), "returning from Agents paints the current pane");
-  await machineToggle.click();
   await workspaceHeader(workspaces[0]!).locator('.workspace-select[aria-current="true"]').waitFor();
 
   // Reuse the real API roster as an offline cache in an isolated context. Its
@@ -718,11 +721,18 @@ try {
   await page.locator(`.pane-select[title^="${paneA} —"]`).click();
   await until(async () => (await selectedTitle())?.startsWith(`${paneA} —`) === true, "back on the first pane");
   await composer.fill("draft");
-  await page.keyboard.press("ControlOrMeta+Shift+ArrowDown");
-  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the shortcut may not switch pane while a draft is typed
-  assert.ok((await selectedTitle())?.startsWith(`${paneA} —`), "a draft keeps Mod+Shift+arrows for selecting text");
+  // the caret at the end of a draft: up selects the text first, and the pane stays
+  await page.keyboard.press("ControlOrMeta+Shift+ArrowUp");
+  await page.waitForTimeout(NO_SEND_WAIT_MS); // fixed wait: the shortcut may not switch pane while the draft has text that way
+  assert.ok((await selectedTitle())?.startsWith(`${paneA} —`), "a draft keeps Mod+Shift+arrows while they select text");
+  assert.deepEqual(await composer.evaluate((node: HTMLTextAreaElement) => [node.selectionStart, node.selectionEnd]), [0, 5], "up selected the draft");
+  // nothing is left to select that way: the next press switches panes, so a draft never stops the shortcut
+  await page.keyboard.press("ControlOrMeta+Shift+ArrowUp");
+  await until(async () => !(await selectedTitle())?.startsWith(`${paneA} —`), "a draft selected to its start lets the pane shortcut go");
+  await page.locator(`.pane-select[title^="${paneA} —"]`).click();
+  await until(async () => (await selectedTitle())?.startsWith(`${paneA} —`) === true, "back on the first pane");
   await composer.fill("");
-  console.log("PASS pane shortcut from the empty message box; a draft keeps text selection");
+  console.log("PASS pane shortcut from the empty message box; a draft keeps text selection until none is left that way");
   console.log("PASS terminal clipboard paste sends text once and preserves Ctrl+C");
 
   await page.keyboard.press("ControlOrMeta+Shift+Comma");
@@ -966,7 +976,7 @@ try {
   const socketsBeforeReconnect = sockets.length;
   holdSnapshot = true;
   await routed.at(-1)!.close();
-  await until(() => releaseSnapshot !== null, "the reconnect's snapshot was held back");
+  await until(() => releaseFeatures !== null && releaseSnapshot !== null, "the reconnect's features and snapshot were held back");
   // the server can send its snapshot before the page has even sent its attach: the pane is
   // ready only once the new connection says so, not by the closed one's last word
   await until(() => sockets.length > socketsBeforeReconnect, "the page opened its new connection");
@@ -974,9 +984,12 @@ try {
   assert.equal(await page.locator('.pending-message[data-state="uncertain"]').count(), 2, "the lost connection's rows are no longer its own");
   await composer.fill("sent before the snapshot");
   await page.getByRole("button", { name: "Send message", exact: true }).click();
-  assert.equal(inputs.length, sentBeforeSnapshot, "the message waits for the snapshot that says what the bridge supports");
-  releaseSnapshot!();
+  assert.equal(inputs.length, sentBeforeSnapshot, "the message waits for the frame that says what the bridge supports");
+  // that frame needs no herdr: once it is in, the message goes, with the snapshot (which waits on herdr) still held
+  releaseFeatures!();
   await until(async () => await page.locator('.pending-message[data-state="queued"]').count() === 1, "the message sent before the snapshot is a live pending row");
+  assert.notEqual(releaseSnapshot, null, "the snapshot was still held back when the message went");
+  releaseSnapshot!();
   assert.equal(inputs.at(-1)?.delivery, "queue");
   assert.equal(await page.locator(".composer-note").count(), 0);
   await page.getByRole("button", { name: "Discard", exact: true }).click();
@@ -1471,7 +1484,7 @@ try {
     await createGate;
     await route.continue();
   });
-  await page.getByRole("button", { name: /^New workspace on / }).click();
+  await page.locator(".machine-new-row").click();
   const dialog = page.getByRole("dialog", { name: /^New workspace/ });
   // opening Browse on home leaves Directory as typed, `~`, not the absolute path it lists
   await dialog.getByLabel(/^Directory/).fill("~");
@@ -1847,8 +1860,8 @@ try {
   await page.unroute("**/api/agents");
   await page.evaluate(() => localStorage.removeItem("ovis:new-session-agent"));
   console.log("PASS reopening after a failed agent start owns focus before paint, enables its fields and closes with Escape");
-  // the PC's + is New workspace again, not a tab in the workspace the last dialog was for
-  await page.getByRole("button", { name: /^New workspace on / }).click();
+  // the lone Host's New workspace row is New workspace again, not a tab in the workspace the last dialog was for
+  await page.locator(".machine-new-row").click();
   await page.getByRole("dialog", { name: /^New workspace/ }).waitFor();
   await page.keyboard.press("Escape");
   await page.getByRole("dialog", { name: /^New workspace/ }).waitFor({ state: "hidden" });
@@ -1910,7 +1923,7 @@ try {
   await tabMenu.waitFor();
   assert.equal(await strip.getByRole("tab", { selected: true }).textContent(), "first", "opening another tab's context menu does not select it");
   // The tab menu keeps native tab scope; pane operations belong to the pane or header.
-  assert.deepEqual(await tabMenu.getByRole("menuitem").allTextContents(), ["Move tab left", "New tab with agent…", "Rename tab", "Close tab"], "the last tab offers only a move to the left");
+  assert.deepEqual(await tabMenu.getByRole("menuitem").allTextContents(), ["Move tab left", "Move to workspace…", "New tab with agent…", "Rename tab", "Close tab"], "the last tab offers only a move to the left, and a one-pane tab a move to another workspace");
   await tabMenu.getByRole("menuitem", { name: "Rename tab", exact: true }).click();
   await tabName.fill("build");
   await page.keyboard.press("Enter");
@@ -1933,7 +1946,7 @@ try {
   const tabSheet = tabPhonePage.getByRole("dialog", { name: "build", exact: true });
   await tabSheet.waitFor();
   const touchTabItems = await tabSheet.locator(".row-sheet-item").allTextContents();
-  assert.deepEqual(touchTabItems.slice(-5), ["Move tab left", "Move tab right", "New tab with agent…", "Rename tab", "Close tab"], "a tab between siblings offers both adjacent moves on touch");
+  assert.deepEqual(touchTabItems.slice(-6), ["Move tab left", "Move tab right", "Move to workspace…", "New tab with agent…", "Rename tab", "Close tab"], "a tab between siblings offers both adjacent moves on touch");
   assert.ok(touchTabItems.includes("Rename pane") && touchTabItems.includes("Close pane"), "the touch menu carries the open pane's actions");
   await tabSheet.getByRole("button", { name: "Cancel", exact: true }).tap();
   await tabSheet.waitFor({ state: "detached" });
@@ -2289,6 +2302,7 @@ try {
   await checkTerminalInput(browser, origin, paneA, paneB);
   await checkSafariIme(browser, origin, paneA, paneB);
   await checkIpadIme(browser, origin, paneA, paneB);
+  await checkLinuxIme(browser, origin, paneA);
   await checkHeldDraftPaneSwitch(browser, origin, paneA, paneB);
 
   // the terminal lens on a touch screen starts in direct typing without raising the keyboard;
@@ -2494,6 +2508,8 @@ try {
   await securedContext.close();
   assertCspClean(csp, "the token gate loads with no CSP violation");
   console.log("PASS Settings sign out: cancel preserves access, failure permits retry, token and paired-device sign out return to the access gate");
+
+  await checkRelayPanel(browser);
 } catch (error) {
   for (const evidence of evidenceSessions) {
     if (evidence.isOpen()) await evidence.captureFailure(error);

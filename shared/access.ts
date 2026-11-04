@@ -1,9 +1,18 @@
+import type { PortalSignIn } from "./portal.ts";
+
 /** How a request got in, when it did. */
-export type AccessVia = "local" | "tailscale" | "device" | "token" | "open";
+export type AccessVia = "local" | "tailscale" | "device" | "token" | "open" | "portal" | "relay";
 /** Why a request did not. */
 export type AccessRefusal = "other_user" | "pairing_required" | "token_required";
 /** What a paired device may do: drive (type, answer, manage) or only watch. */
 export type DeviceRole = "drive" | "watch";
+
+/** Who Portal's own sign-in let in, as it states it to the app (server/access.ts `portalLogin`). */
+export interface PortalLogin {
+  /** the wallet address, link name, or verified email or sub:<id> that signed in */
+  readonly user: string;
+  readonly method: PortalSignIn;
+}
 
 /** GET /api/health `auth`: `authenticated` is whether this request got in; `required` is the opposite, kept for older clients. */
 export interface HealthAuth {
@@ -13,6 +22,8 @@ export interface HealthAuth {
   /** with `via: "token"`: the token came in an `Authorization` header (a proxy sends it), so signing out of this browser would change nothing */
   readonly bearer?: true;
   readonly role?: DeviceRole;
+  /** with `via: "portal"`: who signed in through Portal */
+  readonly portal?: PortalLogin;
   readonly reason?: AccessRefusal;
 }
 
@@ -30,6 +41,29 @@ export interface LanExposure {
   readonly host: string;
 }
 
+/** The configured bind address, read from its literal (`bindScope` in server/access.ts): never a DNS lookup or the request's Host. */
+export type BindScope = "loopback" | "tailnet" | "other";
+/** How this one request arrived, as far as it proves (`observedIngress` in server/access.ts); not how every device reaches the server. `direct`: no proxy said it forwarded the request, which a proxy that adds nothing (an SSH tunnel, nginx's bare `proxy_pass`) also looks like. */
+export type ObservedIngress = "direct" | "proxy" | "tailscale" | "funnel" | "unknown" | "relay";
+
+/**
+ * GET /api/health (both scopes), authenticated requests only, a watching device's included:
+ * what protects this server, each fact on its own and none of them a verdict. It carries no
+ * token, hash, header, login or address, and is sent `no-store`. Anonymous answers omit it, and
+ * an older server sends none: the client then says the facts are unavailable rather than
+ * reading them from `auth` or from the absence of `lan_exposure`.
+ */
+export interface SecuritySummary {
+  /** an access token is configured on the server, whether or not this request used it */
+  readonly token_configured: boolean;
+  /** the durable pairing gate (`DeviceStore.gated`); `unavailable` when devices.json cannot be read, which keeps it closed */
+  readonly pairing_gate: "open" | "closed" | "unavailable";
+  readonly bind_scope: BindScope;
+  readonly observed_ingress: ObservedIngress;
+  /** `observed` only with trusted public-ingress evidence on this request (Funnel); otherwise unknown, never "none" */
+  readonly public_exposure: "observed" | "unknown";
+}
+
 export interface PairedDevice {
   readonly id: string;
   readonly label: string;
@@ -38,6 +72,8 @@ export interface PairedDevice {
   readonly last_seen_at: string | null;
   /** the device this request came from */
   readonly current: boolean;
+  /** paired with a public key for relay access, not a browser cookie */
+  readonly via_relay?: true;
 }
 
 /** POST /api/devices/pair/start */

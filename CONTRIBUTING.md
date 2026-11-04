@@ -62,7 +62,7 @@ Neither command updates itself; only `bun run start` and the plugin run the upda
 **Fast checks** is these, one by one; none needs herdr:
 
 ```bash
-bun run generate:types --check   # shared/herdr-api.generated.ts matches scripts/herdr-schema.json
+bun run generate:types --check   # herdr's and hc's generated types match scripts/*-schema.json
 bun run generate:themes --check  # theme copies match the theme blocks of src/styles.css
 bun run typecheck
 bun run build
@@ -111,7 +111,8 @@ the context does not make it clear. The dialog that makes a workspace is
   `*.contract.test.ts`.
 - **Stored formats:** a change to the structure of a stored browser record or state-directory
   file follows the [stored-format rules](docs/development.md#stored-format-changes).
-- **herdr wire types:** never edit `shared/herdr-api.generated.ts`; run `bun run generate:types`.
+- **herdr wire types:** never edit `shared/herdr-api.generated.ts` or
+  `server/herdr-core/hc-api.generated.ts`; run `bun run generate:types`.
 - **Theme colors:** edit them only in the theme blocks of `src/styles.css`. Never edit
   `src/lib/themes.generated.ts` or the generated copies in DESIGN.md, `index.html` and
   `public/manifest.webmanifest`; run `bun run generate:themes`.
@@ -126,7 +127,7 @@ the context does not make it clear. The dialog that makes a workspace is
   new ones. Every language has to translate each later string, so a PR that adds a language is
   closed.
 - **UI:** component CSS uses the tokens in `src/styles.css` (see [DESIGN.md](DESIGN.md)).
-- **Themes:** besides the app's own Amber, Charcoal, Codex and Catppuccin, a theme is added only when
+- **Themes:** besides the app's own Amber, Charcoal, Codex, Catppuccin and Black, a theme is added only when
   herdr ships it as a built-in; a PR with any other theme is closed. Each theme is a complete block
   in `src/styles.css`, the one place its colors are written. Start from
   `bun scripts/herdr-theme-proposal.ts`, write the block by hand, and record every role whose value

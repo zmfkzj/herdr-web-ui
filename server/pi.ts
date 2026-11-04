@@ -1,11 +1,14 @@
-import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { agentGet, paneProcessInfo } from "./herdr/client.ts";
 import { runsAgent } from "./gjc-runtime.ts";
 import { processEnviron } from "./omo.ts";
 import { piAgentDir } from "./pi-models.ts";
+import { transcriptInStore as piTranscriptInStore, unwrittenSession } from "./transcript-store.ts";
+import { userHome } from "./user-home.ts";
+export { transcriptInStore as piTranscriptInStore, unwrittenSession } from "./transcript-store.ts";
 
 /**
  * pi's session store. `PI_CODING_AGENT_SESSION_DIR` moves it, exactly as CODEX_HOME
@@ -18,59 +21,14 @@ export const defaultPiSessionDir = (): string =>
   process.env["PI_CODING_AGENT_SESSION_DIR"] || join(piAgentDir(), "sessions");
 
 /**
- * The canonical file inside the store, or null. pi names an absolute path itself, so
- * the store is checked rather than trusted: a path elsewhere, a link out of it or a
- * non-session file is no evidence, and an unreadable store holds nothing readable.
- */
-export function piTranscriptInStore(path: string, sessionDir: string): string | null {
-  let canonical: string;
-  let root: string;
-  try {
-    canonical = realpathSync(path);
-    root = realpathSync(sessionDir);
-  } catch { return null; }
-  const inside = relative(root, canonical);
-  if (!inside || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) return null;
-  if (!canonical.endsWith(".jsonl")) return null;
-  // A directory wearing the extension answers no transcript read later: refuse it here.
-  let fd: number | undefined;
-  try {
-    fd = openSync(canonical, constants.O_RDONLY | constants.O_NONBLOCK);
-    return fstatSync(fd).isFile() ? canonical : null;
-  } catch { return null; }
-  finally { if (fd !== undefined) closeSync(fd); }
-}
-
-const absent = (error: unknown): boolean => (error as { code?: unknown } | null)?.code === "ENOENT";
-
-/**
  * The session an agent named but has not written, or null. pi and omp write their file only
  * once the first answer is in (pi's SessionManager waits for an assistant message), so until
  * then the reported path does not exist. Only an absent `.jsonl` file whose nearest existing
  * ancestor is a directory inside the store, both resolved, counts: nothing is read from it,
  * its display id and canonical prospective path keep equally named sessions distinct.
  */
-export function unwrittenSession(path: string, sessionDir: string): { id: string; path: string } | null {
-  if (!isAbsolute(path) || !path.endsWith(".jsonl")) return null;
-  let root: string;
-  try { root = realpathSync(sessionDir); } catch { return null; }
-  try {
-    lstatSync(path);
-    return null;
-  } catch (error) { if (!absent(error)) return null; }
-  for (let dir = dirname(path); ; dir = dirname(dir)) {
-    try {
-      const real = realpathSync(dir);
-      if (!statSync(real).isDirectory()) return null;
-      const inside = relative(root, real);
-      if (inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) return null;
-      return { id: basename(path, ".jsonl"), path: join(real, relative(dir, path)) };
-    } catch (error) {
-      if (!absent(error) || dirname(dir) === dir) return null;
-      // a link to nowhere is a place the agent cannot write to, not a directory still to come
-      try { lstatSync(dir); return null; } catch (missing) { if (!absent(missing)) return null; }
-    }
-  }
+export function piUnwrittenHeaderId(path: string): string | null {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu.exec(basename(path))?.[1] ?? null;
 }
 
 const PI_EXECUTABLE = /(^|[\\/])pi(?:\.exe|\.[cm]?js)?$/i;
@@ -86,7 +44,7 @@ type PiTranscriptOptions = {
 };
 
 /** True for Pi's binary/script launch forms and the official npm bundle entry. */
-function isPiProcess(argv: readonly string[]): boolean {
+export function isPiProcess(argv: readonly string[]): boolean {
   return runsAgent(argv, PI_EXECUTABLE)
     || /(^|[\\/])(?:bun|node)(?:\.exe)?$/i.test(argv[0] ?? "") && PI_NPM_ENTRY.test(argv[1] ?? "");
 }
@@ -111,6 +69,23 @@ type PiStoreResolution = { kind: "default" } | { kind: "store"; path: string; ag
 type VerifiedPiProcess = Omit<PiProcess, "argv" | "pid"> & { pid: number; argv: readonly string[] };
 
 /**
+ * A pi process's agent directory as pi resolves it from its own environment, and pi's normalizer
+ * for its other paths: `~` against the process's home, then a file: URL decoded to its path.
+ */
+function piProcessPaths(environ: readonly string[], home: string, cwd: string) {
+  const value = (name: string) => environ.find((word) => word.startsWith(`${name}=`))?.slice(name.length + 1) || null;
+  const processHome = value("HOME") ?? value("USERPROFILE") ?? home;
+  const absolute = (raw: string): string | null => {
+    let expanded = raw === "~" ? processHome : raw.startsWith("~/") ? join(processHome, raw.slice(2)) : raw;
+    if (/^file:\/\//.test(expanded)) {
+      try { expanded = fileURLToPath(expanded); } catch { return null; }
+    }
+    return isAbsolute(expanded) ? resolve(expanded) : cwd ? resolve(join(cwd, expanded)) : null;
+  };
+  return { value, absolute, agentDir: absolute(value("PI_CODING_AGENT_DIR") || join(processHome, ".pi", "agent")) };
+}
+
+/**
  * Resolve only stores the pane's Pi process identifies; an unseen CLI override is unsafe. The
  * agent directory comes with it: pi reads its model catalogs from there, not from the bridge's.
  */
@@ -123,22 +98,44 @@ function piSessionDirForProcess(
   if (!isPiProcess(argv)) return { kind: "reject" };
   if (argv.some((word) => word === "--session-dir" || word.startsWith("--session-dir="))) return { kind: "reject" };
   if (environ === null) return { kind: "default" };
-  const value = (name: string) => environ.find((word) => word.startsWith(`${name}=`))?.slice(name.length + 1) || null;
-  const processHome = value("HOME") ?? value("USERPROFILE") ?? home;
+  const { value, absolute, agentDir } = piProcessPaths(environ, home, cwd);
   const sessionEntry = value("PI_CODING_AGENT_SESSION_DIR");
-  const agentEntry = value("PI_CODING_AGENT_DIR");
-  // pi's own normalizer: `~` against the process's home, then a file: URL decoded to its path
-  const absolute = (raw: string): string | null => {
-    let expanded = raw === "~" ? processHome : raw.startsWith("~/") ? join(processHome, raw.slice(2)) : raw;
-    if (/^file:\/\//.test(expanded)) {
-      try { expanded = fileURLToPath(expanded); } catch { return null; }
-    }
-    return isAbsolute(expanded) ? resolve(expanded) : cwd ? resolve(join(cwd, expanded)) : null;
-  };
-  const agentDir = absolute(agentEntry || join(processHome, ".pi", "agent"));
   const path = sessionEntry ? absolute(sessionEntry) : agentDir === null ? null : join(agentDir, "sessions");
   if (path === null) return { kind: "reject" };
   return { kind: "store", path, agentDir };
+}
+
+/**
+ * The pane's foreground pids and the agent directories its pi may use, whatever its session: the
+ * directory each identified pi process names, and the bridge's own for processes whose environment
+ * says nothing (or that are not identified as pi). Nothing here is a card's authority; it says only
+ * where the pane's pi would answer if it runs the web UI's extension.
+ */
+export async function piPaneAgentDirs(
+  paneId: string,
+  options: Omit<PiTranscriptOptions, "agent"> = {},
+): Promise<{ pids: number[] | null; agentDirs: string[] }> {
+  const info = options.processes === undefined
+    ? await paneProcessInfo(paneId).catch(() => null)
+    : { foreground_processes: [...options.processes] };
+  const home = options.home ?? userHome();
+  const environOf = options.environOf ?? processEnviron;
+  const argvOf = options.argvOf ?? processArgv;
+  const pids: number[] = [];
+  const agentDirs = new Set<string>([piAgentDir()]);
+  // the pane's processes could not be read: who is in front is not known
+  if (info === null) return { pids: null, agentDirs: [...agentDirs] };
+  for (const entry of info?.foreground_processes ?? []) {
+    if (typeof entry.pid !== "number") continue;
+    pids.push(entry.pid);
+    const argv = entry.argv?.length ? entry.argv : argvOf(entry.pid);
+    if (!argv?.length || !isPiProcess(argv)) continue;
+    // whatever its session store (a --session-dir the bridge cannot follow), the agent directory is pi's own
+    const environ = environOf(entry.pid);
+    const agentDir = environ === null ? null : piProcessPaths(environ, home, entry.cwd ?? "").agentDir;
+    if (agentDir !== null) agentDirs.add(agentDir);
+  }
+  return { pids: [...new Set(pids)], agentDirs: [...agentDirs] };
 }
 
 /**
@@ -166,7 +163,7 @@ export async function piTranscriptPath(
   const info = options.processes === undefined
     ? await paneProcessInfo(paneId).catch(() => undefined)
     : { foreground_processes: [...options.processes] };
-  const home = options.home ?? process.env["HOME"] ?? process.env["USERPROFILE"] ?? "";
+  const home = options.home ?? userHome();
   const environOf = options.environOf ?? processEnviron;
   const argvOf = options.argvOf ?? processArgv;
   const piProcesses: VerifiedPiProcess[] = [];

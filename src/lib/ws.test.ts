@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, expect, it, jest } from "bun:test";
 import { HerdrSocket } from "./ws.ts";
+import { nativeTransport, setTransport, type WebSocketLike } from "./transport.ts";
 import type { ClientConnectionTrace, PendingMessage } from "../../shared/protocol.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../../shared/terminal-flow.ts";
 
@@ -77,6 +78,51 @@ it("sends nothing when the bridge has not said what it supports by the end of th
   } finally {
     client.close();
     jest.useRealTimers();
+  }
+});
+
+it("waits for the snapshot when the features frame is not trusted: nothing leaves, as on an older bridge (#2257)", async () => {
+  jest.useFakeTimers();
+  const client = new HerdrSocket("ws://test/ws");
+  client.trustFeatures((frame) => frame.herdr_lifetime === "known");
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive({ type: "features", features: ["submit", "terminal-insert"], connection: "c1", herdr_lifetime: "replaced" });
+  try {
+    const result = client.submit("w1:p1", "chat message", "chat message");
+    jest.advanceTimersByTime(2_000);
+    expect(await result).toMatchObject({ ok: false, code: "capabilities_unknown" });
+    expect(submissions(socket)).toEqual([]);
+  } finally {
+    client.close();
+    jest.useRealTimers();
+  }
+});
+
+it("sends a chat message and an Insert once the server's features frame came, its snapshot still on its way", async () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.trustFeatures((frame) => frame.herdr_lifetime === "known");
+  client.attach("w1:p1", 80, 24);
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  // the snapshot waits on herdr (10 s after a restart, under load); what the server takes does not
+  socket.receive({ type: "features", features: ["submit", "input-ready", "terminal-insert"], connection: "c1", herdr_lifetime: "known" });
+  socket.receive({ type: "input-ready", pane_id: "w1:p1" });
+  try {
+    const sent = socket.nextSubmission();
+    const result = client.submit("w1:p1", "chat message", "chat message");
+    const frame = await sent;
+    socket.receive({ type: "submit-result", id: frame.id, pane_id: "w1:p1", ok: true });
+    expect(await result).toEqual({ ok: true });
+    const insertSent = new Promise<{ id: number }>((resolve) => socket.addEventListener("sent", (candidate) => { if (candidate.type === "insert") resolve(candidate); }));
+    const inserted = client.insert("w1:p1", "one line");
+    const insert = await insertSent;
+    socket.receive({ type: "insert-result", id: insert.id, pane_id: "w1:p1", ok: true });
+    expect(await inserted).toEqual({ ok: true });
+  } finally {
+    client.close();
   }
 });
 
@@ -302,12 +348,19 @@ it("steers or discards an opaque pending ID once and waits for its action acknow
   const socket = FakeSocket.last;
   socket.open();
   socket.receive(snapshot(["submit", "pending-input"]));
-  for (const [index, action] of ["steer", "discard"].entries()) {
-    const result = client.pendingAction("w1:p1", "pending-1", action as "steer" | "discard");
-    for (let turn = 0; turn < 10 && socket.sent.filter((frame) => frame.type === "pending-action").length <= index; turn++) await Promise.resolve();
-    const frame = socket.sent.filter((frame) => frame.type === "pending-action")[index]!;
-    expect(frame).toEqual({ type: "pending-action", id: index + 1, pane_id: "w1:p1", pending_id: "pending-1", action });
-    socket.receive({ type: "pending-result", id: index + 1, pane_id: "w1:p1", pending_id: "pending-1", ok: index === 0, ...(index === 1 ? { code: "pending_not_found", message: "already sent" } : {}) });
+  for (const [index, [action, withdrawalOnly]] of ([["steer", false], ["discard", false], ["discard", true]] as const).entries()) {
+    const sent = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("no pending-action frame")), 1_000);
+      socket.addEventListener("sent", (frame) => {
+        if (frame.type === "pending-action") { clearTimeout(timeout); resolve(frame); }
+      });
+    });
+    const result = client.pendingAction("w1:p1", "pending-1", action, undefined, withdrawalOnly);
+    const frame = await sent;
+    // launch_ended: this client tells a launch that ended apart, so the bridge answers it with that code (#1547)
+    expect(frame).toEqual({ type: "pending-action", id: index + 1, pane_id: "w1:p1", pending_id: "pending-1", action, launch_ended: true,
+      ...(withdrawalOnly ? { withdrawal_only: true } : {}) });
+    socket.receive({ type: "pending-result", id: index + 1, pane_id: "w1:p1", pending_id: "pending-1", ok: index === 0, ...(index > 0 ? { code: "pending_not_found", message: "already sent" } : {}) });
     expect(await result).toEqual(index === 0 ? { ok: true } : { ok: false, code: "pending_not_found", message: "already sent" });
   }
   client.close();
@@ -578,15 +631,15 @@ it("attaches a grid the chat lens covers without resizing the shared pty, on a r
   // attached before the socket opened: the open replays it, as a reconnect does
   client.attach("w1:p1", 40, 20, true);
   socket.open();
-  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 40, rows: 20, flow_control: "ack", keep_size: true });
+  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 40, rows: 20, flow_control: "ack", receipt_resume_id: expect.any(String), keep_size: true });
   // the terminal lens is shown and resizes: from then on it drives the size
   client.resize("w1:p1", 100, 30, true);
   socket.open();
-  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack" });
+  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack", receipt_resume_id: expect.any(String) });
   // the chat lens covers it again
   client.keepSize("w1:p1");
   socket.open();
-  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack", keep_size: true });
+  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack", receipt_resume_id: expect.any(String), keep_size: true });
   client.close();
 });
 
@@ -607,7 +660,7 @@ it("releases the shared grid once when the chat lens covers a terminal this tab 
   client.releaseSize("w1:p1");
   expect(releases()).toEqual([{ type: "release-size", pane_id: "w1:p1" }]);
   socket.open();
-  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 53, rows: 33, flow_control: "ack", keep_size: true });
+  expect(lastAttach()).toEqual({ type: "attach", pane_id: "w1:p1", cols: 53, rows: 33, flow_control: "ack", receipt_resume_id: expect.any(String), keep_size: true });
   expect(releases()).toHaveLength(1);
   // an observer never drives the grid, so it never releases it either
   client.setMode("observe");
@@ -637,7 +690,7 @@ it("keeps a visible unfocused grid while changing only its reconnect policy", ()
     socket.open();
     // Control: blur still changes the reconnect policy, without replaying a release.
     expect(socket.sent.filter((m) => m.type === "attach").at(-1))
-      .toEqual({ type: "attach", pane_id: "w1:p1", cols: 120, rows: 40, flow_control: "ack", keep_size: true });
+      .toEqual({ type: "attach", pane_id: "w1:p1", cols: 120, rows: 40, flow_control: "ack", receipt_resume_id: expect.any(String), keep_size: true });
     expect(releases()).toHaveLength(1);
   } finally {
     client.close();
@@ -664,7 +717,7 @@ it("releases the shared grid once when a hidden terminal returns directly to Cha
     client.releaseSize("w1:p1");
     expect(releases()).toHaveLength(1);
     expect(socket.sent.filter((m) => m.type === "attach").at(-1))
-      .toEqual({ type: "attach", pane_id: "w1:p1", cols: 53, rows: 33, flow_control: "ack", keep_size: true });
+      .toEqual({ type: "attach", pane_id: "w1:p1", cols: 53, rows: 33, flow_control: "ack", receipt_resume_id: expect.any(String), keep_size: true });
     // Showing the terminal again at the same dimensions still reclaims its released grid.
     client.resize("w1:p1", 53, 33);
     expect(socket.sent.at(-1)).toEqual({ type: "resize", pane_id: "w1:p1", cols: 53, rows: 33 });
@@ -690,7 +743,7 @@ it("sends no resize for a pane it let go of, and does not attach it again on a r
   expect(socket.sent.slice(after).filter((m) => m.type === "attach" || m.type === "resize")).toEqual([]);
   // the user is back: it attaches at its own size again
   client.attach("w1:p1", 120, 40);
-  expect(socket.sent.at(-1)).toEqual({ type: "attach", pane_id: "w1:p1", cols: 120, rows: 40, flow_control: "ack" });
+  expect(socket.sent.at(-1)).toEqual({ type: "attach", pane_id: "w1:p1", cols: 120, rows: 40, flow_control: "ack", receipt_resume_id: expect.any(String) });
   client.close();
 });
 
@@ -732,6 +785,152 @@ it("watches a pane it let go of only on a server that can, again after a reconne
   expect(socket.sent.filter((m) => m.type === "watch")).toEqual([]);
   expect(ended).toEqual(["w1:p1", "w1:p2"]);
   expect(client.watch("w1:p2", 80, 24)).toBe(false);
+  client.close();
+});
+
+/** Answers every ping the client sent and the fake server has not answered yet, as the bridge does in order. */
+const answerPings = (socket: FakeSocket, answered: Set<unknown>) => {
+  for (const frame of socket.sent) if (frame.type === "ping" && !answered.has(frame.id)) {
+    answered.add(frame.id);
+    socket.receive({ type: "pong", id: frame.id });
+  }
+};
+
+const watchClient = (features = ["watch", "ping"]) => {
+  const client = new HerdrSocket("ws://test/ws");
+  const ended: string[] = [];
+  client.on((message) => { if (message.type === "watch-end") ended.push(message.pane_id); });
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  socket.receive(snapshot(features));
+  const frames = () => socket.sent.filter((m) => m.type === "watch" || m.type === "unwatch");
+  return { client, ended, socket, frames };
+};
+
+it("keeps a new watch when the unwatched view's end arrives after it, so the next unwatch still goes out", () => {
+  const { client, ended, socket, frames } = watchClient();
+  const answered = new Set<unknown>();
+  client.watch("w1:p1", 100, 30);
+  client.unwatch("w1:p1");
+  client.watch("w1:p1", 100, 30);
+  // the first view's end, sent before the server read the unwatch
+  socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  expect(ended).toEqual([]);
+  client.unwatch("w1:p1");
+  expect(frames().map((m) => m.type)).toEqual(["watch", "unwatch", "watch", "watch", "unwatch"]);
+  // once the server answered past every superseded view, a view that ends is ended for the page
+  client.watch("w1:p1", 100, 30);
+  answerPings(socket, answered);
+  socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  expect(ended).toEqual(["w1:p1"]);
+  client.unwatch("w1:p1");
+  expect(frames().at(-1)).toEqual({ type: "watch", pane_id: "w1:p1", cols: 100, rows: 30 });
+  client.close();
+});
+
+it("absorbs the late ends of two superseded views, so the newest unwatch still goes out", () => {
+  const { client, ended, socket, frames } = watchClient();
+  client.watch("w1:p1", 100, 30);
+  client.unwatch("w1:p1");
+  client.watch("w1:p1", 100, 30);
+  client.unwatch("w1:p1");
+  client.watch("w1:p1", 100, 30);
+  // both earlier views ended before the server read their unwatch
+  socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  expect(ended).toEqual([]);
+  const sent = frames().length;
+  client.unwatch("w1:p1");
+  expect(frames().slice(sent)).toEqual([{ type: "unwatch", pane_id: "w1:p1" }]);
+  client.close();
+});
+
+it("honours a view's own end after an unwatch once the server has read that unwatch", () => {
+  const { client, ended, socket, frames } = watchClient();
+  const answered = new Set<unknown>();
+  client.watch("w1:p1", 100, 30);
+  client.unwatch("w1:p1");
+  // the pong of a ping sent after the unwatch: the unwatched view can no longer end on a new one
+  answerPings(socket, answered);
+  client.watch("w1:p1", 100, 30);
+  const sent = frames().length;
+  socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  expect(ended).toEqual(["w1:p1"]);
+  // the view is over: it is not started again, and there is nothing left to unwatch
+  client.unwatch("w1:p1");
+  expect(frames().slice(sent)).toEqual([]);
+  client.close();
+});
+
+it("re-sends a replacement watch the server cannot start at most once, then lets its end reach the page", () => {
+  const { client, ended, socket, frames } = watchClient();
+  client.watch("w1:p1", 100, 30);
+  const start = socket.sent.length;
+  // a resize replaces the running view; the server cannot start the new one, so it ends it at once,
+  // answering each frame in order (its end comes before the pong of the ping sent after the watch)
+  client.watch("w1:p1", 120, 40);
+  for (let i = start; i < socket.sent.length && i < start + 100; i += 1) {
+    const frame = socket.sent[i]!;
+    if (frame.type === "watch") socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+    if (frame.type === "ping") socket.receive({ type: "pong", id: frame.id });
+  }
+  expect(frames().length - 1).toBeLessThanOrEqual(2);
+  expect(ended).toEqual(["w1:p1"]);
+  client.close();
+});
+
+// A bridge without "ping" cannot fence a superseded view's end, so the client tracks none: every end
+// reaches the page and nothing is re-sent or kept, and the page's next watch and unwatch both go out.
+const expectUntrackedEnds = ({ client, ended, socket, frames }: ReturnType<typeof watchClient>, ends: number) => {
+  const sent = frames().length;
+  for (let i = 0; i < ends; i += 1) socket.receive({ type: "watch-end", pane_id: "w1:p1" });
+  expect(ended).toEqual(Array.from({ length: ends }, () => "w1:p1"));
+  expect(frames().slice(sent)).toEqual([]);
+  expect(socket.sent.some((m) => m.type === "ping")).toBe(false);
+  client.watch("w1:p1", 100, 30);
+  client.unwatch("w1:p1");
+  expect(frames().slice(sent)).toEqual([{ type: "watch", pane_id: "w1:p1", cols: 100, rows: 30 }, { type: "unwatch", pane_id: "w1:p1" }]);
+  client.close();
+};
+
+it("tracks no superseded end on a bridge without ping: two late ends after two unwatches each reach the page", () => {
+  const watching = watchClient(["watch"]);
+  watching.client.watch("w1:p1", 100, 30);
+  watching.client.unwatch("w1:p1");
+  watching.client.watch("w1:p1", 100, 30);
+  watching.client.unwatch("w1:p1");
+  watching.client.watch("w1:p1", 100, 30);
+  expectUntrackedEnds(watching, 2);
+});
+
+it("tracks no superseded end on a bridge without ping: a replaced view's late end reaches the page", () => {
+  const replaced = watchClient(["watch"]);
+  replaced.client.watch("w1:p1", 100, 30);
+  replaced.client.watch("w1:p1", 120, 40);
+  expectUntrackedEnds(replaced, 1);
+
+  const both = watchClient(["watch"]);
+  both.client.watch("w1:p1", 100, 30);
+  both.client.unwatch("w1:p1");
+  both.client.watch("w1:p1", 100, 30);
+  both.client.watch("w1:p1", 120, 40);
+  expectUntrackedEnds(both, 2);
+});
+
+it("restores watches and chat interest once per connection: on the features frame, not again on the snapshot", () => {
+  const client = new HerdrSocket("ws://test/ws");
+  client.trustFeatures(() => true);
+  client.connect();
+  const socket = FakeSocket.last;
+  socket.open();
+  expect(client.watch("w1:p1", 100, 30)).toBe(true);
+  socket.receive({ type: "features", features: ["watch", "submit"], connection: "c1" });
+  expect(socket.sent.filter((m) => m.type === "watch")).toEqual([{ type: "watch", pane_id: "w1:p1", cols: 100, rows: 30 }]);
+  // the snapshot lists the same features: nothing is asked twice
+  socket.receive(snapshot(["watch", "submit"]));
+  expect(socket.sent.filter((m) => m.type === "watch")).toHaveLength(1);
+  expect(client.canWatch()).toBe(true);
   client.close();
 });
 
@@ -1205,7 +1404,7 @@ it("drops an open socket that answers no ping, reconnects at once and replays th
     expect(fresh).not.toBe(socket);
     expect(client.state).toBe("connecting");
     fresh.open();
-    expect(fresh.sent).toEqual([{ type: "role", mode: "interact" }, { type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack" }]);
+    expect(fresh.sent).toEqual([{ type: "role", mode: "interact" }, { type: "attach", pane_id: "w1:p1", cols: 100, rows: 30, flow_control: "ack", receipt_resume_id: expect.any(String) }]);
     expect(client.state).toBe("open");
     // the dead socket's late close changes nothing
     socket.disconnect();
@@ -2092,4 +2291,49 @@ it("an observing connection and a liveness probe never carry an insert", async (
     socket.receive({ type: "insert-result", id: sent.id, pane_id: "w1:p1", ok: true });
     expect(await result).toEqual({ ok: true });
   } finally { client.close(); }
+});
+
+// #511: a message for an agent alone goes only to a bridge that refuses it where no agent runs
+it("refuses an agent-only message on a bridge without agent-only, and names it where the bridge has it", async () => {
+  for (const features of [["submit"], ["submit", "agent-only"]]) {
+    const client = new HerdrSocket("ws://test/ws");
+    client.connect();
+    const socket = FakeSocket.last;
+    socket.open();
+    socket.receive(snapshot(features));
+    try {
+      if (!features.includes("agent-only")) {
+        expect(await client.submit("w1:p1", "> q\nc", "> q\rc", false, "immediate", undefined, false, undefined, undefined, true))
+          .toMatchObject({ ok: false, code: "agent_only_unsupported" });
+        expect(submissions(socket)).toEqual([]);
+      } else {
+        const next = socket.nextSubmission();
+        void client.submit("w1:p1", "> q\nc", "> q\rc", false, "immediate", undefined, false, undefined, undefined, true);
+        expect(await next).toMatchObject({ type: "submit", agent_only: true });
+      }
+    } finally {
+      client.close();
+    }
+  }
+});
+
+it("runs on a transport's socket where the page has no global WebSocket", () => {
+  // Given a transport that opens its own socket and no browser WebSocket global
+  setTransport({ ...nativeTransport, kind: "relay", openSocket: (url) => new FakeSocket(url) as unknown as WebSocketLike });
+  globals.WebSocket = undefined;
+  const client = new HerdrSocket("ws://test/ws");
+  try {
+    // When it connects, opens and is woken
+    client.connect();
+    const socket = FakeSocket.last;
+    expect(client.connected).toBe(false);
+    socket.open();
+    client.wake();
+    // Then its ready state is read from the socket, not the missing global
+    expect(client.connected).toBe(true);
+  } finally {
+    client.close();
+    globals.WebSocket = FakeSocket;
+    setTransport(nativeTransport);
+  }
 });

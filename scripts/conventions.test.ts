@@ -133,9 +133,7 @@ describe("demo transport", () => {
     "/api/bridge": "a remote PC's bridge endpoint, asked by another server, never by the browser",
     "/api/event": "OpenCode v2's own service's event stream, read by this server (opencode-service.ts), never by the browser",
     "/api/info": "OpenCode v2's own service's identity, checked by this server (opencode-service.ts), never by the browser",
-    "/api/devices": "Settings → Devices: the demo pairs no devices (listed when this guard was added)",
     "/api/devices/pair": "pairing a device: the demo is never locked, so the pairing form does not run",
-    "/api/devices/pair/start": "Settings → Devices: the demo pairs no devices (listed when this guard was added)",
     "/api/pane/conversation/image": "an image in a chat turn: the demo's transcripts carry none (listed when this guard was added)",
     "/api/pane/conversation/tool-output": "a tool call's full output: not part of the demo (listed when this guard was added)",
     "/api/pane/image": "pasting an image: the demo stores no files (listed when this guard was added)",
@@ -190,6 +188,8 @@ describe("names from before Ovis", () => {
     "server/remote-host.ts": "a remote bundle published before the rename reads the old name",
     "install.sh": "reads the old settings of an earlier install",
     "install.ps1": "reads the old settings of an earlier install",
+    "app/windows/src/Setup.cs": "reads the token of an earlier install's settings, as install.ps1 does",
+    "app/windows/tests/SetupTests.cs": "tests that read",
     "docs/guide.md": "tells users the old names still work",
     "shared/telemetry.ts": "pinned to the deployed telemetry Worker, so not even a comment changes",
   };

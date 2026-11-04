@@ -2,7 +2,7 @@ import { ImageReview } from "./pi-visual/ImageReview.tsx";
 import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowDown, BookOpen, Check, ChevronDown, ChevronRight, Circle, CircleAlert, CircleCheck, CircleDot, CircleQuestionMark, CircleSlash, CircleX, Copy, Layers, SquareTerminal, Target, Undo2,
+  ArrowDown, BookOpen, Check, ChevronDown, ChevronRight, Circle, CircleAlert, CircleCheck, CircleDot, CircleQuestionMark, CircleSlash, CircleX, Copy, Layers, SquareTerminal, Target,
   type LucideProps,
 } from "lucide-react";
 
@@ -14,6 +14,7 @@ import "./ChatTimeline.css";
 import { AgentMark } from "./AgentMark.tsx";
 import { AnimatedHeight } from "./AnimatedHeight.tsx";
 import { Markdown, ReservedImage } from "./Markdown.tsx";
+import { ChatMarkdownImages } from "./ChatMarkdownImages.tsx";
 import { ImageLightbox } from "./ImageLightbox.tsx";
 import { PromptCard } from "./PromptCard.tsx";
 import { RenderBoundary } from "./RenderBoundary.tsx";
@@ -21,28 +22,32 @@ import { loadChatTimeline, loadedChatTimeline, useChatTimeline } from "./chatTim
 import { ChatMinimap } from "./ChatMinimap.tsx";
 import { minimapTurns } from "../lib/chatMinimap.ts";
 import type { LegendListRef } from "@legendapp/list/react";
-import { appendChatRowSlots, createChatRowSlots, prependChatRowSlots } from "../lib/chatRows.ts";
-import { ChatDetails, ChatRowMemoryContext, useChatRowToggle, type ChatRowMemory } from "../lib/chatRowState.tsx";
+import { continuesHistory, createChatRowSlots, growChatRowSlots, prependChatRowSlots } from "../lib/chatRows.ts";
+import { ChatDetails, ChatRowMemoryContext, useChatRowToggle, useRowFocus, type ChatRowMemory } from "../lib/chatRowState.tsx";
 import { turnRevision } from "../lib/turnRevision.ts";
 import { conversationFinishEvidence, conversationFinishPresented } from "../lib/panePresentation.ts";
 import { seenKey } from "../lib/seenFinishes.ts";
 import { useWholeOutput as useScopedOutput } from "../lib/useWholeOutput.ts";
 import { turnSkills } from "../lib/skillActivity.ts";
-import { ApiError } from "../lib/api.ts";
+import { ApiError, pinPaneConversation, unpinPaneConversation } from "../lib/api.ts";
 import { copyText } from "../lib/clipboard.ts";
-import { attachmentFileName, mentionFileName, type GalleryImage } from "../lib/imageViewer.ts";
+import type { GalleryImage } from "../lib/imageViewer.ts";
+import { toolGalleryImage, userGalleryImages } from "../lib/chatImages.ts";
 import { useMachineApi } from "../lib/machineContext.tsx";
 import { toTranscriptMessages, type TranscriptMessage } from "../lib/transcript.ts";
-import { isLiveWorkTurn, isWaitingWorkTurn, formatWorkDuration, splitTurn, todoGroups, visibleWorkParts, workFailed, workStartsOpen, workSummary, type TodoAttempt, type TodoGroup, type ToolPart as ToolPartType } from "../lib/workBlocks.ts";
+import { endedOnAnswer, isLiveWorkTurn, isWaitingWorkTurn, formatWorkDuration, runNames, splitTurn, turnSegments, type WorkSegment, todoGroups, visibleWorkParts, workBlockStartsOpen, workFailed, workSummary, type TodoAttempt, type TodoGroup, type ToolPart as ToolPartType } from "../lib/workBlocks.ts";
 import { phaseRows, planRows, taskRows, todoRows, type ChecklistRow } from "../lib/checklist.ts";
 import { isTodoTool, parseTodoAnswer, todoCallSummary, type TodoItem, type TodoStatus } from "../lib/todos.ts";
 import { formatGoalTime, turnGoal, type GoalState, type GoalStatus } from "../lib/goals.ts";
 import { useSettings } from "../lib/settings.ts";
+import { learnFromConversation } from "../lib/tabLabels.ts";
 import { PAGE_OVERLAP_ROWS, pageScrollDistance } from "../lib/pageScroll.ts";
-import { followGlides } from "../lib/followScroll.ts";
+import { dropPendingListScroll, listEndPadded } from "../lib/followScroll.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
 import { statusEdgeRead } from "../lib/status.ts";
-import { askedQuestions } from "../lib/askQuestions.ts";
+import { askedQuestions } from "../../shared/askQuestions.ts";
+import { settleWaitingSends, waitingKey } from "../lib/sentWaiting.ts";
+import { SentWaitingList, useWaitingSends } from "./SentWaiting.tsx";
 import { ConversationRefresh } from "../lib/conversationRefresh.ts";
 import { teammateMessageParts, type TeammateMessage } from "../lib/teammateMessage.ts";
 import { usePageVisible } from "../lib/visibility.ts";
@@ -55,18 +60,17 @@ import { patchText } from "../../shared/patch.ts";
 import { workRowLabel } from "../lib/workRowLabel.ts";
 import { machinePath, paneStorageId } from "../../shared/machines.ts";
 import { chatRestoreIndex, chatTurnAnchor, readChatPosition, rememberChatPosition, type ChatPosition } from "../lib/chatScrollMemory.ts";
-import { fileUrl } from "../lib/api.ts";
 import { useMachineId } from "../lib/machineContext.tsx";
-import { useSkillMatcher } from "../lib/useSkillMatcher.ts";
-import type { SkillMatcher } from "../lib/skillMentions.ts";
+import { skillSyntax } from "../../shared/skill-syntax.ts";
+import { createSkillMatcher, type SkillMatcher } from "../lib/skillMentions.ts";
 import { lineDiff } from "../lib/diff.ts";
-import { formatTokens, sameMessage } from "../lib/compose.ts";
+import { endsWithTurn, formatTokens, stoppedTurn, type TurnIdentity } from "../lib/compose.ts";
 import { formatElapsed, taskCallItems, taskResultMarkdown } from "../lib/omoTasks.ts";
 import { sendUserFileCall } from "../lib/sendUserFile.ts";
+import { LINE_IMAGES_SHOWN, LINE_IMAGES_SHOWN_TOUCH, lineImages, linePictures, previewPlace, workImages, type WorkImage } from "../lib/workImages.ts";
 import { shouldFoldUserMessage } from "../lib/userMessageFold.ts";
-import { rewindOffer } from "../lib/rewindAction.ts";
 import { invalidatePaneCommands } from "../lib/paneCommandCache.ts";
-import { noteCatalogChanges, outcomeChip, outcomeCommand, outcomeLabel, outcomeNote, outcomeResultText, outcomeRows, type OutcomeState } from "../lib/outcomeChip.ts";
+import { afterMove, noteCatalogChanges, outcomeChip, outcomeCommand, outcomeLabel, outcomeNote, outcomeResultText, outcomeRows, type OutcomeState } from "../lib/outcomeChip.ts";
 import { typedTerminalCommand } from "../lib/compose.ts";
 import { usePaneCommands } from "../lib/usePaneCommands.ts";
 import { commandScreenClosed, sentOutcome, type TerminalPeek } from "../lib/terminalPeek.ts";
@@ -77,7 +81,8 @@ const SCROLL_INPUT_MS = 500;
 const READER_ALLOWANCE_PX = 1;
 // How far an upward move without the reader's input may leave the end and still follow: a composer
 // growing a few lines shrinks the view before the correction to the end lands. A scroll that sends
-// no input this page sees (a screen reader's, a Firefox scrollbar's) leaves the end only past it.
+// no input this page sees (a screen reader's, a Firefox scrollbar's) leaves the end only past it, and
+// only over a transcript that did not shrink under it (onScroll, #2042).
 const LAYOUT_ALLOWANCE_PX = 48;
 /** The pane this chat shows, for what its rows fetch on request (a tool call's whole output). */
 const ChatPaneContext = createContext<string | null>(null);
@@ -91,12 +96,16 @@ const ImageViewerContext = createContext<(images: GalleryImage[], index: number)
 /** The pane's folder a tool card's file labels read from (toolPathRoot), or null: labels as written. */
 const ToolPathRootContext = createContext<string | null>(null);
 import type { TypedAnswer } from "../lib/promptAnswer.ts";
-import type { AgentStatus, CommandOutcome, ConversationMetadata, ConversationPart, ConversationResponse, ConversationTurn, InteractivePrompt, OmoTaskResult, SlashCommand } from "../../shared/protocol.ts";
+import { polledPrompt, screenWordsToShow } from "../lib/promptText.ts";
+import type { AgentStatus, CommandOutcome, ConversationMetadata, ConversationPart, ConversationResponse, ConversationTurn, InteractivePrompt, OmoTaskResult, PendingMessage, SlashCommand } from "../../shared/protocol.ts";
 import { chatIsBlank, type ChatRead } from "../lib/greeting.ts";
 import { TurnTime } from "./TurnTime.tsx";
 import { useT } from "../lib/i18n.ts";
 import { offersRetry, userFailure, type UserFailure } from "../lib/userError.ts";
 import { useAnnouncedText } from "../lib/useAnnouncedText.ts";
+import { replyCommentsKey } from "../lib/replyComments.ts";
+import { ReplyCommentAction } from "./ReplyComments.tsx";
+import { useResourceUrl } from "../lib/useResourceUrl.ts";
 
 /** Slow reads in a row the chat waits through quietly before it alarms: about 50 s at the local 15 s deadline. */
 const SLOW_READS_BEFORE_ALARM = 3;
@@ -121,22 +130,20 @@ function FailureLine({ action, failure, onRetry }: { action: string; failure: Us
   </div>;
 }
 
-// No row is this object, so the list finds nothing to scroll to.
-const NO_ROW = Object.freeze({});
-/**
- * The list's scrollToEnd does not scroll at once: it waits for the list's next commit, and then
- * for the layout to settle after a data change (up to 800 ms). A follow asked for while the reader
- * was at the end can so land after the reader paged or scrolled away, and pull them back. Any newer
- * scroll request supersedes a waiting one; a request for no row supersedes it without moving.
- */
-function dropPendingListScroll(list: LegendListRef | null): void {
-  void list?.scrollToItem({ item: NO_ROW, animated: false });
-}
-
 const TRANSCRIPT_LINES = 400;
 const PROMPT_POLL_MS = 2000;
+/**
+ * How long herdr's status may still say working after a turn's final answer is drawn: it trailed the
+ * transcript by 100–400 ms at the Claude Code turn ends measured. Twice the longest, and still short
+ * enough that a turn the agent begins by itself shows its Working head within a second.
+ */
+const ANSWER_STATUS_LAG_MS = 800;
 // failed prompt reads in a row before the card says it may be out of date: one is a hiccup
 const PROMPT_STALE_READS = 2;
+/** The prompt each pane's chat last read (by paneStorageId): a chat drawn again (back from the
+ * Terminal lens) shows its card before paint, as it shows its turns, while its first read revalidates
+ * it. Only while herdr still says the pane waits: one answered in the terminal is not drawn again. */
+const lastPrompts = new Map<string, InteractivePrompt>();
 /** Scrolling this close to the top asks for the page before it. */
 const LOAD_OLDER_PX = 400;
 
@@ -162,6 +169,10 @@ export interface ChatViewProps {
   onTerminalOutput?: (listener: (() => void) | null) => void;
   /** bumped when a composer message goes out, before the transcript holds it */
   sentKey?: number;
+  /** bumped as a send that bumped sentKey is refused with nothing typed: the stopped turn it hid shows again once its copy is gone */
+  unsentKey?: number;
+  /** the pane's pending rows: one going out (`sending`, Send now or the turn-end drain) empties the agent's box before its receipt bumps sentKey */
+  pendingRows?: readonly Pick<PendingMessage, "id" | "state">[];
   /** bumped once this browser's own message from the box was accepted at once, with the navigation
    * generation it went out at: the chat follows it to the end unless the reader navigated since */
   localSend?: { key: number; navigationGeneration: number };
@@ -172,13 +183,15 @@ export interface ChatViewProps {
   ended: boolean;
   agent: string | null;
   agentStatus?: AgentStatus;
+  /** the pane's session as the roster names it (api.ts paneSessionKey): an answer drawn for the session before is read again */
+  agentSession?: string | null;
   onMetadata?: (paneId: string, metadata: ConversationMetadata | null) => void;
   /** what the last read says of the conversation, for the composer's greeting; null while nothing is known (loading, a failed read, the chat gone) */
   onRead?: (paneId: string, read: ChatRead | null) => void;
-  /** the composer shows its greeting: the chat's own "nothing yet" line stays out */
+  /** the composer shows its greeting, or a message sent from it is on its way or held: the chat's own "nothing yet" line stays out */
   greeted?: boolean;
   /** the agent's waiting prompt, for the composer to answer too */
-  onPrompt?: (paneId: string, prompt: InteractivePrompt | null) => void;
+  onPrompt?: (paneId: string, prompt: InteractivePrompt | null, answered?: boolean) => void;
   /** with no prompt waiting, the next prompt the agent suggests (Claude's grey input text) */
   onSuggestion?: (paneId: string, suggestion: string | null) => void;
   /** a cancelled send the agent put back in its input box: the composer fills it again, and it is no sent turn here either */
@@ -210,8 +223,8 @@ export interface ChatViewProps {
   onOutcomes?: (paneId: string, ids: readonly string[]) => void;
   /** this connection may type into the pane (it is no watching device or observer): only then can a message be rewound to */
   interactive?: boolean;
-  /** a message's "Rewind in terminal" (Claude Code, grok, agy): the pane opens its terminal with a hint to run the agent's own rewind; nothing is sent */
-  onRewindInTerminal?: () => void;
+  /** the pane's composer is there to take a quote of a selection: a secret prompt stands in its place */
+  quotable?: boolean;
   /** the pane's folder: a tool card's file reads from it (`app/src/a.ts`), while its title and what it opens stay the path as written */
   cwd?: string | null;
 }
@@ -231,6 +244,7 @@ interface ChatState {
 }
 
 const EMPTY_STATE: ChatState = { source: "conversation", turns: [], messages: [], truncated: false };
+const NO_ROWS: readonly Pick<PendingMessage, "id" | "state">[] = [];
 
 /** One row of the timeline: a loaded turn in its browser slot, or a provisional sent row keyed by its outcome. */
 type ChatRow = { key: string; beforeUser: boolean } & (
@@ -417,6 +431,18 @@ function ToolInputView({ part }: { part: ToolPartType }) {
   return <pre className="chat-tool-io">{part.input}</pre>;
 }
 
+/** A call's input as the agent sent it, indented when it is JSON. */
+function RawToolInput({ part }: { part: ToolPartType }) {
+  const t = useT();
+  return <section className="chat-tool-output"><h4>{t("Input")}</h4>
+    <pre className="chat-tool-io">{part.arguments_omitted ? t("Arguments omitted (too large)") : indentedJson(part.input)}</pre>
+  </section>;
+}
+
+function indentedJson(text: string): string {
+  try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; }
+}
+
 /** A cut output's rest, fetched when asked for: the page carries the first few thousand characters. */
 function useWholeOutput(ref: string | undefined): { text: string | null; state: "idle" | "loading" | "failed"; load: () => void } {
   const paneId = useContext(ChatPaneContext);
@@ -434,7 +460,7 @@ function useWholeOutput(ref: string | undefined): { text: string | null; state: 
   return saved === undefined ? result : { text: saved, state: "idle", load: result.load };
 }
 
-/** A chat thumbnail: a tap opens the message's pictures over the page (ImageLightbox), this one first. */
+/** A chat picture, shown whole: a tap opens the message's pictures over the page (ImageLightbox), this one first. */
 function ImageThumb({ image, onOpen }: { image: GalleryImage; onOpen: () => void }) {
   const t = useT();
   // the focus is placed on the thumbnail before the viewer opens, so the viewer's focus trap
@@ -453,18 +479,100 @@ function ImageGallery({ images, className }: { images: GalleryImage[]; className
   </div>;
 }
 
-/** Images a tool returned (pi reads a picture into the result); opened with the row. */
+/** Images a tool returned (pi reads a picture into the result), shown whole in the opened row. */
 function ToolImages({ paneId, part }: { paneId: string; part: ToolPartType }) {
   const t = useT();
   const machineId = useMachineId();
-  if (part.images === undefined || part.images.length === 0) return null;
-  const images = part.images.map((image, index): GalleryImage => ({
-    src: machinePath(machineId, `pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ref: image.ref }).toString()}`),
-    // a tool's picture carries no file name: it is named by its place and the tool that read it
-    name: t("Image {n} from {tool}", { n: index + 1, tool: part.name }),
-    file: attachmentFileName(image.media_type, index),
-  }));
-  return <ImageGallery images={images} className="chat-tool-images" />;
+  const images = workImages([part]);
+  if (images.length === 0) return null;
+  return <ImageGallery images={images.map((image) => toolGalleryImage(machineId, paneId, image, t))} className="chat-tool-images" />;
+}
+
+/**
+ * The larger look a line thumbnail gives on hover or keyboard focus, over the page: the picture, the
+ * tool that returned it and its place among the line's (lib/workImages.ts previewPlace). It never
+ * takes a pointer, so moving onto it reads as leaving the thumbnail.
+ */
+function LinePreview({ image, tool, place, anchor }: { image: GalleryImage; tool: string; place: string; anchor: HTMLElement }) {
+  const box = useRef<HTMLDivElement>(null);
+  const [at, setAt] = useState<{ left: number; top: number } | null>(null);
+  // placed before the first paint, its box being sized by CSS before the picture decodes, and again
+  // whenever the page under it moves (the chat following a streaming answer scrolls it): it stays with
+  // its thumbnail, and is hidden while that is out of view or gone
+  useLayoutEffect(() => {
+    const own = box.current;
+    if (own === null) return;
+    const place = () => {
+      const target = anchor.getBoundingClientRect();
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+      setAt(!anchor.isConnected || target.bottom < 0 || target.top > viewport.height ? null : previewPlace(target, own.getBoundingClientRect(), viewport));
+    };
+    place();
+    window.addEventListener("scroll", place, { capture: true, passive: true });
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, { capture: true });
+      window.removeEventListener("resize", place);
+    };
+  }, [anchor]);
+  return createPortal(<div ref={box} className="work-image-preview" aria-hidden="true" style={at === null ? { visibility: "hidden" } : { left: at.left, top: at.top }}>
+    <ReservedImage src={image.src} alt="" slot />
+    <div className="work-image-preview-bar"><span className="work-image-preview-tool">{tool}</span><span>{place}</span></div>
+  </div>, document.body);
+}
+
+/** One small thumbnail on a work line. */
+function LineThumb({ image, onOpen, onHover, onFocused, onFailed }: {
+  image: GalleryImage; onOpen: (target: HTMLElement) => void; onHover: (anchor: HTMLElement | null) => void; onFocused: (target: HTMLElement) => void; onFailed: () => void;
+}) {
+  const src = useResourceUrl(image.src);
+  return <button type="button" className="work-image" aria-label={image.name}
+    onClick={(event) => onOpen(event.currentTarget)}
+    // a touch has no hover: a tap opens the viewer at once
+    onPointerEnter={(event) => { if (event.pointerType !== "touch") onHover(event.currentTarget); }}
+    onPointerLeave={() => onHover(null)}
+    // reached by the keyboard, not by a click
+    onFocus={(event) => { if (event.currentTarget.matches(":focus-visible")) onFocused(event.currentTarget); }}
+    onBlur={() => onHover(null)}>
+    <img src={src ?? undefined} alt="" loading="lazy" onError={onFailed} />
+  </button>;
+}
+
+/**
+ * The pictures a work line's tools returned, small at the line's end, as the Claude app's folded
+ * "Read 2 files" line shows them: hovering one shows it larger, a click opens the viewer on all of
+ * them at that one. The latest few show; the ones before them are one "+N" tile, so the line never wraps.
+ */
+function LineImages({ paneId, images }: { paneId: string; images: readonly WorkImage[] }) {
+  const t = useT();
+  const machineId = useMachineId();
+  const openViewer = useContext(ImageViewerContext);
+  const touch = useMediaQuery("(pointer: coarse)");
+  // by address, not place: a picture that moves onto the "+N" tile or leaves the line takes its preview along
+  const [preview, setPreview] = useState<{ src: string; anchor: HTMLElement } | null>(null);
+  // a picture that failed to load leaves the line and the viewer, never a broken icon, while the line is drawn
+  const [failed, setFailed] = useState<ReadonlySet<string>>(() => new Set());
+  const entries = useMemo(() => images.map((image) => ({ image: toolGalleryImage(machineId, paneId, image, t), tool: image.part.name })), [images, machineId, paneId, t]);
+  const usable = entries.filter((entry) => !failed.has(entry.image.src));
+  if (usable.length === 0) return null;
+  const gallery = usable.map((entry) => entry.image);
+  const { hidden, shown } = lineImages(usable, touch ? LINE_IMAGES_SHOWN_TOUCH : LINE_IMAGES_SHOWN);
+  // the focus is placed on the thumbnail first, so the viewer gives it back there on close (ImageThumb)
+  const open = (index: number, target: HTMLElement) => { setPreview(null); target.focus({ preventScroll: true }); openViewer(gallery, index); };
+  // a thumbnail takes back only its own preview: leaving one must not close the next one's
+  const hide = (src: string) => setPreview((current) => current?.src === src ? null : current);
+  const at = preview === null ? -1 : usable.findIndex((entry) => entry.image.src === preview.src);
+  const previewed = at >= hidden ? usable[at] : undefined;
+  return <div className="work-images" role="group" aria-label={t("Pictures from this work")}>
+    {hidden > 0 && <button type="button" className="work-image is-more" aria-label={t("All {count} pictures", { count: usable.length })} onClick={(event) => open(0, event.currentTarget)}>+{hidden}</button>}
+    {shown.map(({ image }, offset) => <LineThumb key={image.src} image={image}
+      onOpen={(target) => open(hidden + offset, target)}
+      onHover={(anchor) => anchor === null ? hide(image.src) : setPreview({ src: image.src, anchor })}
+      onFocused={(target) => setPreview({ src: image.src, anchor: target })}
+      onFailed={() => { hide(image.src); setFailed((current) => new Set(current).add(image.src)); }} />)}
+    {preview !== null && previewed !== undefined && <LinePreview image={previewed.image} tool={previewed.tool} anchor={preview.anchor}
+      place={t("{n} of {count}", { n: at + 1, count: usable.length })} />}
+  </div>;
 }
 
 /**
@@ -478,27 +586,35 @@ function WorkRow({ paneId, part, stateKey, state }: { paneId: string; part: Tool
   const openFile = useContext(OpenFileContext);
   const [chosen, setOpen] = useChatRowToggle(stateKey, false);
   const open = chosen === true;
+  const focus = useRowFocus<HTMLButtonElement>(stateKey);
+  // an update inside a todo run: the run already shows the list it left, so the update shows what it sent and got back
+  const attempt = state !== undefined;
   const whole = useWholeOutput(part.output_ref);
   const summary = part.arguments_omitted ? t("Arguments omitted (too large)") : todoCallSummary(part) ?? part.summary;
   // reads the call's input: once per call, not on every poll of the transcript
   const { verb, narration } = useMemo(() => workRowLabel({ name: part.name, input: part.input }, summary), [part.name, part.input, summary]);
   // the list is the answer of a todo call: its raw text would say it twice
-  const output = isTodoTool(part.name) && parseTodoAnswer(part.output) !== null ? "" : whole.text ?? part.output;
+  const output = !attempt && isTodoTool(part.name) && parseTodoAnswer(part.output) !== null ? "" : whole.text ?? part.output;
   // an attempt inside a todo run says how it went, in the transcript's words; a failure already says "failed"
   const stateWord = state === undefined || part.error ? null
     : state === "ok" ? t("succeeded") : state === "pending" ? t("pending") : state === "error" ? t("failed") : t("outcome not recorded");
+  const images = useMemo(() => linePictures([part]), [part]);
   return <div className={`work-row${part.error ? " is-error" : ""}`}>
-    <button type="button" className="work-row-head" aria-expanded={open} title={narration || verb !== null ? `${part.name} · ${summary}` : undefined} onClick={() => setOpen(!open)}>
-      <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
-      {!narration && (verb !== null ? <span className="work-row-name is-verb">{t(verb)}</span> : <span className="work-row-name">{part.name}</span>)}
-      {/* the spaces are for a screen reader: the row is read as words, not "Ranbun test" */}
-      {!narration && part.error && verb === null && <>{" "}<span className="work-row-failed">{t("failed")}</span></>}
-      {summary.length > 0 && summary !== part.name && <>{" "}<span className="work-row-summary">{summary}</span></>}
-      {/* after a verb, or the agent's own sentence, the word follows it: "Ran pnpm test failed", not "Ran failed pnpm test" */}
-      {part.error && (narration || verb !== null) && <>{" "}<span className="work-row-failed">{t("failed")}</span></>}
-      {stateWord !== null && <>{" "}<span className={state === "error" ? "work-row-failed" : `work-row-state is-${state}`}>{stateWord}</span></>}
-    </button>
-    {open && <div className="work-row-detail">{verb !== null && <p className="work-row-tool">{part.name}</p>}<ToolInputView part={part} /><ToolImages paneId={paneId} part={part} />{output.length > 0 && <section className="chat-tool-output"><h4>{t(part.error ? "Error" : "Output")}</h4><pre className={`chat-tool-io${whole.text !== null ? " is-whole" : ""}`}>{linkFilePaths(output, openFile)}</pre>
+    <div className="work-row-line">
+      <button type="button" className="work-row-head" aria-expanded={open} title={narration || verb !== null ? `${part.name} · ${summary}` : undefined} onClick={() => setOpen(!open)} {...focus}>
+        <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
+        {!narration && (verb !== null ? <span className="work-row-name is-verb">{t(verb)}</span> : <span className="work-row-name">{part.name}</span>)}
+        {/* the spaces are for a screen reader: the row is read as words, not "Ranbun test" */}
+        {!narration && part.error && verb === null && <>{" "}<span className="work-row-failed">{t("failed")}</span></>}
+        {summary.length > 0 && summary !== part.name && <>{" "}<span className="work-row-summary">{summary}</span></>}
+        {/* after a verb, or the agent's own sentence, the word follows it: "Ran pnpm test failed", not "Ran failed pnpm test" */}
+        {part.error && (narration || verb !== null) && <>{" "}<span className="work-row-failed">{t("failed")}</span></>}
+        {stateWord !== null && <>{" "}<span className={state === "error" ? "work-row-failed" : `work-row-state is-${state}`}>{stateWord}</span></>}
+      </button>
+      {/* opened, the row shows its pictures larger in its detail */}
+      {!open && <LineImages paneId={paneId} images={images} />}
+    </div>
+    {open && <div className="work-row-detail">{verb !== null && <p className="work-row-tool">{part.name}</p>}{attempt ? <RawToolInput part={part} /> : <ToolInputView part={part} />}<ToolImages paneId={paneId} part={part} />{output.length > 0 && <section className="chat-tool-output"><h4>{t(part.error ? "Error" : "Output")}</h4><pre className={`chat-tool-io${whole.text !== null ? " is-whole" : ""}`}>{linkFilePaths(output, openFile)}</pre>
       {part.output_ref !== undefined && whole.text === null && <button type="button" className="btn btn-ghost chat-tool-more" disabled={whole.state === "loading"} onClick={whole.load}>
         {t(whole.state === "loading" ? "Loading the whole output…" : whole.state === "failed" ? "Couldn't load the whole output — retry" : "Show the whole output ({size} characters)", { size: formatTokens(part.output_size ?? 0) })}
       </button>}</section>}</div>}
@@ -512,7 +628,15 @@ function WorkRow({ paneId, part, stateKey, state }: { paneId: string; part: Tool
  */
 function TodoGroupRow({ paneId, group, stateKeyOf }: { paneId: string; group: TodoGroup; stateKeyOf: (part: ToolPartType) => string }) {
   const t = useT();
-  const [chosen, setOpen] = useChatRowToggle(`todo-group:${group.id}`, false);
+  const memory = useContext(ChatRowMemoryContext);
+  // an update the reader opened before the next one joined it opens the group: what they were
+  // reading stays open, inside it, while the turn streams on (#1388). The group keeps that as its own
+  // state, so closing the update inside later does not fold the group when the list remounts it.
+  const groupKey = `todo-group:${group.id}`;
+  const [chosen, setOpen] = useChatRowToggle(groupKey, group.attempts.some((attempt) => memory?.toggles.get(stateKeyOf(attempt.part)) === true));
+  // the update the reader was on takes the focus back inside the run when it is open (WorkRow); folded, the run's head takes it
+  const focus = useRowFocus<HTMLButtonElement>(groupKey, group.attempts.map((attempt) => stateKeyOf(attempt.part)));
+  useLayoutEffect(() => { if (chosen === true && memory !== null && !memory.toggles.has(groupKey)) memory.toggles.set(groupKey, true); }, [chosen, memory, groupKey]);
   const open = chosen === true;
   const { current } = group;
   const items = current?.items ?? null;
@@ -526,7 +650,7 @@ function TodoGroupRow({ paneId, group, stateKeyOf }: { paneId: string; group: To
       : current.state === "ok" ? t("Current list") : t("Latest list. The transcript does not record whether this update succeeded.");
   // its failures are counted in words on its head; each failed attempt marks itself inside
   return <div className="work-row work-todo-group" data-todo-group={group.id}>
-    <button type="button" className="work-row-head" aria-expanded={open} onClick={() => setOpen(!open)}>
+    <button type="button" className="work-row-head" aria-expanded={open} onClick={() => setOpen(!open)} {...focus}>
       <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
       <span className="work-row-name is-verb">{t("Plan")}</span>
       {" "}<span className="work-row-summary">{t("{n} updates", { n: group.attempts.length })} · {status}</span>
@@ -545,10 +669,11 @@ function TodoGroupRow({ paneId, group, stateKeyOf }: { paneId: string; group: To
   </div>;
 }
 
-function ThinkingRow({ text, stateKey }: { text: string; stateKey: string }) {
+/** `defaultOpen`: Expand thinking (Settings); what the reader chose in the row wins for its message */
+function ThinkingRow({ text, stateKey, defaultOpen }: { text: string; stateKey: string; defaultOpen: boolean }) {
   const t = useT();
-  const [chosen, setOpen] = useChatRowToggle(stateKey, false);
-  const open = chosen === true;
+  const [chosen, setOpen] = useChatRowToggle(stateKey, null);
+  const open = chosen ?? defaultOpen;
   return <div className="work-row work-row-thinking">
     <button type="button" className="work-row-head" aria-expanded={open} onClick={() => setOpen(!open)}>
       <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
@@ -569,23 +694,41 @@ function ThinkingRow({ text, stateKey }: { text: string; stateKey: string }) {
  * the first row draws takes its place without a change of look; nothing to open yet, so its caret
  * holds only the room.
  */
-function PendingWorkHead({ title, className = "" }: { title: string; className?: string }) {
-  return <div className={`work-block is-live is-pending ${className}`} role="status">
+function PendingWorkHead({ title, className = "", reserved = false }: { title: string; className?: string; reserved?: boolean }) {
+  return <div className={`work-block is-live is-pending ${className}`} role="status" aria-hidden={reserved || undefined}>
     <div className="work-block-head"><span className="work-row-caret" aria-hidden="true" /><span className="work-block-title">{title}</span></div>
   </div>;
 }
 
-function WorkBlockView({ paneId, parts, turnParts, rowKey, duration, live, waiting, defaultOpen, showThinking, pendingHead }: { paneId: string; parts: ConversationPart[]; turnParts: ConversationPart[]; rowKey: string; duration: string | null; live: boolean; waiting: boolean; defaultOpen: boolean; showThinking: boolean; pendingHead: boolean }) {
+/** What every work block of one turn reads, found once per turn rather than once per block. */
+interface TurnWork {
+  /** each part's index in the turn: rows are keyed and remembered by it, whichever block holds them */
+  at: ReadonlyMap<ConversationPart, number>;
+  /** runs of todo updates, found in the turn's own order before anything is hidden */
+  groups: ReadonlyMap<ToolPartType, TodoGroup>;
+  /** the updates a group row stands for, after its first */
+  grouped: ReadonlySet<ConversationPart>;
+}
+
+function turnWork(parts: ConversationPart[], rowKey: string): TurnWork {
+  const groups = todoGroups(parts, rowKey);
+  return {
+    at: new Map(parts.map((part, index) => [part, index])),
+    groups,
+    grouped: new Set([...groups.values()].flatMap((group) => group.attempts.slice(1).map((attempt) => attempt.part))),
+  };
+}
+
+function WorkBlockView({ paneId, parts, work, memoryKey, duration, live, waiting, defaultOpen, showThinking, expandThinking, pendingHead }: { paneId: string; parts: ConversationPart[]; work: TurnWork; memoryKey: string; duration: string | null; live: boolean; waiting: boolean; defaultOpen: boolean; showThinking: boolean; expandThinking: boolean; pendingHead: boolean }) {
   const t = useT();
-  const [chosenOpen, setOpen] = useChatRowToggle("work", null);
+  const [chosenOpen, setOpen] = useChatRowToggle(memoryKey, null);
   const open = chosenOpen ?? defaultOpen;
   // reading or working inside the block is a choice to keep it: the fold at the end of the turn
   // must not take the rows from under the reader's focus or close the row they opened
   const keepOpen = () => { if (chosenOpen === null) setOpen(true); };
-  // runs of todo updates, found in the turn's own order before anything is hidden
-  const groups = useMemo(() => todoGroups(turnParts, rowKey), [turnParts, rowKey]);
-  const grouped = new Set([...groups.values()].flatMap((group) => group.attempts.slice(1).map((attempt) => attempt.part)));
-  const toolKey = (part: ConversationPart) => `tool:${parts.indexOf(part)}`;
+  const { at, groups, grouped } = work;
+  const toolKey = (part: ConversationPart) => `tool:${at.get(part)}`;
+  const images = useMemo(() => linePictures(parts), [parts]);
   const visible = visibleWorkParts(parts, showThinking);
   if (visible.length === 0) return live && !waiting && pendingHead ? <PendingWorkHead title={t("Working…")} /> : null;
   const summary = workSummary(parts);
@@ -593,20 +736,24 @@ function WorkBlockView({ paneId, parts, turnParts, rowKey, duration, live, waiti
   // a blocked agent is not working: the open block takes the sidebar's words for it
   const title = waiting ? t("Needs you") : live ? t("Working…") : duration !== null ? t("Worked for {duration}", { duration }) : t("Worked");
   return <section className={`work-block${live ? " is-live" : ""}${waiting ? " is-waiting" : ""}${open ? "" : " is-folded"}`}>
-    <button type="button" className="work-block-head" aria-expanded={open} onClick={() => setOpen(!open)}>
-      <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
-      <span className="work-block-title">{title}</span>
-      {summary.length > 0 && <span className="work-block-summary">· {summary}</span>}
-      {/* its own span: the counts before it are cut on a narrow screen, a failure never is */}
-      {failed > 0 && <span className="work-block-failed">· {t("{n} failed", { n: failed })}</span>}
-    </button>
+    <div className="work-block-line">
+      <button type="button" className="work-block-head" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="work-row-caret" aria-hidden="true">{open ? <ChevronDown /> : <ChevronRight />}</span>
+        <span className="work-block-title">{title}</span>
+        {summary.length > 0 && <span className="work-block-summary">· {summary}</span>}
+        {/* its own span: the counts before it are cut on a narrow screen, a failure never is */}
+        {failed > 0 && <span className="work-block-failed">· {t("{n} failed", { n: failed })}</span>}
+      </button>
+      {/* folded, the block's line carries its tools' pictures the browser keeps (linePictures); opened, each row carries its own */}
+      {!open && <LineImages paneId={paneId} images={images} />}
+    </div>
     {/* the rows open and fold at the block's measured height; folded and settled, they are not drawn */}
     <AnimatedHeight open={open} animateContent={false}>
-      <div className="work-block-rows" onFocus={keepOpen} onClick={keepOpen}>{visible.map((part, index) =>
-        part.kind === "thinking" ? <ThinkingRow key={index} stateKey={`thinking:${parts.indexOf(part)}`} text={part.text} />
-          : part.kind === "text" ? <div key={index} className="work-narration"><Markdown>{part.text}</Markdown></div>
+      <div className="work-block-rows" onFocus={keepOpen} onClick={keepOpen}>{visible.map((part) =>
+        part.kind === "thinking" ? <ThinkingRow key={`thinking:${at.get(part)}`} stateKey={`thinking:${at.get(part)}`} text={part.text} defaultOpen={expandThinking} />
+          : part.kind === "text" ? <div key={`text:${at.get(part)}`} className="work-narration"><Markdown>{part.text}</Markdown></div>
             : part.kind === "tool" ? groups.has(part) ? <TodoGroupRow key={groups.get(part)!.id} paneId={paneId} group={groups.get(part)!} stateKeyOf={toolKey} />
-              : grouped.has(part) ? null : <WorkRow key={index} stateKey={toolKey(part)} paneId={paneId} part={part} /> : null)}
+              : grouped.has(part) ? null : <WorkRow key={toolKey(part)} stateKey={toolKey(part)} paneId={paneId} part={part} /> : null)}
       </div>
     </AnimatedHeight>
   </section>;
@@ -652,24 +799,11 @@ function GoalActivity({ goal }: { goal: GoalState }) {
   </ChatDetails>;
 }
 
-/** Image files a message mentions as `@path`, the way this app attaches them: shown as thumbnails. */
-const IMAGE_MENTION = /(?:^|\s)@(\S+\.(?:png|jpe?g|gif|webp))(?=\s|$)/gi;
-
 function UserImages({ paneId, parts, text }: { paneId: string; parts: ConversationPart[]; text: string }) {
   const t = useT();
   const machineId = useMachineId();
-  const pasted = parts.filter((part): part is Extract<ConversationPart, { kind: "image" }> => part.kind === "image");
-  const mentioned = [...new Set([...text.matchAll(IMAGE_MENTION)].map((match) => match[1]!))];
-  if (pasted.length === 0 && mentioned.length === 0) return null;
-  // one gallery for the message: its pasted pictures first, then the files it mentioned
-  const images: GalleryImage[] = [
-    ...pasted.map((part, index): GalleryImage => ({
-      src: machinePath(machineId, `pane/conversation/image?${new URLSearchParams({ pane_id: paneId, ref: part.ref }).toString()}`),
-      name: t("Attached image"),
-      file: attachmentFileName(part.media_type, index),
-    })),
-    ...mentioned.map((path): GalleryImage => ({ src: fileUrl(path, paneId, machineId), name: path, file: mentionFileName(path) })),
-  ];
+  const images = userGalleryImages(machineId, paneId, parts, text, t);
+  if (images.length === 0) return null;
   return <ImageGallery images={images} className="chat-user-images" />;
 }
 
@@ -810,6 +944,9 @@ interface TurnProps {
   /** ...and "Needs you" while the agent is blocked */
   waiting: boolean;
   showThinking: boolean;
+  /** Settings: the reasoning shown starts open (Expand thinking), the work blocks folded (Collapse work) */
+  expandThinking?: boolean;
+  foldWork?: boolean;
   /** the pane's skill names: an answer's text chips them */
   skills?: SkillMatcher | null;
   /** omo only: the user's own `$skill:x` and the `[skill: x]` omo leaves where one stood are chipped too */
@@ -817,8 +954,6 @@ interface TurnProps {
   /** a user turn that records a command sent from here: what became of it is drawn under the bubble */
   outcome?: CommandOutcome | null;
   outcomeActions?: OutcomeActions | null;
-  /** Claude Code, grok, agy: the message offers to open the terminal, where the agent's own rewind is run (lib/rewindAction.ts) */
-  onRewindInTerminal?: (() => void) | null;
 }
 
 const TASK_RESULT_ICONS: Record<OmoTaskResult["status"], ComponentType<LucideProps>> = { completed: CircleCheck, failed: CircleX, cancelled: CircleSlash };
@@ -890,8 +1025,20 @@ function noticeLabel(t: ReturnType<typeof useT>, notice: Extract<ConversationPar
 }
 
 // a turn that did not change keeps its object across polls: skip re-rendering it
-const Turn = memo(function Turn({ paneId, turn, rowKey, live, waiting, showThinking, skills = null, userSkills = null, outcome = null, outcomeActions = null, onRewindInTerminal = null }: TurnProps) {
+export const Turn = memo(function Turn({ paneId, turn, rowKey, live, waiting, showThinking, expandThinking = false, foldWork = false, skills = null, userSkills = null, outcome = null, outcomeActions = null }: TurnProps) {
   const t = useT();
+  const memory = useContext(ChatRowMemoryContext);
+  // what the drawn runs, and the runs that drew no block, were named, by part index; the row's
+  // memory takes it once the turn is drawn
+  const named = useRef<{ runs: Map<number, string>; dormant: Map<number, string> } | null>(null);
+  named.current = null;
+  useLayoutEffect(() => {
+    if (memory === null || named.current === null) return;
+    for (const key of ["runs", "dormant"] as const) {
+      memory[key].clear();
+      for (const [index, name] of named.current[key]) memory[key].set(index, name);
+    }
+  });
   // under the turn, not in its meta row: that row fades out once the pointer and focus leave
   const [copyFailed, setCopyFailed] = useChatRowToggle("copy-failed", false);
   const copyError = copyFailed && <p className="chat-copy-error" role="alert">{t("Couldn't copy. Select the text and copy it manually.")}</p>;
@@ -921,6 +1068,17 @@ const Turn = memo(function Turn({ paneId, turn, rowKey, live, waiting, showThink
       <pre className="chat-compact-text chat-notice-text">{notice.text}</pre>
     </ChatDetails>;
   }
+  // a command the user ran in the agent's shell, without the model (bash mode): what went in, then what came out
+  const shell = turn.parts.find((part): part is Extract<ConversationPart, { kind: "shell" }> => part.kind === "shell");
+  if (shell !== undefined) {
+    return <article className="chat-turn chat-turn-user chat-shell">
+      <p className="chat-shell-command"><SquareTerminal aria-hidden="true" /><code>{shell.command}</code></p>
+      {shell.stdout && <pre className="chat-tool-io">{shell.stdout}</pre>}
+      {shell.stderr && <pre className="chat-tool-io chat-shell-stderr">{shell.stderr}</pre>}
+      <div className="chat-turn-meta">{time}</div>
+      {outcome !== null && <OutcomeChip outcome={outcome} actions={outcomeActions} />}
+    </article>;
+  }
   if (turn.role === "user") {
     if (outcome !== null && terminalOnlyOutcome(outcome, outcomeActions)) return <TerminalCommandRow outcome={outcome} actions={outcomeActions} />;
     const text = userText(turn);
@@ -938,11 +1096,7 @@ const Turn = memo(function Turn({ paneId, turn, rowKey, live, waiting, showThink
       {/* one row: with a mouse the time and copy sit beside the bubble, on touch under it */}
       <div className="chat-user-row">
         {text.length > 0 && <UserMessage text={text} skills={userSkills} />}
-        <div className="chat-turn-meta">{time}{text.length > 0 && <CopyButton text={text} label={t("Copy message")} onResult={copied} />}
-          {text.length > 0 && onRewindInTerminal !== null && (
-            <button type="button" className="icon-button chat-copy chat-rewind" aria-label={t("Rewind in terminal")} title={t("Rewind in terminal")} onClick={onRewindInTerminal}><Undo2 aria-hidden="true" /></button>
-          )}
-        </div>
+        <div className="chat-turn-meta">{time}{text.length > 0 && <CopyButton text={text} label={t("Copy message")} onResult={copied} />}</div>
       </div>
       {copyError}
       {outcome !== null && <OutcomeChip outcome={outcome} actions={outcomeActions} />}
@@ -950,15 +1104,42 @@ const Turn = memo(function Turn({ paneId, turn, rowKey, live, waiting, showThink
       <SkillActivityList parts={turn.parts} />
     </article>;
   }
-  const { work, answer } = splitTurn(turn.parts);
+  const { answer } = splitTurn(turn.parts);
   const answerText = answer.map((part) => part.text).join("\n\n");
   const goal = turnGoal(turn.parts);
+  // in the agent's own order, as the terminal shows it: words written before a tool stay above it
+  const segments = turnSegments(turn.parts);
+  const runs = segments.filter((segment): segment is WorkSegment => segment.kind === "work");
+  // the turn's head is its last run that draws a row: it reads Working… while the turn runs and
+  // carries the turn's duration once it settles, even below the answer when tools came after it.
+  // The runs before it have the agent's words after them: they are done, read Worked and fold.
+  const head = runs.filter((run) => visibleWorkParts(run.parts, showThinking).length > 0).at(-1) ?? runs.at(-1);
+  const work = turnWork(turn.parts, rowKey);
+  // a run keeps its block and fold while its parts change (runNames); the stand-in is named by the
+  // part that will start the turn's first run, and is drawn only while the turn has none
+  const drawn = (run: WorkSegment): boolean => visibleWorkParts(run.parts, showThinking).length > 0;
+  const names = runNames(runs, work.at, memory?.runs ?? new Map(), drawn, memory?.dormant ?? new Map());
+  // a run of hidden reasoning alone leaves its name apart: it has no fold, and a drawn block's name
+  // comes first once the two merge (#2111)
+  const partNames = (shown: boolean) => new Map(runs.flatMap((run, index) => drawn(run) === shown ? run.parts.map((part) => [work.at.get(part)!, names[index]!] as const) : []));
+  named.current = { runs: partNames(true), dormant: partNames(false) };
+  // `null`: the head standing in while the running turn has no work yet
+  const block = (run: WorkSegment | null) => {
+    const isHead = run === null || run === head;
+    const key = run === null ? `work:${turn.parts.length}` : names[runs.indexOf(run)]!;
+    return <WorkBlockView key={key} paneId={paneId} parts={run?.parts ?? []} work={work} memoryKey={key}
+      duration={isHead ? formatWorkDuration(turn.ts, turn.end_ts ?? null) : null} live={live && isHead} waiting={waiting && isHead}
+      // a settled turn folds its work, unless words the agent said last are in its final run
+      defaultOpen={workBlockStartsOpen({ live: live && isHead, waiting: waiting && isHead, last: run !== null && run === segments.at(-1) }, turn.parts, foldWork)}
+      showThinking={showThinking} expandThinking={expandThinking} pendingHead={isHead && answer.length === 0} />;
+  };
   return <article className="chat-turn chat-turn-agent">
     <SkillActivityList parts={turn.parts} />
     {goal !== null && <GoalActivity goal={goal} />}
     {/* the pending head stands only above no answer: one above words would leave a gap when the turn ends */}
-    {(work.length > 0 || (live && answer.length === 0)) && <WorkBlockView paneId={paneId} parts={work} turnParts={turn.parts} rowKey={rowKey} duration={formatWorkDuration(turn.ts, turn.end_ts ?? null)} live={live} waiting={waiting} defaultOpen={workStartsOpen(live, turn.parts)} showThinking={showThinking} pendingHead={answer.length === 0} />}
-    {answer.map((part, index) => <Markdown key={index} skills={skills}>{part.text}</Markdown>)}
+    {head === undefined && live && answer.length === 0 && block(null)}
+    {segments.map((segment) => segment.kind === "work" ? block(segment)
+      : segment.parts.map((part) => <Markdown key={`answer:${work.at.get(part)}`} skills={skills}>{part.text}</Markdown>))}
     {answerText.length > 0 && <div className="chat-turn-meta chat-agent-meta">
       {/* a mouse reads one copy glyph and the words "Plain text"; touch reads the two formats */}
       <CopyButton className="chat-meta-btn" text={answerText} label={t("Copy as markdown")} onResult={copied}><span className="chat-meta-fmt">MD</span></CopyButton>
@@ -1029,13 +1210,24 @@ function TerminalFallback({ paneId, visible }: { paneId: string; visible: boolea
 }
 
 // the app re-renders on every pane-status and poll; an unchanged transcript sits those out
-export const ChatView = memo(function ChatView({ paneId, presentationKey, finishEpoch, finishId, active = true, visible: paneVisible = true, pageScroll, refreshKey, invalidationKey = 0, onConversationWatch, conversationPushes = false, onTerminalOutput, sentKey = 0, localSend, navigation, connected, ended, agent, agentStatus, onMetadata, onRead, greeted = false, onPrompt, onSuggestion, onRestored, promptRefreshKey = 0, pendingAnswer = null, onPendingAnswerDone, promptDock = null, onPromptAnswered, title = null, onOpenTerminal, covered = false, peek = null, onCommandScreenClosed, onOutcomes, interactive = false, onRewindInTerminal, cwd = null, draftable = false }: ChatViewProps) {
+export const ChatView = memo(function ChatView({ paneId, presentationKey, finishEpoch, finishId, active = true, visible: paneVisible = true, pageScroll, refreshKey, invalidationKey = 0, onConversationWatch, conversationPushes = false, onTerminalOutput, sentKey = 0, unsentKey = 0, pendingRows = NO_ROWS, localSend, navigation, connected, ended, agent, agentStatus, agentSession = null, onMetadata, onRead, greeted = false, onPrompt, onSuggestion, onRestored, promptRefreshKey = 0, pendingAnswer = null, onPendingAnswerDone, promptDock = null, onPromptAnswered, title = null, onOpenTerminal, covered = false, peek = null, onCommandScreenClosed, onOutcomes, interactive = false, quotable = false, draftable = false, cwd = null }: ChatViewProps) {
   const t = useT();
   const { fetchPaneConversation, peekPaneConversation, fetchPanePromptState, fetchPaneTranscript } = useMachineApi();
   const { settings } = useSettings();
+  // older turns load a page at a time; the setting decides how many prompts a page holds
+  const pagePrompts = settings.historyPrompts;
+  // read by the conversation reads as they answer: turning the setting on or off needs no new read
+  const autoTabNames = useRef(settings.autoTabNames);
+  autoTabNames.current = settings.autoTabNames;
   const machineId = useMachineId();
-  const skillMatcher = useSkillMatcher(paneId, agent);
+  // the pane the chat has open keeps its page: its answer is the last one evicted
+  useEffect(() => {
+    pinPaneConversation(paneId, machineId);
+    return () => unpinPaneConversation(paneId, machineId);
+  }, [paneId, machineId]);
   const commands = usePaneCommands(paneId, agent);
+  // the pane's skill names, from the same list: a chat opened again chips them in its first frame
+  const skillMatcher = useMemo(() => createSkillMatcher(commands, skillSyntax(agent)), [commands, agent]);
   // polls pause while the page or the pane is hidden and pick up at once when it is back
   const pageVisible = usePageVisible();
   const visible = paneVisible && pageVisible;
@@ -1050,8 +1242,6 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // Native Grok/Agy events can arrive while Herdr still reports ready/done. This is display
   // feedback only: sending, queuing and stopping retain the server's input authority.
   const activity = state.activity ?? (agentStatus === "working" ? "working" : "idle");
-  const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
-  const smoothFollow = followGlides({ working: activity !== "idle" && agentStatus !== "blocked", reducedMotion });
   const workStatus = state.activity !== undefined && agentStatus !== "blocked" ? activity === "idle" ? "idle" : "working" : agentStatus;
   const [error, setError] = useState<UserFailure | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
@@ -1063,6 +1253,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const [reviewImage, setReviewImage] = useState<GalleryImage | null>(null);
   const [viewer, setViewer] = useState<{ images: GalleryImage[]; index: number } | null>(null);
   const openViewer = useCallback((images: GalleryImage[], index: number) => setViewer({ images, index }), []);
+  const openMarkdownImage = useCallback((image: GalleryImage) => openViewer([image], 0), [openViewer]);
   const closeViewer = useCallback(() => setViewer(null), []);
   /** an answer for this pane arrived (or failed): until then, and while a replaced history is read again, an empty chat is only loading */
   const [loaded, setLoaded] = useState(false);
@@ -1076,11 +1267,14 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const [readPresentation, setReadPresentation] = useState<string>();
   const [endPresentation, setEndPresentation] = useState<{ state: ChatState; key: string | undefined } | null>(null);
   const [prompt, setPrompt] = useState<InteractivePrompt | null>(null);
+  // the prompt whose answer went out, by its id: its card waits for the next read of the screen
+  const [answeredPrompt, setAnsweredPrompt] = useState<string | null>(null);
   // Each prompt that appears is an occurrence of its own, and gets a card of its own. The prompt's
-  // id is a hash of what it says, so the same question asked twice shares it: the read below keeps
-  // one object while one prompt stays on screen, and that object is what tells them apart.
+  // id is a hash of what it says, so the same question asked twice shares it. Navigation metadata
+  // can change within an occurrence; only another id or a disappearance starts a new card.
   const promptOccurrence = useRef<{ of: InteractivePrompt | null; count: number }>({ of: null, count: 0 });
-  if (prompt !== null && promptOccurrence.current.of !== prompt) promptOccurrence.current = { of: prompt, count: promptOccurrence.current.count + 1 };
+  if (prompt === null) promptOccurrence.current.of = null;
+  else if (promptOccurrence.current.of?.id !== prompt.id) promptOccurrence.current = { of: prompt, count: promptOccurrence.current.count + 1 };
   // turns the transcript holds on a path /tree walked away from: no page can reach them, so the
   // only way to say they exist is to be told, and to say it where the reader would look for them
   const [abandoned, setAbandoned] = useState<{ count: number; branches: number; summary: string | null } | null>(null);
@@ -1095,6 +1289,11 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const [restored, setRestored] = useState<string | null>(null);
   // the pane's tracked command sends, read with the prompt (lib/outcomeChip.ts draws them)
   const [outcomes, setOutcomes] = useState<CommandOutcome[]>([]);
+  const outcomesNow = useRef(outcomes);
+  outcomesNow.current = outcomes;
+  /** a move to another history: the outcomes held when the chat saw it, and the first list after it (lib/outcomeChip.ts afterMove) */
+  const [historyMove, setHistoryMove] = useState<{ history: string | undefined; held: CommandOutcome[] } | null>(null);
+  const firstAfterMove = useRef<CommandOutcome[] | undefined>(undefined);
   const onOutcomesRef = useRef(onOutcomes);
   onOutcomesRef.current = onOutcomes;
   /** the outcomes whose catalog change this chat has already answered with a fresh command read */
@@ -1113,9 +1312,21 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const timeline = useRef<LegendListRef>(null);
   const ChatTimeline = useChatTimeline();
   const stickToBottom = useRef(true);
+  // the timeline's hold on a following reader's own click layout (ChatTimeline manualLayout)
+  const manualLayout = useRef(false);
+  // a selection in progress in the transcript (ChatTimeline selecting): nothing follows the end under it
+  const selecting = useRef(false);
   // Explicit paging stays away even inside the ordinary near-bottom tolerance.
   const pagingAway = useRef(false);
+  // The paging away is the reader opening something (readOpened): it holds in a chat still too short to scroll.
+  const openedAway = useRef(false);
   const lastScrollTop = useRef(0);
+  // where the chat itself last put the view (a follow, or the selection hold's correction)
+  const placedAt = useRef<number | null>(null);
+  // The last row and where it started in the transcript, and the transcript's height, at the
+  // previous scroll event (#2042).
+  const lastRowOffset = useRef<{ key: string; offset: number } | null>(null);
+  const lastScrollHeight = useRef(0);
   // When the reader last used upward scroll input.
   const scrollInputAt = useRef(-Infinity);
   const pointerDragAt = useRef(-Infinity);
@@ -1123,6 +1334,8 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // transcript moved up since. No pointermove comes while its thumb is dragged.
   const scrollbarPress = useRef<{ y: number; movedUp: boolean } | null>(null);
   const onScrollRef = useRef<() => void>(() => undefined);
+  // the timeline put the view at the end itself: a move from there is read from there
+  const followed = useCallback((top: number) => { lastScrollTop.current = top; placedAt.current = top; }, []);
   const signature = useRef("");
   // Older pages sit above the newest one. Once any shows, the newest page is
   // polled from its start at that moment, so the two always meet.
@@ -1130,6 +1343,8 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const olderCount = useRef(0);
   const incarnation = useRef(0);
   const slots = useRef(createChatRowSlots({ machineId, paneId, historyId: null, incarnation: 0 }, 0));
+  /** the history the row slots stand for: its own, or the one a rewrite continued (continuesHistory) */
+  const slotsHistory = useRef<string | null>(null);
   /** the page before everything shown; null at the conversation's beginning, undefined when unknown */
   const [olderCursor, setOlderCursor] = useState<string | null | undefined>(undefined);
   const [olderState, setOlderState] = useState<"idle" | "loading" | "failed">("idle");
@@ -1151,10 +1366,29 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
    * applies again (a slash command Claude logs as no user turn continues the very same turn).
    */
   const [sentOver, setSentOver] = useState<{ turn: ConversationTurn; page: ConversationTurn[] } | null>(null);
+  /**
+   * The cancelled send's turn, back in the agent's box when a message went out. That message empties
+   * the box, so a prompt read answers no restored copy before the transcript holds the new turn; the
+   * cancelled turn stays out while it is still the last turn (the next read drops it from the active
+   * chain). `lastStopped`: that turn as last read with its copy in the box, which is before the send
+   * started: a read between the send and its receipt (a queued send's, a row's removal) answers none.
+   */
+  const [cancelledAtSend, setCancelledAtSend] = useState<TurnIdentity | null>(null);
+  const lastStopped = useRef<TurnIdentity | null>(null);
+  /**
+   * The cancelled send's turn a pending row going out clears (Send now, the turn-end drain), with that
+   * row. The bridge empties the box as the row starts, long before its receipt bumps sentKey: from then
+   * the turn stays out while it is still the last turn. A row listed again but not going out (back in
+   * the queue, held) was not typed, and its record no longer applies.
+   */
+  const [goingCancel, setGoingCancel] = useState<{ id: string; turn: TurnIdentity } | null>(null);
+  const goingId = pendingRows.find((row) => row.state === "sending")?.id ?? null;
   /** the newest page as rendered: an earlier page loaded above it does not move the transcript */
   const heldPage = useRef<ConversationTurn[]>([]);
   const seenSent = useRef(sentKey);
+  const seenUnsent = useRef(unsentKey);
   const seenStatus = useRef<{ pane: string; status: AgentStatus | undefined }>({ pane: paneId, status: agentStatus });
+  const seenSession = useRef({ pane: paneId, session: agentSession });
   const seenConnected = useRef(connected);
   /** the socket has been connected since this pane showed: only then is a connected edge a reconnect */
   const wasConnected = useRef(connected);
@@ -1166,6 +1400,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     incarnation.current += 1;
     prependAnchor.current = null;
     slots.current = createChatRowSlots({ machineId, paneId, historyId: history.current ?? null, incarnation: incarnation.current }, 0);
+    slotsHistory.current = history.current ?? null;
   };
 
   /** What an answer says beside its turns: where older pages start, its metadata, abandoned turns. */
@@ -1178,13 +1413,17 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   };
 
   /** Lays out the state built from an answer and marks that answer as the one shown. */
-  const showAnswer = (conversation: ConversationResponse, next: ChatState): void => {
+  const showAnswer = (conversation: ConversationResponse, next: ChatState, moved: readonly ConversationTurn[] = []): void => {
     if (next.source === "conversation") {
       const count = olderCount.current + next.turns.length;
-      if (slots.current.scope.historyId !== (history.current ?? null) || lastAnswer.current?.source === "scrollback") {
+      if (slotsHistory.current !== (history.current ?? null) || lastAnswer.current?.source === "scrollback") {
         slots.current = createChatRowSlots({ machineId, paneId, historyId: history.current ?? null, incarnation: ++incarnation.current }, count);
+        slotsHistory.current = history.current ?? null;
       } else if (count > slots.current.rows.length) {
-        slots.current = appendChatRowSlots(slots.current, count - slots.current.rows.length);
+        // a turn written before the one at work takes a new row there: the turns after it keep theirs
+        const previous = lastAnswer.current;
+        const shown = previous !== null && previous.history_id === conversation.history_id ? previous.turns : [];
+        slots.current = growChatRowSlots(slots.current, olderCount.current - moved.length, shown, moved, next.turns);
       } else if (count < slots.current.rows.length) {
         slots.current = { ...slots.current, rows: slots.current.rows.slice(0, count) };
       }
@@ -1206,14 +1445,15 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     stopRestore.current?.();
     restoring.current = readChatPosition(paneStorageId(machineId, paneId)) ?? null;
     history.current = undefined; setHistoryId(undefined);
-    pagingAway.current = false; stickToBottom.current = true; signature.current = ""; setState(EMPTY_STATE); setNewMessages(false); setAway(false); setLoaded(false); setError(null); setErrorStatus(null); setFailures(0); setPrompt(null); setAbandoned(null); setRestored(null); setOutcomes([]); setScreenRead(false);
+    pagingAway.current = false; stickToBottom.current = true; lastRowOffset.current = null; lastScrollHeight.current = 0; signature.current = ""; setState(EMPTY_STATE); setNewMessages(false); setAway(false); setLoaded(false); setError(null); setErrorStatus(null); setFailures(0); setPrompt(agentStatus === "blocked" ? lastPrompts.get(paneStorageId(machineId, paneId)) ?? null : null); setAbandoned(null); setRestored(null); setOutcomes([]); setScreenRead(false);
     dropOlder();
     lastAnswer.current = null;
     setSentOver(null);
+    setCancelledAtSend(null); setGoingCancel(null); lastStopped.current = null;
     wasConnected.current = connected;
     // Stale while revalidating: the last answer read for this pane draws before paint, and the
     // mount read still asks the server; an unchanged answer (a 304) is this object and is skipped.
-    const cached = peekPaneConversation(paneId);
+    const cached = peekPaneConversation(paneId, pagePrompts);
     if (cached !== undefined && cached.source !== "scrollback" && loadedChatTimeline() !== null) {
       history.current = cached.history_id; setHistoryId(cached.history_id);
       showAnswerDetails(cached);
@@ -1229,7 +1469,22 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     const page = heldPage.current;
     const last = page[page.length - 1];
     setSentOver(last?.role === "assistant" && agentStatus !== "working" && agentStatus !== "blocked" ? { turn: last, page } : null);
+    setCancelledAtSend(lastStopped.current);
   }, [sentKey, agentStatus]);
+  // that send was refused before anything was typed: the copy stays the box's, so its record goes
+  useEffect(() => {
+    if (seenUnsent.current === unsentKey) return;
+    seenUnsent.current = unsentKey;
+    setCancelledAtSend(null);
+  }, [unsentKey]);
+
+  useEffect(() => {
+    if (goingId !== null && lastStopped.current !== null) setGoingCancel({ id: goingId, turn: lastStopped.current });
+  }, [goingId]);
+  // its row listed again, not going out, was not typed: the record goes (a later Discard is no send either)
+  useEffect(() => {
+    if (goingCancel !== null && pendingRows.some((row) => row.id === goingCancel.id && row.state !== "sending")) setGoingCancel(null);
+  }, [goingCancel, pendingRows]);
 
   // Status edges still read immediately, including on a bridge without conversation pushes.
   // They share the same serialized reader as pushes, sends and the periodic backstop.
@@ -1238,18 +1493,25 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     seenStatus.current = { pane: paneId, status: agentStatus };
     if (seen.pane === paneId && statusEdgeRead(seen.status, agentStatus)) setPollKey((key) => key + 1);
   }, [paneId, agentStatus]);
+  // herdr moved the pane to another session: what the chat shows (a press read taken while the roster
+  // still named the old one) is that session's, so the newest page is read now, not at the next push
+  useEffect(() => {
+    const seen = seenSession.current;
+    seenSession.current = { pane: paneId, session: agentSession };
+    if (seen.pane === paneId && seen.session !== agentSession) setPollKey((key) => key + 1);
+  }, [paneId, agentSession]);
 
   useEffect(() => {
     if (!visible) return;
     let cancelled = false;
     /** The turns between the held start and where the newest page now starts, a page at a time; null when they cannot be joined. */
-    const turnsBetween = async (held: string | null, start: string): Promise<ConversationTurn[] | null> => {
+    const turnsBetween = async (held: string | null, start: string, signal: AbortSignal): Promise<ConversationTurn[] | null> => {
       const pages: ConversationTurn[][] = [];
       let before = start;
       try {
         for (let step = 0; step < 32 && before !== held; step++) {
           if (cancelled) return null;
-          const page = await fetchPaneConversation(paneId, { before, ...(held === null ? {} : { since: held }) });
+          const page = await fetchPaneConversation(paneId, { before, ...(held === null ? {} : { since: held }), prompts: pagePrompts, signal });
           if (page.cursor === held) {
             pages.unshift(page.turns);
             return pages.flat();
@@ -1258,31 +1520,44 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
           pages.unshift(page.turns);
           before = page.cursor;
         }
-      } catch {
+      } catch (cause) {
+        // Failed gap reads keep the same timeline, just as a failed newest-page
+        // read does. Only a rejected cursor means these pages cannot be joined.
+        if (!(cause instanceof ApiError) || cause.status !== 409) throw cause;
         return null;
       }
       return before === held ? pages.flat() : null;
     };
-    const read = async (): Promise<void> => {
+    const read = async (signal: AbortSignal): Promise<void> => {
       const readKey = presentationRef.current;
       const finish = finishRef.current;
       const previousAnswer = lastAnswer.current ?? undefined;
-      const page = { ...(heldFrom.current === null ? {} : { from: heldFrom.current }), fresh: readKey !== validatedPresentation.current };
-      let generation = olderGeneration.current;
+      const page = { ...(heldFrom.current === null ? {} : { from: heldFrom.current }), history_id: previousAnswer?.history_id, prompts: pagePrompts, fresh: readKey !== validatedPresentation.current, signal };
+       let generation = olderGeneration.current;
       try {
         let conversation;
         try {
           conversation = await fetchPaneConversation(paneId, page);
         } catch (cause) {
           // a new session or a Codex backtrack replaced the transcript the older pages came from
-          if (heldFrom.current === null || !(cause instanceof ApiError) || cause.status !== 409) throw cause;
+          if (!(cause instanceof ApiError) || cause.status !== 409) throw cause;
           if (cancelled || generation !== olderGeneration.current) return;
-          dropOlder(); setState(EMPTY_STATE); setLoaded(false); signature.current = ""; lastAnswer.current = null;
-          generation = olderGeneration.current;
-          conversation = await fetchPaneConversation(paneId);
+          // the turns shown stay until the newest page answers: a /clear goes from them straight to
+          // the new conversation, with no loading state between. A failed read takes them away too.
+          try {
+            conversation = await fetchPaneConversation(paneId, { prompts: pagePrompts, signal });
+          } finally {
+            if (!cancelled && generation === olderGeneration.current) {
+              dropOlder(); signature.current = ""; lastAnswer.current = null;
+              if (conversation === undefined) setState(EMPTY_STATE);
+              generation = olderGeneration.current;
+            }
+          }
         }
         if (cancelled || generation !== olderGeneration.current) return;
         if (conversation !== previousAnswer) validatedPresentation.current = readKey;
+        // a tab herdr still names by its number takes its label from the first message (#2019)
+        if (autoTabNames.current) learnFromConversation(machineId, paneId, conversation);
         const proved = finish.status !== "done" || (readKey === presentationRef.current && finishRef.current.status === "done"
           && finish.epoch !== undefined && finish.id !== undefined
           && conversationFinishEvidence.accept(seenKey(machineId, finish.epoch, paneId), finish.id, conversation, previousAnswer));
@@ -1292,10 +1567,33 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
           if (cancelled || generation !== olderGeneration.current) return;
         }
         if (history.current !== conversation.history_id) {
-          if (history.current !== undefined) navigated();
-          dropOlder(); generation = olderGeneration.current;
+          // the same turns under a new ID (gjc rewrote its file): the rows, what the reader opened and
+          // where they read stay, so it is no navigation. Older pages were read from the old file: with
+          // any held, it starts over, and a replaced history is navigation.
+          const continued = olderCount.current === 0 && history.current !== undefined && conversation.history_id !== undefined
+            && continuesHistory(lastAnswer.current, conversation);
+          if (continued) {
+            slotsHistory.current = conversation.history_id ?? null;
+            // an older page still being read names the old file: it is dropped, not taken for a replacement
+            olderGeneration.current += 1; loadingOlder.current = false; setOlderState("idle");
+            // the place kept for this pane is in the new history too
+            const storageId = paneStorageId(machineId, paneId);
+            const kept = readChatPosition(storageId);
+            if (kept !== undefined && kept.historyId === (history.current ?? null)) rememberChatPosition(storageId, { ...kept, historyId: conversation.history_id ?? null });
+          }
+          else {
+            if (history.current !== undefined) {
+              navigated();
+              // the sends to the history left behind are no receipts of this one: the last prompt poll holds them,
+              // and the server lists them until herdr names the new session, which can be a poll after this read
+              firstAfterMove.current = undefined;
+              setHistoryMove({ history: conversation.history_id, held: outcomesNow.current });
+            }
+            dropOlder();
+          }
+          generation = olderGeneration.current;
           history.current = conversation.history_id; setHistoryId(conversation.history_id);
-          pagingAway.current = false; stickToBottom.current = true; setNewMessages(false); setAway(false);
+          if (!continued) { pagingAway.current = false; stickToBottom.current = true; lastRowOffset.current = null; lastScrollHeight.current = 0; setNewMessages(false); setAway(false); }
         }
         // a 304 hands back the answer already shown: nothing to compare or lay out again
         if (conversation === lastAnswer.current) { setError(null); setErrorStatus(null); setFailures(0); setReadPresentation(proved ? readKey : undefined); return; }
@@ -1305,7 +1603,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
         const held = heldFrom.current ?? (previous?.source !== "scrollback" && previous?.history_id === conversation.history_id ? previous?.cursor : undefined);
         let moved: ConversationTurn[] = [];
         if (held !== undefined && conversation.source !== "scrollback" && typeof conversation.cursor === "string" && conversation.cursor !== held) {
-          const between = await turnsBetween(held, conversation.cursor);
+          const between = await turnsBetween(held, conversation.cursor, signal);
           if (cancelled || generation !== olderGeneration.current) return;
           if (between === null) {
             dropOlder(); setState(EMPTY_STATE); setLoaded(false); signature.current = ""; lastAnswer.current = null;
@@ -1329,11 +1627,11 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
               ? { source: "scrollback", turns: [], messages: [], truncated: false } : previous);
             signature.current = ""; lastAnswer.current = null;
           }
-          const result = await fetchPaneTranscript(paneId, TRANSCRIPT_LINES);
+          const result = await fetchPaneTranscript(paneId, TRANSCRIPT_LINES, signal);
           if (cancelled || generation !== olderGeneration.current) return;
           next = { source: "scrollback", turns: [], messages: toTranscriptMessages(result.text).filter((message) => message.role !== "status"), truncated: result.truncated === true };
         }
-        showAnswer(conversation, next);
+        showAnswer(conversation, next, moved);
         setReadPresentation(proved ? readKey : undefined);
       } catch (cause) {
         if (cancelled || generation !== olderGeneration.current) return;
@@ -1353,13 +1651,13 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       onConversationWatch?.(paneId, false);
       conversationRefresh.stop();
     };
-  }, [paneId, fetchPaneConversation, fetchPaneTranscript, conversationRefresh, visible, onConversationWatch, agent]);
+  }, [paneId, pagePrompts, fetchPaneConversation, fetchPaneTranscript, conversationRefresh, visible, onConversationWatch, agent]);
 
   // Sends, status/history repairs and visibility return read immediately without cancelling
   // the answer in flight. The reader is installed before this effect requests its first read.
   useEffect(() => {
     if (visible) conversationRefresh.refresh();
-  }, [paneId, presentationKey, refreshKey, pollKey, visible, fetchPaneConversation, fetchPaneTranscript, conversationRefresh, onConversationWatch, agent]);
+  }, [paneId, pagePrompts, presentationKey, refreshKey, pollKey, visible, fetchPaneConversation, fetchPaneTranscript, conversationRefresh, onConversationWatch, agent]);
 
   // Mount/visibility return already read immediately; only a changed push key invalidates.
   useEffect(() => {
@@ -1368,7 +1666,9 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     if (seen.pane === paneId && seen.key !== invalidationKey && visible) conversationRefresh.invalidate();
   }, [paneId, invalidationKey, visible, conversationRefresh]);
 
-  useEffect(() => { conversationRefresh.setPushes(conversationPushes); }, [conversationPushes, conversationRefresh]);
+  useEffect(() => {
+    conversationRefresh.setPushes(conversationPushes && (agent !== "copilot" || state.source !== "scrollback"));
+  }, [conversationPushes, state.source, conversationRefresh, agent]);
 
   // A scrollback stand-in has no native file for the server to watch, and neither have settings
   // read off the agent's screen (a conversation not begun). Their source is the pane's own
@@ -1400,11 +1700,12 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     const generation = olderGeneration.current;
     loadingOlder.current = true;
     setOlderState("loading");
-    await conversationRefresh.page(async () => {
+    await conversationRefresh.page(async (signal) => {
       try {
         if (shownPane.current !== paneId || olderGeneration.current !== generation) return;
-        const page = await fetchPaneConversation(paneId, { before });
+        const page = await fetchPaneConversation(paneId, { before, prompts: pagePrompts, signal });
         if (shownPane.current !== paneId || olderGeneration.current !== generation) return;
+        if (autoTabNames.current) learnFromConversation(machineId, paneId, page);
         if (page.history_id !== history.current) {
           dropOlder(); setState(EMPTY_STATE); setLoaded(false); signature.current = ""; lastAnswer.current = null;
           setPollKey((key) => key + 1); return;
@@ -1435,8 +1736,13 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       } finally {
         if (olderGeneration.current === generation) loadingOlder.current = false;
       }
+    }).catch((cause: unknown) => {
+      // A page still queued when its screen closes is cancelled before its callback runs, so its
+      // finally never clears the loading flags: clear them here, or Load older stays disabled
+      if (!(cause instanceof DOMException && cause.name === "AbortError")) throw cause;
+      if (olderGeneration.current === generation) { loadingOlder.current = false; setOlderState("idle"); }
     });
-  }, [fetchPaneConversation, olderCursor, paneId, conversationRefresh]);
+  }, [fetchPaneConversation, olderCursor, paneId, pagePrompts, conversationRefresh]);
 
   // Reconcile the estimated prepend with the actual reader row, through the list's
   // own scroll command. No scrollHeight delta or second virtualizer owns the position.
@@ -1452,22 +1758,31 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // menu can appear while idle without any file mutation. Keep their independent 2s poll.
   const [promptStale, setPromptStale] = useState(false);
   const failedPromptReads = useRef(0);
-  const pollPrompt = connected && !ended && agent !== null;
+  const promptGone = ended || agent === null;
+  const pollPrompt = connected && !promptGone;
+  // herdr says the agent now waits on the user, or no longer does: the card is read at once, not at
+  // the next poll up to 2 s later, while the turn already says "Needs you"
+  const blocked = agentStatus === "blocked";
   useEffect(() => {
-    if (!pollPrompt) { setPrompt(null); setPromptStale(false); failedPromptReads.current = 0; setRestored(null); onSuggestionRef.current?.(paneId, null); onRestoredRef.current?.(paneId, null); return; }
+    const promptKey = paneStorageId(machineId, paneId);
+    // a dropped connection says nothing about the screen either: the card stays until a read answers
+    if (promptGone) { lastPrompts.delete(promptKey); setPrompt(null); }
+    if (!pollPrompt) { setPromptStale(false); failedPromptReads.current = 0; setRestored(null); onSuggestionRef.current?.(paneId, null); onRestoredRef.current?.(paneId, null); return; }
     if (!visible) return;
     let cancelled = false;
     let timer = 0;
     // a restart (the page shown again, a refused answer) keeps the notice and the count of failed reads: only a read that answers clears them
     const readPrompt = async (): Promise<void> => {
-      // the same prompt keeps its object: the composer and the card only change with it
+      // Keep unchanged prompts stable, but refresh navigation without replacing the card's edits.
       const sent = sentKeyRef.current;
       try {
         const next = await fetchPanePromptState(paneId);
         if (!cancelled) {
           failedPromptReads.current = 0;
           setPromptStale(false);
-          setPrompt((current) => current?.id === next.prompt?.id ? current : next.prompt);
+          setPrompt((current) => polledPrompt(current, next.prompt));
+          if (next.prompt === null) lastPrompts.delete(promptKey); else lastPrompts.set(promptKey, next.prompt);
+          setAnsweredPrompt(null);
           // unchanged outcomes keep their objects: the turns carrying them are not re-rendered
           setOutcomes((current) => JSON.stringify(current) === JSON.stringify(next.outcomes) ? current : next.outcomes);
           onOutcomesRef.current?.(paneId, next.outcomes.map((outcome) => outcome.id));
@@ -1488,12 +1803,12 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     };
     void readPrompt();
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [pollPrompt, paneId, machineId, promptPollKey, promptRefreshKey, fetchPanePromptState, visible]);
+  }, [pollPrompt, promptGone, paneId, machineId, promptPollKey, promptRefreshKey, fetchPanePromptState, visible, blocked]);
 
   useEffect(() => {
-    onPrompt?.(paneId, prompt);
+    onPrompt?.(paneId, prompt, prompt !== null && answeredPrompt === prompt.id);
     return () => onPrompt?.(paneId, null);
-  }, [onPrompt, paneId, prompt]);
+  }, [onPrompt, paneId, prompt, answeredPrompt]);
 
   // a pane left behind keeps no suggestion and no restored send
   useEffect(() => () => { onSuggestionRef.current?.(paneId, null); onRestoredRef.current?.(paneId, null); }, [paneId]);
@@ -1510,8 +1825,10 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     const node = scroller.current;
     if (!node) return;
     // Every measurement path must respect a pending restore/minimap/page navigation.
-    // Only genuinely short content cannot be moved away from its end.
-    if (pagingAway.current && node.scrollHeight > node.clientHeight) {
+    // Only genuinely short content cannot be moved away from its end, unless the reader opened
+    // something in it: the records that make it longer must not pull that away (readOpened).
+    if (!pagingAway.current) openedAway.current = false;
+    if (pagingAway.current && (node.scrollHeight > node.clientHeight || openedAway.current)) {
       setEndPresentation(null);
       return;
     }
@@ -1525,6 +1842,8 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       ? before?.state === state && before.key === presentationKey ? before : { state, key: presentationKey }
       : null);
     if (atEnd) {
+      // back at the end, by hand as by Jump: what grows next is followed, no earlier hold kept
+      if (!stickToBottom.current) manualLayout.current = false;
       pagingAway.current = false; stickToBottom.current = true;
       scrollInputAt.current = -Infinity; pointerDragAt.current = -Infinity;
       setAway(false); setNewMessages(false);
@@ -1537,7 +1856,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // instead of scrolling there from the top.
   useLayoutEffect(() => {
     const node = scroller.current;
-    if (node !== null && stickToBottom.current) {
+    if (node !== null && stickToBottom.current && !selecting.current) {
       if (state.source === "conversation") timeline.current?.scrollToEnd({ animated: false });
       else node.scrollTop = node.scrollHeight;
     }
@@ -1548,7 +1867,8 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // conversation that rewraps inside an unchanged view: its width or its type changed
   // (Settings → Chat width, Chat font size, Chat font). One that only grew taller did so under
   // the reader's hand (a folded block opened, a whole output asked for): following the end there
-  // would jump past what was just opened. New messages follow in the layout effect above.
+  // would jump past what was just opened. New messages follow in the layout effect above, and a
+  // footer that grew (a sent message's bubble) in ChatTimeline.
   useEffect(() => {
     const node = scroller.current;
     if (node === null) return;
@@ -1561,7 +1881,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
         const next = `${entry.contentRect.width}|${style.fontSize}|${style.fontFamily}`;
         if (next !== lane) { lane = next; follow = true; }
       }
-      if (follow && stickToBottom.current) {
+      if (follow && stickToBottom.current && !selecting.current) {
         // The list's scrollToEnd lands a frame later (see dropPendingListScroll), so the frame
         // painted now would show the conversation's last lines under a composer that grew a line.
         // This callback runs before that paint: put the view at the end here, then let the list
@@ -1585,7 +1905,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const faces = useFacesArrived();
   useLayoutEffect(() => {
     const node = scroller.current;
-    if (node !== null && stickToBottom.current) {
+    if (node !== null && stickToBottom.current && !selecting.current) {
       if (timeline.current) timeline.current.scrollToEnd({ animated: false });
       else node.scrollTo({ top: node.scrollHeight, behavior: "instant" });
     }
@@ -1674,6 +1994,7 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     const distanceFromBottom = node.scrollHeight - node.clientHeight - node.scrollTop;
     const scrollingDown = node.scrollTop > lastScrollTop.current;
     const scrollingUp = node.scrollTop < lastScrollTop.current;
+    const up = lastScrollTop.current - node.scrollTop;
     lastScrollTop.current = node.scrollTop;
     // A pointer press alone is not intent: a drag must also move the transcript up. A held scrollbar
     // thumb's move is decided when it is let go (the pointerup above): while it rests, the layout
@@ -1688,16 +2009,62 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     const byReader = performance.now() - scrollInputAt.current < SCROLL_INPUT_MS;
     const allowance = byReader ? READER_ALLOWANCE_PX : LAYOUT_ALLOWANCE_PX;
     if (scrollingUp && byReader) navigated();
+    // A row above the view shrank and the list held the rows on screen where they were
+    // (maintainVisibleContentPosition), or the transcript's end shrank under a view at it: the move
+    // up is the layout's, however far it lands from the end it was following to (#2042).
+    // A move up the reader made, even one that sends no input this page sees, moves the view up a
+    // transcript that did not shrink.
+    const lastKey = timelineRows.at(-1)?.key;
+    const lastRow = lastKey === undefined ? null : node.querySelector<HTMLElement>(`[data-chat-row="${CSS.escape(lastKey)}"]`);
+    // where the last row starts in the transcript: it moves up as rows above it shrink
+    const row = lastKey === undefined || lastRow === null ? null
+      : { key: lastKey, offset: lastRow.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop };
+    const rowBefore = lastRowOffset.current;
+    lastRowOffset.current = row;
+    const shrunkAbove = row !== null && rowBefore?.key === row.key ? Math.max(0, rowBefore.offset - row.offset) : 0;
+    // the transcript got shorter: at its end the browser moves the view up with it
+    const shrunk = Math.max(0, lastScrollHeight.current - node.scrollHeight);
+    lastScrollHeight.current = node.scrollHeight;
+    // Without input, a move up while the transcript got shorter is the layout's, however far: the
+    // list holding the rows and the browser keeping the view inside the transcript can both move it
+    // for one shrink. Over a transcript that did not shrink it is the reader's once the view is past
+    // the layout allowance from the end, however many small moves took it there. Growth never
+    // excuses a move up.
+    const shrankUnderView = shrunkAbove > READER_ALLOWANCE_PX || shrunk > READER_ALLOWANCE_PX;
+    // Under a selection in progress the hold keeps the view where it puts it (ChatTimeline), and the
+    // browser can trim it a pixel from there as the transcript shrinks under it: without the
+    // reader's input, landing a pixel above where the chat put it is the layout's. Anywhere else (further
+    // up, or anywhere below it, where only the reader takes the view) the move is the reader's, as
+    // without a selection.
+    const below = placedAt.current === null ? null : placedAt.current - node.scrollTop;
+    const trimmed = selecting.current && below !== null && below > 0 && below <= READER_ALLOWANCE_PX && up <= READER_ALLOWANCE_PX;
+    const heldInPlace = scrollingUp && !byReader && (shrankUnderView || distanceFromBottom <= LAYOUT_ALLOWANCE_PX || trimmed);
+    const leftEnd = scrollingUp && !heldInPlace;
     // Reaching the rounded endpoint clears reading intent unless still paging upward.
     if ((!pagingAway.current || scrollingDown) && distanceFromBottom <= 1) pagingAway.current = false;
-    if (scrollingUp && distanceFromBottom > allowance && stickToBottom.current) {
+    if (leftEnd && distanceFromBottom > allowance && stickToBottom.current) {
       pagingAway.current = true;
       dropPendingListScroll(timeline.current);
     }
+    // The list's own move down can stop short too: the browser holds it at the transcript's height
+    // before the list has grown it, and once grown no row changes to follow (a long chat's first
+    // open). Not while the list holds rows in place over room it adds for a frame: the scroller's end
+    // lies past the real one there (listEndPadded).
+    const stoppedShort = scrollingDown && !byReader && timeline.current !== null && !listEndPadded(node);
+    // the layout's move left a reader still following short of the end: they go on there, unless
+    // what they just clicked is laid out where they are (ChatTimeline manualLayout)
+    if ((heldInPlace || stoppedShort) && stickToBottom.current && !pagingAway.current && !manualLayout.current && !selecting.current && distanceFromBottom > LAYOUT_ALLOWANCE_PX) {
+      // the list's scroll lands a frame later: the frame painted next is at the end already
+      if (stoppedShort) node.scrollTop = node.scrollHeight;
+      if (timeline.current) timeline.current.scrollToEnd({ animated: false });
+      else node.scrollTo({ top: node.scrollHeight, behavior: "instant" });
+    }
     // A downward automatic scroll may arrive before the next measured layout.
     // Only upward movement can turn an existing follow intent into reading intent.
-    if (!stickToBottom.current || scrollingUp || pagingAway.current) {
-      stickToBottom.current = !pagingAway.current && distanceFromBottom <= allowance;
+    if (!stickToBottom.current || leftEnd || pagingAway.current) {
+      const following = !pagingAway.current && distanceFromBottom <= allowance;
+      if (following && !stickToBottom.current) manualLayout.current = false;
+      stickToBottom.current = following;
     }
     setAway(!stickToBottom.current);
     measureEnd();
@@ -1728,11 +2095,25 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       atEnd: row === undefined,
     });
   };
+  // Opening a tool, a folded block or a whole output is reading there, as scrolling up is: the end
+  // moves on without the reader until they go back to it (#1388), and a local send already on its way
+  // no longer takes them to the end.
+  const readOpened = useCallback((): void => {
+    navigationRef.current += 1;
+    if (!stickToBottom.current) return;
+    pagingAway.current = true; stickToBottom.current = false; openedAway.current = true;
+    dropPendingListScroll(timeline.current);
+    const node = scroller.current;
+    if (node !== null) node.scrollTo({ top: node.scrollTop, behavior: "instant" });
+    setAway(true);
+  }, [navigationRef]);
   const scrollToBottom = (): void => {
     const node = scroller.current;
     if (node === null) return;
     // Away/new-message state clears in measureEnd once the end is really on screen (#1342).
     pagingAway.current = false; stickToBottom.current = true;
+    // back at the end, what grows next is followed: no hold an earlier click set is kept (#1388)
+    manualLayout.current = false;
     // A lens change can unmount us before the deferred list scroll emits its first event.
     rememberPlace(node);
     if (timeline.current) timeline.current.scrollToEnd({ animated: false });
@@ -1791,12 +2172,15 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // A cancelled send back in the agent's input box is no sent turn: the transcript still holds it
   // (empty, blank, held and onRead keep the turns as read), but the rendered list drops it while
   // the last turn is that very send — matching the terminal, which shows it only as typed text.
-  const shownTurns = useMemo(() => {
-    const last = turns[turns.length - 1];
-    if (restored === null || last?.role !== "user") return turns;
-    const sent = last.parts.filter((part): part is Extract<ConversationPart, { kind: "text" }> => part.kind === "text").map((part) => part.text).join("\n");
-    return sameMessage(sent, restored) ? turns.slice(0, -1) : turns;
-  }, [turns, restored]);
+  const stopped = useMemo(() => stoppedTurn(turns, restored), [turns, restored]);
+  if (stopped !== null) lastStopped.current = stopped;
+  // A send that emptied the box keeps it out while it is still the last turn (cancelledAtSend, and
+  // goingCancel from a pending row's start). Its outcome gets no sent row either (outcomeRows).
+  const goneOut = goingCancel !== null && !pendingRows.some((row) => row.id === goingCancel.id && row.state !== "sending");
+  const hiddenTurn = stopped ?? (endsWithTurn(turns, cancelledAtSend) ? cancelledAtSend : null)
+    ?? (goneOut && endsWithTurn(turns, goingCancel.turn) ? goingCancel.turn : null);
+  const hiddenSend = restored ?? hiddenTurn?.text ?? null;
+  const shownTurns = useMemo(() => hiddenTurn !== null ? turns.slice(0, -1) : turns, [turns, hiddenTurn]);
   heldPage.current = state.turns;
   const finishedBeforeSend = sentOver !== null && sentOver.page === state.turns ? sentOver.turn : null;
   const lastShownTurn = state.source === "conversation" ? shownTurns.at(-1) : undefined;
@@ -1806,6 +2190,24 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const workBlockLive = lastSplit !== null && (visibleWorkParts(lastSplit.work, settings.showThinking).length > 0 || lastSplit.answer.length === 0);
   // a running turn with words and no work rows: the activity is a line under its words, as before
   const answerOnlyLive = lastSplit !== null && !workBlockLive;
+  // working over a turn that ended on its answer: the status trailing that answer, or a turn the agent
+  // began by itself with no row yet. The next turn's head waits out the lag, so none flashes under
+  // each answer. A send from here has its turn on the way, and its head shows at once.
+  const afterAnswer = workStatus === "working" && lastShownTurn?.role === "assistant" && lastShownTurn !== finishedBeforeSend && endedOnAnswer(lastShownTurn);
+  // the wait runs for that finished turn, named by its start (no later read of it changes that): a new
+  // turn read in already finished waits its own, and the frame it first shows in draws no head
+  const answerTurn = afterAnswer && lastShownTurn !== undefined ? lastShownTurn.ts ?? chatTurnAnchor(lastShownTurn) : null;
+  const [lagOutFor, setLagOutFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (answerTurn === null) { setLagOutFor(null); return; }
+    const timer = window.setTimeout(() => setLagOutFor(answerTurn), ANSWER_STATUS_LAG_MS);
+    return () => window.clearTimeout(timer);
+  }, [answerTurn, paneId]);
+  const answerLagOut = answerTurn !== null && lagOutFor === answerTurn;
+  // while it waits the head keeps its place, unseen: showing it later moves nothing a reader is
+  // selecting or reading, as the chat is laid out the same from the answer's first frame
+  const activityReserved = afterAnswer && !answerLagOut;
+  const activityClass = activityReserved ? "chat-activity-reserved" : "chat-activity";
   const empty = state.source === "conversation" ? turns.length === 0 : agent === null && state.messages.length === 0;
   const blank = !ended && chatIsBlank({ loaded, failed: error !== null, transcript: state.source === "conversation", turns: turns.length, older: typeof olderCursor === "string", abandoned: abandoned?.count ?? 0, prompt: prompt !== null, agent });
   // the scrollback standing in says nothing of the conversation: it has no history to compare
@@ -1825,7 +2227,12 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   const rowMemories = useMemo(() => new Map<string, ChatRowMemory>(), [timelineScope]);
   // the turns with the commands sent from here: a chip on the turn that records one, a provisional
   // sent row for one no turn records (yet), placed by send time (lib/outcomeChip.ts)
-  const withOutcomes = useMemo(() => outcomeRows(shownTurns, outcomes, { restored, beginningLoaded: olderCursor === null }), [shownTurns, outcomes, restored, olderCursor]);
+  const shownOutcomes = useMemo(() => {
+    if (historyMove === null || historyMove.history !== historyId) return outcomes;
+    if (outcomes !== historyMove.held) firstAfterMove.current ??= outcomes;
+    return afterMove(outcomes, historyMove.held, firstAfterMove.current);
+  }, [outcomes, historyMove, historyId]);
+  const withOutcomes = useMemo(() => outcomeRows(shownTurns, shownOutcomes, { restored: hiddenSend, beginningLoaded: olderCursor === null }), [shownTurns, shownOutcomes, hiddenSend, olderCursor]);
   const timelineRows = useMemo((): ChatRow[] => {
     const rows = withOutcomes.map((row): ChatRow => {
       if (row.kind === "sent") return { key: `outcome:${row.outcome.id}`, turn: null, outcome: row.outcome, beforeUser: false };
@@ -1919,18 +2326,15 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     if (commandScreenClosed(peek, agent, at, turns)) onCommandScreenClosed(peek);
   }, [peek, outcomes, turns, agent, onCommandScreenClosed]);
   const outcomeActions = useMemo((): OutcomeActions => ({ answer: promptUp ? focusPrompt : null, terminal: onOpenTerminal ?? null, commands }), [promptUp, focusPrompt, onOpenTerminal, commands]);
-  // Nothing is typed: drafts and the agent's own rewind remain in the terminal.
-  const offered = rewindOffer({ agent, interactive, connected, ended, conversation: state.source === "conversation" });
-  const rewindInTerminal = offered === "terminal" ? onRewindInTerminal ?? null : null;
   const renderTurn = useCallback((row: ChatRow) => {
     if (row.turn === null) return <OutcomeRow outcome={row.outcome} actions={outcomeActions} skills={skillMatcher} />;
     const { turn } = row;
     const live = isLiveWorkTurn(turn, row.index === shownTurns.length - 1, workStatus, finishedBeforeSend);
     return <RenderBoundary resetKey={turnRevision(turn, true)} fallback={() => <p className="chat-inline-state chat-inline-error" data-pane-content-error>{t("This message can't be shown here. The terminal has it.")}</p>}>
-      <Turn paneId={paneId} turn={turn} rowKey={row.key} live={live} waiting={isWaitingWorkTurn(live, agentStatus)} showThinking={settings.showThinking} skills={skillMatcher} userSkills={skillMatcher} outcome={row.outcome} outcomeActions={outcomeActions}
-        onRewindInTerminal={turn.role === "user" ? rewindInTerminal : null} />
+      <Turn paneId={paneId} turn={turn} rowKey={row.key} live={live} waiting={isWaitingWorkTurn(live, agentStatus)} showThinking={settings.showThinking}
+        expandThinking={settings.expandThinking} foldWork={settings.foldWork} skills={skillMatcher} userSkills={skillMatcher} outcome={row.outcome} outcomeActions={outcomeActions} />
     </RenderBoundary>;
-  }, [shownTurns.length, workStatus, finishedBeforeSend, t, paneId, agentStatus, settings.showThinking, skillMatcher, outcomeActions, rewindInTerminal]);
+  }, [shownTurns.length, workStatus, finishedBeforeSend, t, paneId, agentStatus, settings.showThinking, settings.expandThinking, settings.foldWork, skillMatcher, outcomeActions]);
   // displayPaneTitle falls back to the pane id for a pane with nothing else to call it
   const shownTitle = title?.trim() ?? "";
   const logLabel = shownTitle !== "" && shownTitle !== paneId ? t("conversation of {pane}", { pane: shownTitle }) : t("Conversation");
@@ -1961,10 +2365,22 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
   // empty (never display: none); its words land a frame after it (lib/useAnnouncedText.ts). The
   // connection's word is the header chip's alone; a slow PC is waited for quietly before it alarms
   const waiting = error !== null && error.kind === "slow" && failures < SLOW_READS_BEFORE_ALARM;
+  // A message this browser sent that the pane has not written as a turn yet: Claude records the user
+  // turn only when its next turn starts, so without this the chat would show nothing at all. The
+  // queue lives in the store, so a reader who goes to another tab and comes back still sees it.
+  const waitKey = waitingKey(machineId, paneId);
+  const sentWaiting = useWaitingSends(machineId, paneId, connected);
+  // before paint: a frame never shows a send's turn and its waiting bubble together. Only a
+  // conversation read that answered says what the chat holds: a failed read leaves it unknown
+  const turnsRead = loaded && error === null && state.source === "conversation";
+  useLayoutEffect(() => {
+    settleWaitingSends(waitKey, state.turns, Date.now(), turnsRead);
+  }, [sentWaiting, state.turns, turnsRead, waitKey]);
   const waitWords = useAnnouncedText(!loaded && error === null ? t("Loading conversation…") : waiting ? t("Waiting for the PC…") : null);
   const retryRead = useCallback(() => { setFailures(0); conversationRefresh.refresh(); }, [conversationRefresh]);
   const footer = <>
       <p className={waitWords === null ? "visually-hidden" : "chat-inline-state"} role="status">{waitWords}</p>
+      {sentWaiting.length > 0 && state.source === "conversation" && <SentWaitingList sends={sentWaiting} />}
       {error !== null && !waiting && (errorStatus === 401
         ? <p className="chat-inline-state chat-inline-error" role="alert">{t("locked — the token gate is asking again")}</p>
         : <FailureLine action={t("Couldn't load the conversation")} failure={error} onRetry={retryRead} />)}
@@ -1973,21 +2389,22 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       {/* The agent's activity, where no open work block says it: before the turn has an assistant or
           tool row (Claude Code's spinner writes nothing to the transcript), and while a native turn
           thinks (a work block's head says Working). Without native activity the pane status stands
-          in. One Working at a time. */}
-      {connected && !ended && activity !== "idle" && agentStatus !== "blocked" && prompt === null && (activity === "thinking" || !workBlockLive) && (workBlockLive
+          in. One Working at a time, so none before the first read: its rows may hold the running
+          turn's own head. None seen under an answer while the status may still be catching up with it. */}
+      {connected && loaded && !ended && activity !== "idle" && agentStatus !== "blocked" && prompt === null && (activity === "thinking" || !workBlockLive) && (workBlockLive
         // under the running turn's own head, a second head would read as a second block
-        ? <p className="chat-activity chat-activity-line" role="status"><CircleDot aria-hidden="true" />{t("Thinking…")}</p>
+        ? <p className={`${activityClass} chat-activity-line`} role="status" aria-hidden={activityReserved || undefined}><CircleDot aria-hidden="true" />{t("Thinking…")}</p>
         // under a running turn's words: removing a line below them moves nothing when it ends
         : answerOnlyLive
-          ? <p className="chat-activity chat-activity-line" role="status"><CircleDot aria-hidden="true" />{activity === "thinking" ? t("Thinking…") : t("Working…")}</p>
+          ? <p className={`${activityClass} chat-activity-line`} role="status" aria-hidden={activityReserved || undefined}><CircleDot aria-hidden="true" />{activity === "thinking" ? t("Thinking…") : t("Working…")}</p>
           // before the turn has a row at all, where its work block will be drawn
-          : <PendingWorkHead className="chat-activity" title={activity === "thinking" ? t("Thinking…") : t("Working…")} />)}
-      {loaded && empty && error === null && prompt === null && activity === "idle" && !(greeted && blank) && <div className="chat-empty"><AgentMark agent={agent ?? "agent"} size={32} /><p>{t("No conversation yet — say something below")}</p></div>}
+          : <PendingWorkHead className={activityClass} reserved={activityReserved} title={activity === "thinking" ? t("Thinking…") : t("Working…")} />)}
+      {loaded && empty && error === null && prompt === null && activity === "idle" && !(greeted && blank) && sentWaiting.length === 0 && <div className="chat-empty"><AgentMark agent={agent ?? "agent"} size={32} /><p>{t("No conversation yet — say something below")}</p></div>}
       {ended && <p className="chat-endcap">{t("terminal ended")}</p>}
   </>;
   const jump = newMessages ? <button type="button" className="btn chat-new-messages chat-virtual-jump" onClick={scrollToBottom}>{t("New messages")} <ArrowDown aria-hidden="true" /></button>
     : away && <button type="button" className="btn chat-new-messages chat-virtual-jump is-icon" aria-label={t("Jump to latest")} title={t("Jump to latest")} onClick={scrollToBottom}><ArrowDown aria-hidden="true" /></button>;
-  return <ChatPaneContext.Provider value={paneId}><ChatHistoryContext.Provider value={historyId ?? ""}><ImageViewerContext.Provider value={openViewer}><ToolPathRootContext.Provider value={toolPathRoot(cwd)}>
+  return <ChatMarkdownImages paneId={paneId} cwd={cwd} connected={connected} onOpen={openMarkdownImage}><ChatPaneContext.Provider value={paneId}><ChatHistoryContext.Provider value={historyId ?? ""}><ImageViewerContext.Provider value={openViewer}><ToolPathRootContext.Provider value={toolPathRoot(cwd)}>
     {/* a reader away from the end has not seen the answer a finish lands there: presented only at the end */}
     <div className="chat-frame" data-pane-content={active && visible && !covered && connected && !ended && loaded && error === null && !away && !newMessages
       && endPresentation?.state === state && endPresentation.key === presentationKey
@@ -2009,12 +2426,15 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
       scroller={scroller}
       listRef={timeline}
       following={stickToBottom}
-      smoothFollow={smoothFollow}
+      manualLayout={manualLayout}
+      selecting={selecting}
       memories={rowMemories}
       header={header}
       footer={footer}
       label={logLabel}
       onScroll={onScroll}
+      onFollowed={followed}
+      onOpen={readOpened}
       renderRow={renderTurn}
     /> : <div className="chat-view" ref={scroller} onScroll={onScroll} role="log" aria-live="polite" aria-label={logLabel}>
       <div className="chat-transcript" data-conversation-source={state.conversationSource}>
@@ -2024,16 +2444,22 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     </div>}
     {state.source === "conversation" && <ChatMinimap turns={minimap} rowKeys={rowKeys} scroller={scroller} onJump={jumpToTurn} onWheel={minimapWheel} />}
     {jump}
+    {/* only a pane this device may send to takes quotes and comments: they go with its next message */}
+    {state.source === "conversation" && interactive && !ended && <ReplyCommentAction scroller={scroller} storageKey={replyCommentsKey(paneStorageId(machineId, paneId))} paneKey={quotable ? paneStorageId(machineId, paneId) : null} />}
     </div>
     </div>
   {/* The prompt card is not part of the transcript: it is drawn on the composer's column, over the
       input card, where PaneTerminal keeps its place. The prompt itself (its poll, the answer, the
       re-read) stays here. */}
   {prompt !== null && promptDock !== null && createPortal(
-    <PromptCard key={promptOccurrence.current.count} paneId={paneId} prompt={prompt} stale={promptStale} typedAnswer={pendingAnswer?.promptId === prompt.id ? pendingAnswer.answer : null} onTypedAnswerDone={() => onPendingAnswerDone?.(paneId, prompt.id)} onPromptChanged={() => setPromptPollKey((key) => key + 1)} onAnswered={(toMessageBox) => {
+    <PromptCard key={promptOccurrence.current.count} paneId={paneId} prompt={prompt} answered={answeredPrompt === prompt.id} stale={promptStale} screenWords={screenWordsToShow(prompt, state.source === "conversation" ? state.turns : [])} typedAnswer={pendingAnswer?.promptId === prompt.id ? pendingAnswer.answer : null} onTypedAnswerDone={() => onPendingAnswerDone?.(paneId, prompt.id)} onPromptChanged={() => setPromptPollKey((key) => key + 1)} onAnswered={(toMessageBox) => {
       // the card reports only while it is the one shown; still, only its own prompt is cleared
       onPromptAnswered?.(toMessageBox);
-      setPrompt((current) => current === prompt ? null : current);
+      // the card stays, waiting, until the read below shows what the screen asks next: it never goes
+      // and comes back between two questions of one form
+      setAnsweredPrompt(prompt.id);
+      // and is not drawn again as open if the chat mounts again before that read (lastPrompts)
+      lastPrompts.delete(paneStorageId(machineId, paneId));
       // a form of several questions goes on to its next one: read it now, not at the next poll
       if (prompt.steps) setPromptPollKey((key) => key + 1);
       // Refresh conversation and input state after an answer.
@@ -2043,5 +2469,5 @@ export const ChatView = memo(function ChatView({ paneId, presentationKey, finish
     }} />, promptDock)}
   {reviewImage !== null && agent === "pi" && <ImageReview key={`${machineId}:${paneId}:${reviewImage.src}`} paneId={paneId} machineId={machineId} image={reviewImage} onClose={() => setReviewImage(null)} onDraft={draftable ? () => setReviewImage(null) : null} />}
   {viewer !== null && <ImageLightbox images={viewer.images} index={viewer.index} onClose={closeViewer} onReview={agent === "pi" ? (image) => { setViewer(null); setReviewImage(image); } : undefined} />}
-  </ToolPathRootContext.Provider></ImageViewerContext.Provider></ChatHistoryContext.Provider></ChatPaneContext.Provider>;
+  </ToolPathRootContext.Provider></ImageViewerContext.Provider></ChatHistoryContext.Provider></ChatPaneContext.Provider></ChatMarkdownImages>;
 });

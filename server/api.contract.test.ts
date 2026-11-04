@@ -1,12 +1,16 @@
 import { describe, expect, it, beforeAll, afterAll, spyOn } from "bun:test";
+import { CLEAR_LEGACY_DEVICE_COOKIE, DEVICE_COOKIE_CLEARED } from "./auth.ts";
 import { Database } from "bun:sqlite";
 import { appendFileSync, chmodSync, closeSync, constants as fsConstants, copyFileSync, mkdirSync, mkdtempSync, existsSync, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync, openSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, watch, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { ConversationMonitor } from "./conversation-monitor.ts";
 import { createServer } from "./index.ts";
-import type { AgentKind, AgentStatus, ApiError, HealthAuth, IntegrationsResponse, LanExposure, PortalStatus, PushKey, RemoteAccess, SessionSnapshot, TabMoved, PaneFindResponse, PaneReadResult, UsageReport, WorkspaceCreated, WorktreeListing, WorktreeOpened, WorktreeRemoved } from "../shared/protocol.ts";
+import { AgentDetector, catalogLocator } from "./agent-catalog-detect.ts";
+import * as appModule from "./index.ts";
+import * as herdrClient from "./herdr/client.ts";
+import type { AgentKind, AgentStatus, ApiError, HealthAuth, IntegrationsResponse, LanExposure, PortalStatus, SecuritySummary, PushKey, RemoteAccess, SessionSnapshot, TabMoved, TabMovedToWorkspace, PaneFindResponse, PaneReadResult, UsageReport, WorkspaceCreated, WorktreeListing, WorktreeOpened, WorktreeRemoved } from "../shared/protocol.ts";
 import { SUPPORTED_AGENT_KINDS } from "../shared/supported-agents.ts";
 import { HerdrUpdater } from "./herdr-update.ts";
 import { PortalService } from "./portal.ts";
@@ -17,7 +21,7 @@ import { Telemetry } from "./telemetry.ts";
 import { NOTICE_VERSION, telemetryHarnesses, type TelemetryActive, type TelemetryEvent, type TelemetryStatus } from "../shared/telemetry.ts";
 import { DEFAULT_SETTINGS, telemetrySettingsSnapshot } from "../src/lib/settings.ts";
 import { HerdrSocket } from "../src/lib/ws.ts";
-import { HerdrError, herdrRpc, paneRead, ping, sessionSnapshot, subscribeEvents, tabCreate, workspaceCreate, workspaceClose } from "./herdr/client.ts";
+import { HerdrError, herdrRpc, paneRead, paneSplit, ping, sessionSnapshot, subscribeEvents, tabCreate, workspaceCreate, workspaceClose } from "./herdr/client.ts";
 import { startFakePushService, type FakePushService } from "./push.fake.ts";
 import { descriptorPath, type BridgeDescriptor } from "./bridge.ts";
 import { handleMachineRequest } from "./machine-api.ts";
@@ -30,8 +34,12 @@ import { testShellEnv } from "../scripts/test-shell.ts";
 import { PendingInputError, PendingInputs } from "./pending-input.ts";
 import { loginPathProbe, ShellAgentLocator, type LoginPathProbe } from "./shell-agent.ts";
 import { DeviceStore } from "./devices.ts";
-import type { MachineEvent } from "../shared/machines.ts";
+import type { HerdrCoreFacts, MachineEvent, MachineSettings } from "../shared/machines.ts";
 import { MAX_MUTED_PANES, type SharedPreferences } from "../shared/preferences.ts";
+import { OmoStatus } from "./omo-status.ts";
+import { omoJobTasks } from "./omo-jobs.ts";
+import { ClaudeSubagentStatus } from "./claude-subagents.ts";
+import { setFilePoolOptions } from "./file-pool.ts";
 
 /**
  * Contract test for Ovis's HTTP + WS surface.
@@ -235,6 +243,82 @@ describe("Agy conversation API", () => {
   }, 20_000);
 });
 
+describe("Muse conversation API", () => {
+  it.skipIf(process.platform === "win32")("binds the session whose lock names the pane's Muse process, and follows a switch to another session", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ovis-muse-contract-"));
+    // the session Muse 1.4.13 recorded, live: without the `session.end` that its /exit wrote
+    const recorded = readFileSync(join(import.meta.dir, "fixtures", "muse", "recorded-1.4.13.jsonl"), "utf8").split("\n");
+    const end = recorded.at(-2)!;
+    const live = `${recorded.slice(0, -2).join("\n")}\n`;
+    const sessions = join(root, "data", "sessions", "2026", "10", "25");
+    // each session's folder is named after it, as Muse names it
+    const first = join(sessions, "01a17441-bc95-7e23-b488-988dceb829cd");
+    const second = join(sessions, "01a17445-0000-7000-8000-000000000002");
+    mkdirSync(first, { recursive: true }); mkdirSync(second);
+    // a link, not a copy: macOS kills a copied system binary, and argv keeps the name it was run by
+    const executable = join(root, "muse");
+    symlinkSync("/bin/sleep", executable);
+    const created = await workspaceCreate({ cwd: root, label: "ovis-test-muse-api" });
+    let app: ReturnType<typeof createServer> | undefined;
+    try {
+      const paneId = created.root_pane.pane_id;
+      await herdrRpc("pane.send_text", { pane_id: paneId, text: `${executable} 600\n` });
+      let pid: number | undefined;
+      for (const deadline = Date.now() + 10_000;;) {
+        const pane = (await sessionSnapshot()).panes.find((candidate) => candidate.pane_id === paneId);
+        const info = await herdrRpc<{ process_info?: { foreground_processes?: { pid: number; argv?: string[] }[] } }>("pane.process_info", { pane_id: paneId });
+        pid = info.process_info?.foreground_processes?.find((process) => process.argv?.[0] === executable)?.pid;
+        if (pane?.agent === "muse" && pid !== undefined) break;
+        if (Date.now() > deadline) throw new Error(`fixture Muse process did not start: ${pane?.agent} ${JSON.stringify(info.process_info?.foreground_processes)}`);
+        await Bun.sleep(50);
+      }
+      app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(root, "state"), museData: join(root, "data") });
+      const url = `http://127.0.0.1:${app.port}/api/pane/conversation?pane_id=${encodeURIComponent(paneId)}`;
+      // a session no lock ties to this process is never shown, whatever its folder or age
+      writeFileSync(join(first, "session.jsonl"), live);
+      writeFileSync(join(first, ".session.lock"), `pid=${pid! + 1}\nhost=${hostname()}\n`);
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      writeFileSync(join(first, ".session.lock"), `pid=${pid}\nhost=${hostname()}\n`);
+      // the scan that found nothing stands for 2 s, as for a fresh Muse that has written no log yet
+      let response: Response, body;
+      for (const deadline = Date.now() + 5000;;) {
+        response = await fetch(url); body = await response.json();
+        if (body.source === "muse-transcript" || Date.now() > deadline) break;
+        await Bun.sleep(100);
+      }
+      expect(body.source).toBe("muse-transcript");
+      expect(body.turns.map((turn: { role: string }) => turn.role)).toEqual(["user", "assistant", "user", "assistant", "user", "assistant"]);
+      expect(body.metadata.model).toBe("muse-spark-1.2");
+      expect((await fetch(url, { headers: { "if-none-match": response.headers.get("etag")! } })).status).toBe(304);
+      const outputUrl = `http://127.0.0.1:${app.port}/api/pane/conversation/tool-output?${new URLSearchParams({ pane_id: paneId, ref: "call_01a1744243497078923c0e3306f4900d" })}`;
+      expect(await (await fetch(outputUrl)).text()).toBe("ls: missing-folder: No such file or directory\n");
+      // the TUI switches sessions: the one left behind ends, the new one holds a lock for the same pid
+      appendFileSync(join(first, "session.jsonl"), `${end}\n`);
+      const prompt = recorded.find((line) => line.includes('"runtime.user_intent.accepted"'))!.replace("01a17441-bc95-7e23-b488-988dceb829cd", "01a17445-0000-7000-8000-000000000002");
+      writeFileSync(join(second, "session.jsonl"), `${prompt}\n`);
+      writeFileSync(join(second, ".session.lock"), `pid=${pid}\nhost=${hostname()}\n`);
+      const switched = await (await fetch(url)).json();
+      expect(switched.turns).toHaveLength(1);
+      expect(switched.history_id).not.toBe(body.history_id);
+      expect((await fetch(outputUrl)).status).toBe(404);
+      // a record in a shape the reader does not know, or a log it cannot read, shows Terminal
+      const log = join(second, "session.jsonl");
+      appendFileSync(log, `${prompt.replace('"runtime.user_intent.accepted"', '"runtime.user_intent.renamed"')}\n`);
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      writeFileSync(log, `${prompt}\n`);
+      expect((await (await fetch(url)).json()).source).toBe("muse-transcript");
+      // root reads a file whatever its mode
+      if (process.getuid?.() !== 0) {
+        chmodSync(log, 0);
+        expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      }
+    } finally {
+      app?.stop(); await workspaceClose(created.workspace.workspace_id);
+      forgetTranscriptState(); rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("single-pane context lookup", () => {
   for (const route of ["commands", "files"] as const) {
     it(`rejects an unknown pane on /api/pane/${route} with the shared error envelope`, async () => {
@@ -399,13 +483,77 @@ describe("native tool call id and state on GET /api/pane/conversation", () => {
   }, 20_000);
 });
 
+describe("a Claude bash-mode command on GET /api/pane/conversation", () => {
+  it("answers it as one shell part, and leaves out the streams Claude Code has not recorded yet", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-web-ui-bash-mode-contract-"));
+    const cwd = realpathSync(root);
+    const originalHome = process.env["HOME"];
+    const id = "3b7e9c2a-5d14-4f8b-9a63-0c2e7f1d8b45";
+    const file = join(cwd, ".claude", "projects", claudeProjectDir(cwd), `${id}.jsonl`);
+    mkdirSync(join(file, ".."), { recursive: true });
+    const user = (content: string, second: number) => `${JSON.stringify({ type: "user", timestamp: `2026-10-27T03:00:0${second}.000Z`, message: { role: "user", content } })}\n`;
+    writeFileSync(file, user('<bash-input>echo "Hello"</bash-input>', 0) + user("<bash-stdout>Hello</bash-stdout><bash-stderr></bash-stderr>", 1)
+      + user("<bash-input>ls missing</bash-input>", 2) + user("<bash-stdout></bash-stdout><bash-stderr>ls: missing: No such file or directory</bash-stderr>", 3)
+      + user("<bash-input>sleep 60</bash-input>", 4));
+    let app: ReturnType<typeof createServer> | undefined;
+    let workspace: string | undefined;
+    try {
+      process.env["HOME"] = cwd;
+      forgetTranscriptState();
+      const created = await workspaceCreate({ cwd, label: "herdr-web-ui-test-bash-mode" });
+      workspace = created.workspace.workspace_id;
+      const paneId = created.root_pane.pane_id;
+      await herdrRpc("pane.report_agent", { pane_id: paneId, source: "manual", agent: "claude", state: "idle" });
+      await herdrRpc("pane.report_agent_session", { pane_id: paneId, source: "herdr:claude", agent: "claude", seq: Date.now() * 1000, agent_session_id: id });
+      app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(cwd, "state") });
+      const response = await fetch(`http://127.0.0.1:${app.port}/api/pane/conversation?pane_id=${encodeURIComponent(paneId)}`);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { source: string; turns: { role: string; parts: unknown[] }[] };
+      expect(body.source).toBe("claude-transcript");
+      expect(body.turns.map((turn) => [turn.role, turn.parts])).toEqual([
+        ["user", [{ kind: "shell", command: 'echo "Hello"', stdout: "Hello", stderr: "" }]],
+        ["user", [{ kind: "shell", command: "ls missing", stdout: "", stderr: "ls: missing: No such file or directory" }]],
+        // no output entry yet: the JSON has neither stream, not empty ones
+        ["user", [{ kind: "shell", command: "sleep 60" }]],
+      ]);
+    } finally {
+      app?.stop();
+      if (workspace !== undefined) await workspaceClose(workspace);
+      if (originalHome === undefined) delete process.env["HOME"]; else process.env["HOME"] = originalHome;
+      forgetTranscriptState(); rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("usage API", () => {
+  it.each([false, true])("serializes missing_commands when Linux secret-tool availability is %s", async (installed) => {
+    // Given: no Antigravity credentials and an isolated command lookup.
+    const usageState = mkdtempSync(join(tmpdir(), "herdr-usage-missing-command-"));
+    const usage = new UsageService({
+      home: usageState, env: {}, platform: "linux", now: () => Date.parse("2026-10-06T00:00:00Z"),
+      keychain: async () => ({ status: "missing" }), run: async () => null,
+      has: (command) => command !== "secret-tool" || installed,
+      fetch: async () => { throw new Error("usage must not fetch without credentials"); },
+    }, USAGE_PROVIDERS.filter((provider) => provider.id === "antigravity"));
+    const app = createServer({ port: 0, stateDir: usageState, usage });
+    try {
+      // When
+      const response = await fetch(`http://localhost:${app.port}/api/usage`);
+      // Then
+      expect(response.status).toBe(200);
+      const report: UsageReport = await response.json();
+      expect(report.providers).toEqual([]);
+      if (installed) expect(report).not.toHaveProperty("missing_commands");
+      else expect(report.missing_commands).toEqual([{ provider: "antigravity", command: "secret-tool" }]);
+    } finally { app.stop(); rmSync(usageState, { recursive: true, force: true }); }
+  });
+
   it("returns OpenCode Go windows without exposing its credential", async () => {
     const usageState = mkdtempSync(join(tmpdir(), "herdr-opencode-contract-"));
     const token = "oc_sk_contract_only";
     const usage = new UsageService({
       home: usageState, env: { OPENCODE_API_KEY: token }, platform: "linux", now: () => Date.parse("2026-10-06T00:00:00Z"),
-      keychain: async () => ({ status: "missing" }), run: async () => null,
+      keychain: async () => ({ status: "missing" }), run: async () => null, has: () => true,
       fetch: async (url, init) => {
         expect(url).toBe("https://opencode.ai/zen/go/v1/usage");
         expect(new Headers(init.headers).get("authorization")).toBe(`Bearer ${token}`);
@@ -631,6 +779,50 @@ describe("update API", () => {
         expect(response.status).toBe(401);
       }
     } finally { protectedServer.stop(); rmSync(protectedState, { recursive: true, force: true }); }
+  });
+
+  it("lets the connection server's bridge token read the update status and install the offer, and nothing else of it", async () => {
+    // this PC's own Ovis, gated by its own token, reached by another PC's app through SSH
+    const offered = "a".repeat(40);
+    const bridge = "b".repeat(64);
+    const requests: unknown[] = [];
+    const status: UpdateStatus = { ...unmanagedUpdateStatus(), managed: true, blocked_reason: null, available: true, latest_revision: offered, latest_version: "9.9.9", revision_bound_install: true };
+    const ownState = mkdtempSync(join(tmpdir(), "herdr-update-bridge-"));
+    const own = createServer({ port: 0, stateDir: ownState, token: "own-token", bridgeToken: bridge,
+      updates: { status: () => status, notes: noUpdateNotes, installed: noInstalledNotes, request: (request) => { requests.push(request); } } });
+    const call = (path: string, authorization: string, body?: string) => fetch(`http://127.0.0.1:${own.port}${path}`, {
+      method: body === undefined && path !== "/api/updates/check" ? "GET" : "POST", ...(body === undefined ? {} : { body }),
+      headers: { authorization, "x-herdr-update": "1", "content-type": "application/json" },
+    });
+    try {
+      expect(await (await call("/api/updates", `Bearer ${bridge}`)).json()).toMatchObject({ managed: true, available: true, latest_revision: offered });
+      // where it answers comes with the status, to the bridge token only: /api/access stays its own token's (#2191)
+      const told = await (await call("/api/updates", `Bearer ${bridge}`)).json() as UpdateStatus;
+      expect(told.port).toBe(own.port);
+      expect(told.serving_url === null || typeof told.serving_url === "string").toBe(true);
+      expect((await call("/api/access", `Bearer ${bridge}`)).status).toBe(401);
+      const owner = await (await call("/api/updates", "Bearer own-token")).json() as UpdateStatus;
+      expect(owner).toMatchObject({ managed: true, latest_revision: offered });
+      expect("port" in owner || "serving_url" in owner).toBe(false);
+      // the install still names the offer, as from the app's own controls
+      expect((await call("/api/updates/install", `Bearer ${bridge}`, "{}")).status).toBe(400);
+      expect(requests).toEqual([]);
+      expect((await call("/api/updates/install", `Bearer ${bridge}`, JSON.stringify({ expected_revision: offered }))).status).toBe(202);
+      expect(requests).toEqual([{ command: "install", expected_revision: offered }]);
+      // a wrong bridge token is refused like any other, and the token opens no other update route
+      expect((await call("/api/updates", `Bearer ${"c".repeat(64)}`)).status).toBe(401);
+      for (const path of ["/api/updates/notes", "/api/updates/installed", "/api/updates/check", "/api/herdr/update"]) expect((await call(path, `Bearer ${bridge}`)).status).toBe(401);
+      // only the read and the install it grants, each by its own method and with no query (#2054)
+      const send = (method: string, path: string, body?: string) => fetch(`http://127.0.0.1:${own.port}${path}`, {
+        method, ...(body === undefined ? {} : { body }), headers: { authorization: `Bearer ${bridge}`, "x-herdr-update": "1", "content-type": "application/json" },
+      });
+      const install = JSON.stringify({ expected_revision: offered });
+      for (const [method, path, body] of [["GET", "/api/updates?anything=1"], ["HEAD", "/api/updates"], ["POST", "/api/updates", install], ["DELETE", "/api/updates"],
+        ["GET", "/api/updates/install"], ["PUT", "/api/updates/install", install], ["POST", "/api/updates/install?anything=1", install]] as const) {
+        expect({ method, path, status: (await send(method, path, body)).status }).toEqual({ method, path, status: 401 });
+      }
+      expect(requests).toHaveLength(1);
+    } finally { own.stop(); rmSync(ownState, { recursive: true, force: true }); }
   });
 
   it("offers no herdr update on a server started without the updater", async () => {
@@ -895,7 +1087,7 @@ describe("Portal API", () => {
       "#!/bin/sh",
       'case "$1" in',
       "  version) echo v2.6.1 ;;",
-      "  expose) trap 'exit 0' TERM; echo 'INF service ready at https://herdr-test-0123.relay.example:443'; while :; do sleep 0.05; done ;;",
+      "  expose) [ \"$2\" = --help ] && exit 0; trap 'exit 0' TERM; echo 'INF service ready at https://herdr-test-0123.relay.example:443'; while :; do sleep 0.05; done ;;",
       "  *) exit 2 ;;",
       "esac",
       "",
@@ -911,6 +1103,7 @@ describe("Portal API", () => {
       expect((await fetch(url)).status).toBe(401);
       expect(await status()).toMatchObject({ supported: true, usable: true, blocked: null, phase: "idle" });
       expect((await post("start", {})).status).toBe(401);
+      expect((await post("invite", {})).status).toBe(401);
       expect((await post("start", signedIn)).status).toBe(202);
       const deadline = Date.now() + 10_000;
       let running = await status();
@@ -929,7 +1122,7 @@ describe("Portal API", () => {
 describe("mutation body validation", () => {
   it("rejects non-object JSON without touching herdr or losing the error envelope", async () => {
     for (const path of [
-      "/api/workspace/create", "/api/tab/create", "/api/tab/rename", "/api/tab/close", "/api/tab/move", "/api/workspace/rename", "/api/workspace/move", "/api/workspace/close",
+      "/api/workspace/create", "/api/tab/create", "/api/tab/rename", "/api/tab/close", "/api/tab/move", "/api/tab/move-to-workspace", "/api/workspace/rename", "/api/workspace/move", "/api/workspace/close",
       "/api/pane/rename", "/api/pane/input", "/api/pane/keys", "/api/pane/close", "/api/pane/image",
       "/api/pane/scroll", "/api/agent/rename",
     ]) {
@@ -1074,6 +1267,68 @@ describe("tab reorder", () => {
   });
 });
 
+describe("tab to another workspace", () => {
+  const post = (body: unknown) => fetch(`${base()}/api/machines/local/tab/move-to-workspace`, {
+    method: "POST", headers: { "content-type": "application/json", "x-herdr-machine": "1" }, body: JSON.stringify(body),
+  });
+  it("requires a tab and a workspace", async () => {
+    for (const [body, code] of [[{ workspace_id: "w1" }, "missing_tab_id"], [{ tab_id: "w1:t1", workspace_id: "" }, "missing_workspace_id"]] as const) {
+      const result = await post(body);
+      expect(result.status).toBe(400);
+      expect(((await result.json()) as ApiError).error.code).toBe(code);
+    }
+    const missing = await post({ tab_id: "unknown:t9", workspace_id: "w1" });
+    expect(missing.status).toBe(404);
+    expect(((await missing.json()) as ApiError).error.code).toBe("tab_not_found");
+  });
+  it("moves a one-pane tab with its label and process, and refuses a split tab", async () => {
+    const source = await workspaceCreate({ cwd: tmpdir(), label: "ovis-test-tab-out" });
+    const target = await workspaceCreate({ cwd: tmpdir(), label: "ovis-test-tab-in" });
+    const open = [source.workspace.workspace_id, target.workspace.workspace_id];
+    try {
+      const named = await tabCreate({ workspaceId: source.workspace.workspace_id, label: "build" });
+      await paneSplit(source.root_pane.pane_id, "right", false);
+      const split = await post({ tab_id: source.tab.tab_id, workspace_id: target.workspace.workspace_id });
+      expect(split.status).toBe(409);
+      expect(((await split.json()) as ApiError).error.code).toBe("multi_pane_tab");
+      const same = await post({ tab_id: named.tab.tab_id, workspace_id: source.workspace.workspace_id });
+      expect(((await same.json()) as ApiError).error.code).toBe("same_workspace");
+
+      const response = await post({ tab_id: named.tab.tab_id, workspace_id: target.workspace.workspace_id });
+      expect(response.status).toBe(200);
+      const moved = await response.json() as TabMovedToWorkspace;
+      const snapshot = await sessionSnapshot();
+      const pane = snapshot.panes.find((candidate) => candidate.pane_id === moved.pane_id);
+      expect(pane?.workspace_id).toBe(target.workspace.workspace_id);
+      expect(snapshot.tabs.find((tab) => tab.tab_id === moved.tab_id)?.label).toBe("build");
+      expect(snapshot.tabs.some((tab) => tab.tab_id === named.tab.tab_id)).toBe(false);
+      expect(snapshot.panes.some((candidate) => candidate.pane_id === named.root_pane.pane_id)).toBe(false);
+    } finally { for (const id of open) await workspaceClose(id).catch(() => {}); }
+  });
+  it("leaves the name herdr gave a tab by its place behind, though the tab's number differs", async () => {
+    const source = await workspaceCreate({ cwd: tmpdir(), label: "ovis-test-tab-place-out" });
+    const target = await workspaceCreate({ cwd: tmpdir(), label: "ovis-test-tab-place-in" });
+    const open = [source.workspace.workspace_id, target.workspace.workspace_id];
+    try {
+      await tabCreate({ workspaceId: source.workspace.workspace_id });
+      const third = await tabCreate({ workspaceId: source.workspace.workspace_id });
+      await tabCreate({ workspaceId: target.workspace.workspace_id });
+      // the first tab closes: the third keeps its number, and herdr names it by its new place
+      await herdrRpc("tab.close", { tab_id: source.tab.tab_id });
+      const before = (await sessionSnapshot()).tabs.find((tab) => tab.tab_id === third.tab.tab_id);
+      expect(before?.number).toBe(3);
+      expect(before?.label).toBe("2");
+      const response = await post({ tab_id: third.tab.tab_id, workspace_id: target.workspace.workspace_id });
+      expect(response.status).toBe(200);
+      const moved = await response.json() as TabMovedToWorkspace;
+      const row = (await sessionSnapshot()).tabs.filter((tab) => tab.workspace_id === target.workspace.workspace_id);
+      // third in its new row, and unnamed there: herdr names it by that place, not by the "2" it had
+      expect(row.map((tab) => tab.tab_id).indexOf(moved.tab_id)).toBe(2);
+      expect(row.find((tab) => tab.tab_id === moved.tab_id)?.label).toBe("3");
+    } finally { for (const id of open) await workspaceClose(id).catch(() => {}); }
+  });
+});
+
 describe("agent rename", () => {
   const post = (body: unknown) => fetch(`${base()}/api/agent/rename`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const nameOf = async (paneId: string): Promise<string | null> =>
@@ -1165,6 +1420,27 @@ describe("agent rename", () => {
       expect(Array.isArray(((await res.json()) as { commands: unknown[] }).commands)).toBeTrue();
     } finally {
       bridge.stop();
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+
+  // #2044: a crash left machines.json its old length in NULs, and the server would not start
+  it("starts on saved PCs that are not JSON and names the file it set aside in the PC settings, read only", async () => {
+    const state = mkdtempSync(join(tmpdir(), "ovis-machines-set-aside-"));
+    writeFileSync(join(state, "machines.json"), Buffer.alloc(353));
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    let app: ReturnType<typeof createServer> | undefined;
+    try {
+      app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: state, tailscaleOwner: null });
+      const url = `http://127.0.0.1:${app.port}/api/machines/settings`;
+      const settings = await (await fetch(url)).json() as MachineSettings;
+      expect(settings).toEqual({ auto_update_bridges: true, set_aside: [expect.stringMatching(/^machines\.json\.corrupt-\S+$/)] });
+      expect(readdirSync(state)).toContain(settings.set_aside![0]!);
+      const patched = await fetch(url, { method: "PATCH", headers: { "content-type": "application/json", "x-herdr-machine": "1" }, body: JSON.stringify({ auto_update_bridges: false, set_aside: [] }) });
+      expect(patched.status).toBe(200);
+      expect(await patched.json()).toEqual({ auto_update_bridges: false, set_aside: settings.set_aside });
+    } finally {
+      app?.stop(); error.mockRestore();
       rmSync(state, { recursive: true, force: true });
     }
   });
@@ -1475,7 +1751,7 @@ describe("workspace and discovery endpoints", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32")("offers a shell agent found only on its login shell's PATH, starts that same executable, and keeps hits and misses until the next run", async () => {
+  it.skipIf(process.platform === "win32")("offers a shell agent found only on its login shell's PATH, starts that same executable, keeps its hits until the next run, and finds a missed one put back on the PATH that run read", async () => {
     // a service PATH without gjc, and a test-owned login shell whose -l run puts it on PATH: no dotfile is read
     const root = mkdtempSync(join(tmpdir(), "ovis-login-path-"));
     const home = join(root, "home"), serviceBin = join(root, "service bin"), loginBin = join(root, "login bin");
@@ -1496,7 +1772,9 @@ describe("workspace and discovery endpoints", () => {
     let clock = 0;
     const shellAgents = new ShellAgentLocator({ servicePath: () => serviceBin, probe, now: () => clock });
     const state = mkdtempSync(join(tmpdir(), "ovis-login-path-state-"));
-    const app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: state, shellAgents });
+    // installers' folders are looked up under the test's home, never the user's
+    const agentDetector = new AgentDetector({ home, locate: catalogLocator({ probe: null, servicePath: () => serviceBin }) });
+    const app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: state, shellAgents, agentDetector });
     const url = `http://127.0.0.1:${app.port}`;
     const kinds = async () => ((await (await fetch(`${url}/api/agents`)).json()) as { agents: AgentKind[] }).agents;
     const owned = await workspaceCreate({ cwd: tmpdir(), label: "ovis-test-login-path" });
@@ -1550,12 +1828,10 @@ describe("workspace and discovery endpoints", () => {
       expect((await kinds()).map((agent) => agent.kind)).not.toContain("gjc");
       clock += 60_000;
       expect((await kinds()).map((agent) => agent.kind)).not.toContain("gjc");
-      // back again: the kept miss holds until a read after the answer is a minute old runs the next one
+      // back again on the PATH the last run read: found at once, with no new login shell, as a just-installed agent is
       writeGjc();
-      expect((await kinds()).map((agent) => agent.kind)).not.toContain("gjc");
-      clock += 60_000;
       expect(await kinds()).toContainEqual({ kind: "gjc", label: "Gajae Code", installed: true });
-      expect(runs).toBe(3);
+      expect(runs).toBe(2);
 
       // released, the fixture agent ends: nothing of it outlives the test
       releaseFixture();
@@ -1727,6 +2003,58 @@ describe("workspace and discovery endpoints", () => {
       if (closing) await herdrRpc("workspace.close", { workspace_id: closing.workspace.workspace_id }).catch(() => undefined);
     }
   }, 20_000);
+
+  it("pushes session-changed when a tab, workspace or worktree create answers, not after the collector's debounce", async () => {
+    // the page draws a new pane only once the roster lists it, and the roster is read on this frame
+    const repo = mkdtempSync(join(tmpdir(), "ovis-create-push-"));
+    const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=ovis test", "-c", "user.email=test@example.invalid", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+    expect(git("init", "-q", "-b", "main").exitCode).toBe(0);
+    writeFileSync(join(repo, "README.md"), "create push fixture\n");
+    expect(git("add", "README.md").exitCode).toBe(0);
+    expect(git("commit", "-q", "-m", "fixture").exitCode).toBe(0);
+    const socket = await RecordingSocket.connect(`ws://localhost:${server.port}/ws`);
+    const owned: string[] = [];
+    // until no session-changed comes for 700 ms: the collector's debounced one (500 ms after herdr's event) is not the next create's
+    const quiet = async (): Promise<void> => {
+      const changes = () => socket.seen.filter((frame) => frame.type === "session-changed").length;
+      const deadline = Date.now() + 10_000;
+      let count = changes(), since = Date.now();
+      while (Date.now() - since < 700) {
+        if (Date.now() > deadline) throw new Error("session-changed frames did not stop within 10s");
+        await Bun.sleep(25);
+        if (changes() !== count) { count = changes(); since = Date.now(); }
+      }
+    };
+    // ms from the answer to the first session-changed after the request: the collector's comes 500 ms late
+    const pushedOnAnswer = async (path: string, body: unknown): Promise<number> => {
+      const before = new Set(socket.seen);
+      const changed = socket.waitFor((frame) => frame.type === "session-changed" && !before.has(frame), `session-changed after ${path}`, 5_000).then(() => performance.now());
+      const response = await fetch(`${base()}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const answered = performance.now();
+      expect(response.status).toBe(200);
+      owned.push(((await response.json()) as WorkspaceCreated).workspace_id);
+      const pushed = await changed - answered;
+      await quiet();
+      return pushed;
+    };
+    try {
+      const parent = await workspaceCreate({ cwd: repo, label: "ovis-test-create-push" });
+      owned.push(parent.workspace.workspace_id);
+      await socket.waitFor((frame) => frame.type === "session-changed", "session-changed after setup", 5_000);
+      await quiet();
+      expect(await pushedOnAnswer("/api/tab/create", { workspace_id: parent.workspace.workspace_id })).toBeLessThan(250);
+      expect(await pushedOnAnswer("/api/workspace/create", { cwd: repo, label: "ovis-test-create-push-2" })).toBeLessThan(250);
+      const checkout = join(`${repo}-checkouts`, "feature");
+      expect(await pushedOnAnswer("/api/worktree/create", { workspace_id: parent.workspace.workspace_id, branch: "ovis-test-create-push", path: checkout })).toBeLessThan(250);
+      // opening a worktree that is open already answers from the same route: it pushes too
+      expect(await pushedOnAnswer("/api/worktree/open", { workspace_id: parent.workspace.workspace_id, path: checkout })).toBeLessThan(250);
+    } finally {
+      socket.close();
+      for (const id of new Set(owned)) await herdrRpc("workspace.close", { workspace_id: id }).catch(() => undefined);
+      rmSync(`${repo}-checkouts`, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("says a repository has no commits yet instead of passing git's refusal on", async () => {
     const repo = mkdtempSync(join(tmpdir(), "ovis-worktree-empty-"));
@@ -1947,6 +2275,69 @@ describe("workspace and discovery endpoints", () => {
 });
 
 describe("GET /api/pane/omo-tasks", () => {
+  it("answers a busy Claude task-list scan with retryable 503 while bridge health stays available", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ovis-claude-task-busy-"));
+    const path = join(root, "synthetic.jsonl");
+    writeFileSync(path, "");
+    const original = ClaudeSubagentStatus.prototype.sessionOf;
+    const session = spyOn(ClaudeSubagentStatus.prototype, "sessionOf").mockImplementation(function(this: ClaudeSubagentStatus, paneId) {
+      return paneId === "busy-claude-pane" ? { path, live: true, startedAt: null, read: 1 } : original.call(this, paneId);
+    });
+    setFilePoolOptions({ workers: 0, waiting: 0 });
+    try {
+      const response = await fetch(`${base()}/api/pane/omo-tasks?pane_id=busy-claude-pane`);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("1");
+      expect(await response.json()).toMatchObject({ error: { code: "file_busy" } });
+      expect((await fetch(`${base()}/api/health?scope=bridge`)).status).toBe(200);
+    } finally {
+      session.mockRestore();
+      setFilePoolOptions();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("merges running bash, monitor and eval jobs ahead of ended tasks and jobs", async () => {
+    // Given task records and the core tracker's transcript jobs for the same session.
+    const cwd = mkdtempSync(join(tmpdir(), "ovis-omo-merged-tasks-"));
+    const now = new Date().toISOString();
+    const tasks = join(cwd, ".omo", "senpi-task", "tasks");
+    mkdirSync(tasks, { recursive: true });
+    for (const [id, status] of [["st_running", "running"], ["st_ended", "completed"]]) {
+      writeFileSync(join(tasks, `${id}.json`), JSON.stringify({
+        task_id: id, parent_session_id: "merged-session", host_pid: process.pid, status,
+        task_summary: id, started_at: now, terminal_at: now,
+      }));
+    }
+    const jobs = omoJobTasks({
+      running: [
+        { id: "bash_1", kind: "command", title: "bun test", at: Date.parse(now) },
+        { id: "mon_FIRST", kind: "monitor", title: "test completion", at: Date.parse(now) },
+        { id: "cell-1", kind: "cell", title: "run tests", at: Date.parse(now) },
+      ],
+      ended: [{ id: "bash_2", kind: "command", title: "bun build", at: Date.parse(now), ended: { at: Date.parse(now), status: "completed" } }],
+    }, null);
+    const session = spyOn(OmoStatus.prototype, "sessionOf").mockImplementation((paneId) => paneId === "merged-pane" ? { cwd, sessionId: "merged-session" } : null);
+    const background = spyOn(OmoStatus.prototype, "jobsOf").mockImplementation((paneId) => paneId === "merged-pane" ? jobs : []);
+    try {
+      // When the browser requests the merged list through HTTP.
+      const response = await fetch(`${base()}/api/pane/omo-tasks?pane_id=merged-pane`);
+      const body = await response.json() as { tasks: { id: string; category: string | null; status: string }[] };
+      // Then running jobs precede even the ended task record, and neither source is lost.
+      expect(response.status).toBe(200);
+      expect(body.tasks.map((task) => [task.id, task.status])).toEqual([
+        ["st_running", "running"], ["bash_1", "running"], ["mon_FIRST", "running"], ["cell-1", "running"],
+        ["st_ended", "completed"], ["bash_2", "completed"],
+      ]);
+      expect(body.tasks.slice(1, 4).map((task) => task.category)).toEqual(["bash", "monitor", "eval"]);
+      expect(background).toHaveBeenCalledWith("merged-pane");
+    } finally {
+      session.mockRestore();
+      background.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("answers 400 without a pane, and no tasks for a pane that runs no OmO", async () => {
     const missing = await fetch(`${base()}/api/pane/omo-tasks`);
     expect(missing.status).toBe(400);
@@ -1977,6 +2368,28 @@ describe("GET /api/session", () => {
     expect(typeof body.snapshot.finish_epoch).toBe("string");
     expect(body.snapshot.finish_epoch?.length).toBeGreaterThan(0);
     expect(body.snapshot.panes.every((pane) => Number.isSafeInteger(pane.finish_id))).toBe(true);
+  });
+
+  it("names the herdr it read: the same from another server on it, another for another herdr, none it cannot prove", async () => {
+    const lifetime = async (origin: string): Promise<string | undefined> =>
+      ((await (await fetch(`${origin}/api/session`)).json()) as { snapshot: SessionSnapshot }).snapshot.herdr_lifetime;
+    const own = await lifetime(base());
+    expect(own).toMatch(/^[0-9a-f]{32}$/);
+    let identity: string | null = "a fake herdr";
+    const dirs = [mkdtempSync(join(tmpdir(), "ovis-lifetime-")), mkdtempSync(join(tmpdir(), "ovis-lifetime-"))];
+    const restarted = createServer({ port: 0, stateDir: dirs[0], machines: false });
+    const other = createServer({ port: 0, stateDir: dirs[1], machines: false, herdrIdentity: () => identity });
+    try {
+      expect(await lifetime(`http://127.0.0.1:${restarted.port}`)).toBe(own);
+      const fake = await lifetime(`http://127.0.0.1:${other.port}`);
+      expect(fake).toMatch(/^[0-9a-f]{32}$/);
+      expect(fake).not.toBe(own);
+      identity = null;
+      expect(await lifetime(`http://127.0.0.1:${other.port}`)).toBeUndefined();
+    } finally {
+      await Promise.all([restarted.stop(), other.stop()]);
+      for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -3857,6 +4270,39 @@ describe("pairing and identity", () => {
     expect(await auth()).toMatchObject({ authenticated: true, via: "local" });
   });
 
+  it("revokes every device in one answer that clears the caller's own cookie, and takes revoke-all for no device id", async () => {
+    const pair = async (label: string) => {
+      const { code } = (await (await fetch(`${base()}/api/devices/pair/start`, { method: "POST", headers: guard })).json()) as { code: string };
+      const paired = await fetch(`${base()}/api/devices/pair`, { method: "POST", headers: { ...guard, ...proxied() }, body: JSON.stringify({ code, label }) });
+      expect(paired.status).toBe(204);
+      return paired.headers.get("set-cookie")!.split(";")[0]!;
+    };
+    const phone = await pair("Phone");
+    const tablet = await pair("Tablet");
+    expect(await auth({ ...proxied(), cookie: tablet })).toMatchObject({ authenticated: true, via: "device" });
+    // the route comes before the device ids: another method on it is refused as a method, never read as a device
+    const asDevice = await fetch(`${base()}/api/devices/revoke-all`, { method: "DELETE", headers: guard });
+    expect([asDevice.status, ((await asDevice.json()) as ApiError).error.code]).toEqual([400, "method_not_allowed"]);
+    expect((await fetch(`${base()}/api/devices/revoke-all`, { method: "POST" })).status).toBe(403); // the mutation guard
+    // from a paired device: everything paired goes, that device's own pairing included, and its cookie with the answer
+    const revoked = await fetch(`${base()}/api/devices/revoke-all`, { method: "POST", headers: { ...guard, ...proxied(), cookie: tablet } });
+    expect(revoked.status).toBe(200);
+    expect(revoked.headers.get("content-type")).toContain("application/json");
+    expect(revoked.headers.get("cache-control")).toBe("no-store");
+    expect(await revoked.json()).toEqual({ revoked: 2 });
+    expect(revoked.headers.getSetCookie()).toEqual([DEVICE_COOKIE_CLEARED, CLEAR_LEGACY_DEVICE_COOKIE]);
+    for (const cookie of [phone, tablet]) expect(await auth({ ...proxied(), cookie })).toMatchObject({ authenticated: false, reason: "pairing_required" });
+    expect(((await (await fetch(`${base()}/api/devices`)).json()) as { devices: unknown[] }).devices).toEqual([]);
+    // the gate stays shut to strangers; this PC and the PC's Tailscale login are in as before
+    expect(await auth(proxied())).toMatchObject({ authenticated: false, reason: "pairing_required" });
+    expect(await auth()).toMatchObject({ authenticated: true, via: "local" });
+    expect(await auth(proxied(OWNER))).toMatchObject({ authenticated: true, via: "tailscale" });
+    // with nothing left to revoke the answer is the same shape, and still a durable write
+    const again = await fetch(`${base()}/api/devices/revoke-all`, { method: "POST", headers: guard });
+    expect([again.status, await again.json()]).toEqual([200, { revoked: 0 }]);
+    expect(JSON.parse(readFileSync(join(openState, "devices.json"), "utf8"))).toEqual({ gate_closed_at: expect.any(String), devices: [] });
+  });
+
   it("the plugin script prints a code a headless PC's owner can hand to a phone", async () => {
     const configDir = mkdtempSync(join(tmpdir(), "herdr-pair-cli-"));
     try {
@@ -4176,7 +4622,8 @@ describe("PC management API", () => {
     let serve = () => new Response("{}");
     const peer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => serve() });
     const url = `http://127.0.0.1:${peer.port}`;
-    const manager = { endpoint: (id: string) => id === "capped-remote" ? { url, token: "contract-token" } : undefined, trackTerminal: () => () => {} } as unknown as MachineManager;
+    const retried: string[] = [];
+    const manager = { endpoint: (id: string) => id === "capped-remote" ? { url, token: "contract-token" } : undefined, trackTerminal: () => () => {}, retryNow: (id: string) => { retried.push(id); } } as unknown as MachineManager;
     const ask = (machine: string, path: string, readOnly = false) => handleMachineRequest(new Request(`http://127.0.0.1/api/machines/${machine}/${path}`), manager, undefined, undefined, readOnly);
     const logged: string[] = [];
     const error = spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
@@ -4201,6 +4648,8 @@ describe("PC management API", () => {
       const offline = await ask("missing", "session");
       expect(offline.status).toBe(503);
       expect((await offline.json() as ApiError).error.code).toBe("machine_offline");
+      // and asked to try connecting now rather than after its retry delay
+      expect(retried).toEqual(["missing"]);
     } finally { error.mockRestore(); peer.stop(true); }
   });
   it("gates PC metadata, setup and SSE behind the existing token", async () => {
@@ -4372,6 +4821,202 @@ describe("repository diff of a pane's folder", () => {
 });
 
 describe("GET /api/sessions/history", () => {
+  const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+
+  /** Own all setup and cleanup, including failures before a server or workspace is returned. */
+  async function withPiHistoryFixture(root: string, run: (fixture: { file: string; initial: string; url: string }) => Promise<void>, piSessionDeadlineMs?: number): Promise<void> {
+    const previous = process.env["PI_CODING_AGENT_SESSION_DIR"];
+    let created: Awaited<ReturnType<typeof workspaceCreate>> | undefined;
+    let app: ReturnType<typeof createServer> | undefined;
+    try {
+      const project = join(root, "project");
+      mkdirSync(project);
+      const cwd = realpathSync(project);
+      const store = join(root, "sessions");
+      const { piSessionFolder } = await import("./session-history.ts");
+      const folder = join(store, piSessionFolder(cwd));
+      mkdirSync(folder, { recursive: true });
+      const file = join(folder, "fixture.jsonl");
+      const initial = line({ type: "session", version: 3, id: "pi-history-fixture", cwd })
+        + line({ type: "message", message: { role: "system", content: "s".repeat(100 * 1024) } })
+        + line({ type: "message", message: { role: "user", content: [{ type: "text", text: "Late" }, { type: "text", text: "prompt" }] } })
+        + line({ type: "session_info", name: " Late name " });
+      writeFileSync(file, initial);
+      process.env["PI_CODING_AGENT_SESSION_DIR"] = store;
+      created = await workspaceCreate({ cwd, label: "ovis-test-pi-history" });
+      app = createServer({ port: 0, hostname: "127.0.0.1", stateDir: join(root, "state"), piSessionDeadlineMs });
+      const url = `http://127.0.0.1:${app.port}/api/sessions/history?workspace_id=${encodeURIComponent(created.workspace.workspace_id)}&agent=pi`;
+      await run({ file, initial, url });
+    } finally {
+      try { app?.stop(); }
+      finally {
+        if (previous === undefined) delete process.env["PI_CODING_AGENT_SESSION_DIR"]; else process.env["PI_CODING_AGENT_SESSION_DIR"] = previous;
+        try { if (created) await workspaceClose(created.workspace.workspace_id); }
+        finally { rmSync(root, { recursive: true, force: true }); }
+      }
+    }
+  }
+
+  it("streams Pi labels past the old head bound and follows appended renames/clears without changing resume IDs", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ovis-pi-history-contract-"));
+    await withPiHistoryFixture(root, async ({ file, initial, url }) => {
+      const listing = async () => {
+        const response = await fetch(url);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        return ((await response.json()) as SessionHistoryResponse).sessions;
+      };
+      expect(await listing()).toMatchObject([{ title: "Late name", firstMessage: "Late prompt", resume: { argv: ["pi", "--session", "pi-history-fixture"] } }]);
+      writeFileSync(file, initial + line({ type: "session_info", name: "Renamed" }));
+      expect((await listing())[0]?.title).toBe("Renamed");
+      writeFileSync(file, initial + line({ type: "session_info", name: " " }));
+      expect((await listing())[0]).toMatchObject({ title: null, firstMessage: "Late prompt" });
+      // A fresh streaming read has no old 16 MiB per-turn cutoff.
+      const block = line({ type: "message", message: { role: "system", content: "s".repeat(1024 * 1024) } });
+      for (let n = 0; n < 17; n++) appendFileSync(file, block);
+      appendFileSync(file, line({ type: "session_info", name: "After bounded scan" }));
+      expect((await listing())[0]).toMatchObject({ title: "After bounded scan", firstMessage: "Late prompt" });
+      // A full header queue still refuses the listing even after a real first row.
+      const older = join(dirname(file), "older.jsonl");
+      writeFileSync(older, initial.replace("pi-history-fixture", "pi-history-older"));
+      utimesSync(older, 1, 1);
+      const { PiSessionReader, PiMetadataBusy, PiMetadataDeadline } = await import("./pi-session-metadata.ts");
+      const originalRead = PiSessionReader.prototype.read;
+      let firstComplete = false;
+      const refusedRead = spyOn(PiSessionReader.prototype, "read").mockImplementationOnce(function (this: InstanceType<typeof PiSessionReader>, ...args: Parameters<typeof originalRead>) {
+        return originalRead.apply(this, args).then((label) => { firstComplete = label?.header?.id === "pi-history-fixture"; return label; });
+      }).mockRejectedValueOnce(new PiMetadataBusy("queue"));
+      try {
+        const busy = await fetch(url);
+        expect(firstComplete).toBe(true);
+        expect(refusedRead).toHaveBeenCalledTimes(2);
+        expect(busy.status).toBe(503);
+        expect(busy.headers.get("retry-after")).toBe("1");
+        expect(busy.headers.get("cache-control")).toBe("no-store");
+        const body = await busy.json();
+        expect(body).toMatchObject({ error: { code: "session_history_busy" } });
+        expect(body).not.toHaveProperty("sessions");
+      } finally { refusedRead.mockRestore(); }
+      for (const failure of [new PiMetadataDeadline(null), new PiMetadataBusy()]) {
+        const failedLabel = spyOn(PiSessionReader.prototype, "read").mockImplementation(function (this: InstanceType<typeof PiSessionReader>, ...args: Parameters<typeof originalRead>) {
+          if (args[3] !== "header" && args[2]?.path === realpathSync(older)) return Promise.reject(failure);
+          return originalRead.apply(this, args);
+        });
+        try {
+          const partial = await fetch(url);
+          expect(partial.status).toBe(200);
+          expect(partial.headers.get("cache-control")).toBe("no-store");
+          expect(partial.headers.get("retry-after")).toBeNull();
+          expect(((await partial.json()) as SessionHistoryResponse).sessions).toMatchObject([
+            { id: "pi-history-fixture", title: "After bounded scan" },
+            { id: "pi-history-older", title: null, firstMessage: null, resume: { argv: ["pi", "--session", "pi-history-older"] } },
+          ]);
+        } finally { failedLabel.mockRestore(); }
+      }
+      expect((await listing())[1]).toMatchObject({ id: "pi-history-older", title: "Late name", firstMessage: "Late prompt" });
+    }, 120_000);
+  }, 20_000);
+
+  it("lists a 202-session Pi store with 50 long transcripts through the real API", async () => {
+    // the rows, titles and a later rename are the claim, not how fast this runner reads the store: a busy
+    // CI runner hit the two-second listing deadline (503), so the deadline is set past the test's own timeout
+    const root = mkdtempSync(join(tmpdir(), "ovis-pi-large-history-contract-"));
+    await withPiHistoryFixture(root, async ({ file, url }) => {
+      const cwd = realpathSync(join(root, "project"));
+      const block = line({ type: "custom", data: "synthetic extension state ".repeat(45000) });
+      utimesSync(file, 1_790_000_000, 1_790_000_000);
+      for (let n = 1; n < 202; n++) {
+        const path = join(dirname(file), `${n}.jsonl`);
+        const body = line({ type: "session", version: 3, id: `long-${n}`, cwd })
+          + (n < 152 ? "" : block + line({ type: "message", message: { role: "user", content: `Synthetic prompt ${n}` } })
+            + line({ type: "session_info", name: `Synthetic session ${n}` }) + block.repeat(3));
+        writeFileSync(path, body);
+        utimesSync(path, 1_790_000_000 + n, 1_790_000_000 + n);
+      }
+      const listing = async () => {
+        const response = await fetch(url);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        return ((await response.json()) as SessionHistoryResponse).sessions;
+      };
+      const rows = await listing();
+      expect(rows.map((row) => row.id)).toEqual(Array.from({ length: 50 }, (_, n) => `long-${201 - n}`));
+      expect(rows.every((row, n) => row.title === `Synthetic session ${201 - n}` && row.firstMessage === `Synthetic prompt ${201 - n}`)).toBe(true);
+      // Reopening must scan again and notice a later name, not reuse the completed answer.
+      const renamed = join(dirname(file), "201.jsonl");
+      appendFileSync(renamed, line({ type: "session_info", name: "Freshly renamed" }));
+      utimesSync(renamed, 1_790_000_202, 1_790_000_202);
+      expect((await listing())[0]).toMatchObject({ id: "long-201", title: "Freshly renamed", resume: { argv: ["pi", "--session", "long-201"] } });
+    }, 120_000);
+  }, 60_000);
+
+  for (const phase of ["workspace creation", "server creation", "server stop", "workspace close"] as const) {
+    it(`cleans up the Pi history fixture when ${phase} fails`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "ovis-pi-history-failure-"));
+      const previous = process.env["PI_CODING_AGENT_SESSION_DIR"];
+      const failure = new Error(`synthetic ${phase} failure`);
+      const createWorkspace = herdrClient.workspaceCreate;
+      const createApp = appModule.createServer;
+      const closeWorkspace = herdrClient.workspaceClose;
+      const restores: Array<() => void> = [];
+      let workspaceId: string | undefined;
+      let stop: (() => void) | undefined;
+      let stopped = false;
+      let closed = false;
+      try {
+        const creating = spyOn(herdrClient, "workspaceCreate").mockImplementation(async (...args) => {
+          if (phase === "workspace creation") throw failure;
+          const created = await createWorkspace(...args);
+          workspaceId = created.workspace.workspace_id;
+          return created;
+        });
+        restores.push(() => creating.mockRestore());
+        const starting = spyOn(appModule, "createServer").mockImplementation((...args) => {
+          if (phase === "server creation") throw failure;
+          const app = createApp(...args);
+          stop = app.stop;
+          const stopping = spyOn(app, "stop").mockImplementation(() => {
+            stop!();
+            stopped = true;
+            if (phase === "server stop") throw failure;
+          });
+          restores.push(() => stopping.mockRestore());
+          return app;
+        });
+        restores.push(() => starting.mockRestore());
+        const closing = spyOn(herdrClient, "workspaceClose").mockImplementation(async (...args) => {
+          if (phase === "workspace close") throw failure;
+          await closeWorkspace(...args);
+          closed = true;
+        });
+        restores.push(() => closing.mockRestore());
+
+        await expect(withPiHistoryFixture(root, async () => {})).rejects.toBe(failure);
+        expect(process.env["PI_CODING_AGENT_SESSION_DIR"]).toBe(previous);
+        expect(existsSync(root)).toBe(false);
+        expect(starting).toHaveBeenCalledTimes(phase === "workspace creation" ? 0 : 1);
+        if (stop) expect(stopped).toBe(true);
+        if (workspaceId) {
+          expect(closing).toHaveBeenCalledWith(workspaceId);
+          expect(closed).toBe(phase !== "workspace close");
+          expect((await sessionSnapshot()).workspaces.some((workspace) => workspace.workspace_id === workspaceId)).toBe(phase === "workspace close");
+        }
+      } finally {
+        for (const restore of restores.reverse()) restore();
+        // The injected close failure deliberately leaves our own isolated workspace alive;
+        // recover it here even if a cleanup assertion above failed.
+        try { if (stop && !stopped) stop(); }
+        finally {
+          try { if (workspaceId && !closed) await closeWorkspace(workspaceId); }
+          finally {
+            if (previous === undefined) delete process.env["PI_CODING_AGENT_SESSION_DIR"]; else process.env["PI_CODING_AGENT_SESSION_DIR"] = previous;
+            rmSync(root, { recursive: true, force: true });
+          }
+        }
+      }
+    }, 20_000);
+  }
+
   it("lists a workspace folder's Codex sessions from the server's store, newest first, and none a link puts outside it", async () => {
     const root = mkdtempSync(join(tmpdir(), "ovis-session-history-contract-"));
     const project = join(root, "project");
@@ -5012,6 +5657,215 @@ describe("shared preferences API", () => {
       abort.abort();
       server.stop();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("access facts on /api/health", () => {
+  type Body = { auth: HealthAuth; lan_exposure?: LanExposure; security?: SecuritySummary; herdr_core?: HerdrCoreFacts };
+  const SECRET = "fictional-t0k3n-value";
+  const guard = { "content-type": "application/json", "x-herdr-machine": "1" };
+  /** a server of its own: a temp state dir, an empty token unless one is given, nothing from the runner's environment */
+  const CORE_FACTS: HerdrCoreFacts = { version: "0.1.17", session: "default", running: false };
+  const serve = (options: { hostname?: string; token?: string; serveOnly?: boolean; owner?: string | null; seed?: (stateDir: string) => void } = {}) => {
+    const stateDir = mkdtempSync(join(tmpdir(), "herdr-security-summary-"));
+    options.seed?.(stateDir);
+    const instance = createServer({ port: 0, hostname: options.hostname ?? "127.0.0.1", token: options.token ?? "", stateDir, tailscaleOwner: options.owner ?? null, tailscaleServeOnly: options.serveOnly ?? false, herdrCoreFacts: () => CORE_FACTS });
+    const read = async (headers: Record<string, string> = {}, scope = "") => {
+      const response = await fetch(`http://127.0.0.1:${instance.port}/api/health${scope}`, { headers });
+      const text = await response.text();
+      return { status: response.status, cacheControl: response.headers.get("cache-control"), text, body: JSON.parse(text) as Body };
+    };
+    return { port: instance.port, stateDir, read, stop: () => { instance.stop(); rmSync(stateDir, { recursive: true, force: true }); } };
+  };
+
+  it("authenticated summary contains only safe facts", async () => {
+    const secured = serve({ token: SECRET });
+    try {
+      for (const scope of ["", "?scope=bridge"]) {
+        const answer = await secured.read({ authorization: `Bearer ${SECRET}` }, scope);
+        expect(answer.status).toBe(200);
+        expect(answer.body.security).toEqual({ token_configured: true, pairing_gate: "open", bind_scope: "loopback", observed_ingress: "direct", public_exposure: "unknown" });
+        expect(answer.cacheControl).toBe("no-store");
+        // no token, hash, login, address or path anywhere in the facts
+        const facts = JSON.stringify(answer.body.security);
+        for (const secret of [SECRET, secured.stateDir, "127.0.0.1", "token_hash", "@"]) expect(facts).not.toContain(secret);
+        expect(answer.text).not.toContain(SECRET);
+      }
+    } finally { secured.stop(); }
+    // another bind and a closed gate: the facts follow the configuration, not the request
+    const open = serve({ hostname: "0.0.0.0" });
+    try {
+      expect((await open.read()).body.security).toEqual({ token_configured: false, pairing_gate: "open", bind_scope: "other", observed_ingress: "direct", public_exposure: "unknown" });
+      const { code } = (await (await fetch(`http://127.0.0.1:${open.port}/api/devices/pair/start`, { method: "POST", headers: guard })).json()) as { code: string };
+      const paired = await fetch(`http://127.0.0.1:${open.port}/api/devices/pair`, { method: "POST", headers: { ...guard, "x-forwarded-for": "100.64.0.9" }, body: JSON.stringify({ code, label: "Phone" }) });
+      const cookie = paired.headers.get("set-cookie")!.split(";")[0]!;
+      // the first use of the cookie confirms the pairing, which closes the gate for good
+      expect((await open.read({ cookie })).body.auth).toMatchObject({ authenticated: true, via: "device" });
+      const closed = (await open.read()).body;
+      expect(closed.security).toMatchObject({ pairing_gate: "closed", bind_scope: "other" });
+      expect(closed.lan_exposure).toBeUndefined();
+    } finally { open.stop(); }
+  });
+
+  it("anonymous health omits security", async () => {
+    const secured = serve({ token: SECRET, hostname: "0.0.0.0" });
+    try {
+      const anonymous: Record<string, string>[] = [{}, { authorization: "Bearer wrong" }, { "x-forwarded-for": "203.0.113.7", "tailscale-funnel-request": "?1" }];
+      for (const headers of anonymous) {
+        for (const scope of ["", "?scope=bridge"]) {
+          const answer = await secured.read(headers, scope);
+          expect(answer.body.auth.authenticated).toBe(false);
+          expect(answer.body.security).toBeUndefined();
+          for (const name of ["token_configured", "pairing_gate", "bind_scope", "observed_ingress", "public_exposure", "0.0.0.0"]) expect(answer.text).not.toContain(name);
+        }
+      }
+    } finally { secured.stop(); }
+  });
+
+  it("tells herdr-core's facts to a signed-in client only, and not on a bridge poll", async () => {
+    const secured = serve({ token: SECRET, hostname: "0.0.0.0" });
+    try {
+      const bearer = { authorization: `Bearer ${SECRET}` };
+      const signedIn = await secured.read(bearer);
+      expect(signedIn.body.auth.authenticated).toBe(true);
+      expect(signedIn.body.herdr_core).toEqual(CORE_FACTS);
+      expect((await secured.read(bearer, "?scope=bridge")).body.herdr_core).toBeUndefined();
+      const anonymous = await secured.read({});
+      expect(anonymous.body.auth.authenticated).toBe(false);
+      expect(anonymous.body.herdr_core).toBeUndefined();
+    } finally { secured.stop(); }
+  });
+
+  it("tells herdr-core's facts to a driving owner only: not a watching device, nor a caller on an open install", async () => {
+    let token = "";
+    const secured = serve({ token: SECRET, seed: (stateDir) => {
+      const store = new DeviceStore(stateDir);
+      token = store.pair(store.startPairing().code, "Watch", "watch")!.token;
+      store.match(token);
+    } });
+    try {
+      const watching = await secured.read({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20" });
+      expect(watching.body.auth).toMatchObject({ authenticated: true, role: "watch" });
+      expect(watching.body.herdr_core).toBeUndefined();
+      expect((await secured.read({ authorization: `Bearer ${SECRET}` })).body.herdr_core).toEqual(CORE_FACTS);
+    } finally { secured.stop(); }
+    const open = serve({ hostname: "0.0.0.0" });
+    try {
+      const stranger = await open.read({ "x-forwarded-for": "192.168.0.20" });
+      expect(stranger.body.auth).toMatchObject({ authenticated: true, via: "open" });
+      expect(stranger.body.herdr_core).toBeUndefined();
+      expect((await open.read({})).body.herdr_core).toEqual(CORE_FACTS);
+    } finally { open.stop(); }
+  });
+
+  it("watch can read but not change access", async () => {
+    let token = "";
+    const secured = serve({ token: SECRET, seed: (stateDir) => {
+      const store = new DeviceStore(stateDir);
+      token = store.pair(store.startPairing().code, "Watch", "watch")!.token;
+      store.match(token);
+    } });
+    try {
+      const cookie = `ovis_device=${token}`;
+      const answer = await secured.read({ cookie, "x-forwarded-for": "192.168.0.20" });
+      expect(answer.body.auth).toMatchObject({ authenticated: true, via: "device", role: "watch" });
+      expect(answer.body.security).toEqual({ token_configured: true, pairing_gate: "closed", bind_scope: "loopback", observed_ingress: "proxy", public_exposure: "unknown" });
+      // the facts change nothing: pairing, renaming and revoking stay refused to a watching device
+      const list = (await (await fetch(`http://127.0.0.1:${secured.port}/api/devices`, { headers: { cookie } })).json()) as { devices: Array<{ id: string }> };
+      const id = list.devices[0]!.id;
+      for (const [method, path] of [["POST", "pair/start"], ["PATCH", id], ["DELETE", id]] as const) {
+        const response = await fetch(`http://127.0.0.1:${secured.port}/api/devices/${path}`, { method, headers: { ...guard, cookie }, body: method === "DELETE" ? undefined : "{}" });
+        expect([method, response.status]).toEqual([method, 403]);
+      }
+      expect((await secured.read({ cookie })).body.security).toMatchObject({ pairing_gate: "closed" });
+    } finally { secured.stop(); }
+  });
+
+  it("corrupt registry is unavailable and gated", async () => {
+    const damaged = serve({ hostname: "0.0.0.0", seed: (stateDir) => writeFileSync(join(stateDir, "devices.json"), "{ not json") });
+    try {
+      const answer = await damaged.read();
+      expect(answer.body.security).toEqual({ token_configured: false, pairing_gate: "unavailable", bind_scope: "other", observed_ingress: "direct", public_exposure: "unknown" });
+      // a damaged registry is not a first installation: no open-LAN warning, and a stranger is refused
+      expect(answer.body.lan_exposure).toBeUndefined();
+      const stranger = await damaged.read({ "x-forwarded-for": "192.168.0.20" });
+      expect(stranger.body.auth).toMatchObject({ authenticated: false, reason: "pairing_required" });
+      expect(stranger.body.security).toBeUndefined();
+      expect(answer.text).not.toContain(damaged.stateDir);
+    } finally { damaged.stop(); }
+  });
+
+  it("auth via is not ingress", async () => {
+    const OWNER = "owner@example.com";
+    const bearer = { authorization: `Bearer ${SECRET}` };
+    const tailscaleShape = { ...bearer, "x-forwarded-for": "100.64.0.9", "tailscale-user-login": OWNER };
+    // the same token, three different ways in; Tailscale's header shape alone is no proof: any
+    // client on this PC can send it unless serve is declared the only ingress
+    const cases: Array<[boolean, Record<string, string>, SecuritySummary["observed_ingress"]]> = [
+      [false, bearer, "direct"],
+      [false, { ...bearer, "x-forwarded-for": "203.0.113.7" }, "proxy"],
+      [false, tailscaleShape, "unknown"],
+      [false, { ...bearer, "x-forwarded-for": "100.64.0.99", "tailscale-user-login": "unverified@example.test" }, "unknown"],
+      [true, tailscaleShape, "tailscale"],
+    ];
+    for (const [serveOnly, headers, ingress] of cases) {
+      const secured = serve({ token: SECRET, owner: OWNER, serveOnly });
+      try {
+        const body = (await secured.read(headers)).body;
+        expect(body.auth).toMatchObject({ authenticated: true, via: "token" });
+        expect([serveOnly, headers, body.security?.observed_ingress]).toEqual([serveOnly, headers, ingress]);
+      } finally { secured.stop(); }
+    }
+    // and a local sign-in is not "direct" because of its via: a rewritten Host is a proxy on this PC
+    const open = serve();
+    try {
+      const body = (await open.read({ host: "pc.example.com" })).body;
+      expect(body.auth).toMatchObject({ authenticated: true, via: "open" });
+      expect(body.security?.observed_ingress).toBe("proxy");
+    } finally { open.stop(); }
+  });
+
+  it("unknown proxy never means local only", async () => {
+    // a loopback bind behind some proxy on this PC: nothing proves where that proxy listens
+    const behind = serve();
+    try {
+      const answer = await behind.read({ "x-forwarded-for": "203.0.113.7", "x-forwarded-proto": "https" });
+      expect(answer.body.security).toEqual({ token_configured: false, pairing_gate: "open", bind_scope: "loopback", observed_ingress: "proxy", public_exposure: "unknown" });
+      expect(answer.body.lan_exposure).toBeUndefined();
+      // a Tailscale header nothing here could have written stays unknown, and so does exposure
+      const forged = await behind.read({ "x-forwarded-for": "203.0.113.7", "tailscale-user-login": "someone@example.com" });
+      expect(forged.body.security).toMatchObject({ observed_ingress: "unknown", public_exposure: "unknown" });
+    } finally { behind.stop(); }
+    // Funnel counts as public evidence only where serve is declared the only ingress
+    const funnelHeaders = { authorization: `Bearer ${SECRET}`, "x-forwarded-for": "203.0.113.7", "tailscale-funnel-request": "?1" };
+    const undeclared = serve({ token: SECRET, owner: "owner@example.com" });
+    try {
+      expect((await undeclared.read(funnelHeaders)).body.security).toMatchObject({ observed_ingress: "unknown", public_exposure: "unknown" });
+    } finally { undeclared.stop(); }
+    const declared = serve({ token: SECRET, owner: "owner@example.com", serveOnly: true });
+    try {
+      expect((await declared.read(funnelHeaders)).body.security).toMatchObject({ observed_ingress: "funnel", public_exposure: "observed" });
+    } finally { declared.stop(); }
+  });
+
+  it("bridge health does not require herdr", async () => {
+    const secured = serve({ token: SECRET });
+    const saved = process.env.HERDR_SOCKET;
+    const missing = join(secured.stateDir, "no-herdr.sock");
+    process.env.HERDR_SOCKET = missing;
+    try {
+      const bridge = await secured.read({ authorization: `Bearer ${SECRET}` }, "?scope=bridge");
+      expect(bridge.status).toBe(200);
+      expect(bridge.body.security).toEqual({ token_configured: true, pairing_gate: "open", bind_scope: "loopback", observed_ingress: "direct", public_exposure: "unknown" });
+      // the full answer needs herdr, and its failure carries no facts to be reused
+      const full = await secured.read({ authorization: `Bearer ${SECRET}` });
+      expect(full.status).not.toBe(200);
+      expect(full.body.security).toBeUndefined();
+      expect(full.text).not.toContain(SECRET);
+    } finally {
+      if (saved === undefined) delete process.env.HERDR_SOCKET; else process.env.HERDR_SOCKET = saved;
+      secured.stop();
     }
   });
 });

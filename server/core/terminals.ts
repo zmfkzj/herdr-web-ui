@@ -4,10 +4,11 @@
  * sent. The pane's agent conversation is watched while a client that shows the pane asks for it.
  */
 import type { ClientMessage, ServerMessage } from "../../shared/protocol.ts";
+import { RECEIPT_RESUME_ID } from "../../shared/receipt-resume.ts";
 import { ConversationMonitor } from "../conversation-monitor.ts";
 import { type SightingFacts, sightingFacts } from "../input-guard.ts";
 import { OUTPUT_HARD_BYTES, OUTPUT_HIGH_BYTES, OUTPUT_STALL_MS, OutputWindow, wireBytes } from "../output-window.ts";
-import { type Client, connectionOf, send } from "./connections.ts";
+import { backlog, type Client, connectionOf, send } from "./connections.ts";
 import { ATTACH_HELD_MESSAGE, createSpawnAttachment, type PaneAttachment } from "./terminal-process.ts";
 
 /** joins this close together share one repaint: a reconnect brings every tab back at once */
@@ -54,8 +55,8 @@ export function validGeometry(cols: unknown, rows: unknown): { cols: number; row
  * The server's terminals. `stopped` is read through a getter, as `stop()` sets it later, and `end`
  * is called through one, as the connections are built after the terminals.
  */
-export function createTerminalRegistry({ options, clients, stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending, holdPendingPane, attached, inputReady, end }: {
-  options: { codexHome?: string; devinDbPath?: string; opencodeDb?: string; hermesHome?: string; grokHome?: string };
+export function createTerminalRegistry({ options, clients, stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending, holdPendingPane, attached, transcriptChanged, inputReady, end }: {
+  options: { codexHome?: string; devinDbPath?: string; opencodeDb?: string; hermesHome?: string; grokHome?: string; museData?: string };
   clients: Set<Client>;
   stopped: () => boolean;
   terminalAttach: () => Promise<boolean>;
@@ -67,6 +68,8 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
   holdPendingPane: (paneId: string, fault: { code: string; message: string }) => void;
   /** a connection joined the pane's attachment: the pending messages queued for the pane are told to it, and may go through it */
   attached: (client: Client, paneId: string) => void;
+  /** a native transcript changed: reconcile Ovis-origin Pi receipts before notifying readers */
+  transcriptChanged?: (paneId: string) => void;
   /** the pane's terminal takes input again: a pending message waiting for a typist may go now */
   inputReady: (paneId: string) => void;
   end: (client: Client, reason: "stalled" | "revoked" | "closed") => void;
@@ -79,12 +82,13 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
   const retiringAttachments = new Map<string, Promise<void>>();
 
   const conversations = new ConversationMonitor((paneId, signature) => {
+    transcriptChanged?.(paneId);
     for (const client of clients) {
       if (!connectionOf(client).closing && client.readyState === WebSocket.OPEN && client.data.attached.has(paneId) && client.data.conversationInterests.has(paneId)) {
         send(client, { type: "conversation-changed", pane_id: paneId, signature });
       }
     }
-  }, options.codexHome, options.devinDbPath, options.opencodeDb, options.hermesHome, options.grokHome);
+  }, options.codexHome, options.devinDbPath, options.opencodeDb, options.hermesHome, options.grokHome, options.museData);
 
   function releaseConversation(paneId: string): void {
     for (const client of clients) {
@@ -99,7 +103,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     let paused = false;
     for (const client of attachment.clients) {
       const window = client.data.output.get(paneId);
-      const buffered = client.getBufferedAmount();
+      const buffered = backlog(client);
       if (window) {
         // an ACK client: measured by its ACK progress, and a joiner draining its replay never pauses the pty
         const verdict = window.check(buffered);
@@ -129,7 +133,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
   function sendOutput(client: Client, paneId: string, data: string, replay = false): void {
     const window = client.data.output.get(paneId);
     const bytes = Buffer.byteLength(data);
-    if ((window && window.pending + bytes > OUTPUT_HARD_BYTES) || client.getBufferedAmount() >= OUTPUT_HARD_BYTES) {
+    if ((window && window.pending + bytes > OUTPUT_HARD_BYTES) || backlog(client) >= OUTPUT_HARD_BYTES) {
       end(client, "stalled");
       return;
     }
@@ -155,6 +159,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     attachments.delete(paneId);
     clearTimeout(attachment.retry);
     clearTimeout(attachment.relookup);
+    clearTimeout(attachment.recovery);
     clearTimeout(attachment.repaint);
     // its members hold nothing on this pane any more (a pty that exited leaves them on
     // the "terminal ended" screen): a stale entry would read as a live claim in
@@ -207,6 +212,8 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     if (!attachment || attachment.kind === "mirror" || (attachment.cols === cols && attachment.rows === rows)) return;
     attachment.cols = cols;
     attachment.rows = rows;
+    attachment.resizes = (attachment.resizes ?? 0) + 1;
+    attachment.resizedTo = [...(attachment.resizedTo ?? []).slice(-15), `${cols}x${rows}`];
     attachment.process.resize(cols, rows);
     // herdr redraws the whole screen for a new size: a repaint still waiting would send it twice
     clearTimeout(attachment.repaint);
@@ -312,6 +319,8 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
       // neither can see a client that only joins the attachment afterwards
       const claim = client.data.attached.get(message.pane_id) ?? { keepSize: false };
       claim.keepSize = message.keep_size === true;
+      // An opaque, bounded presentation correlator only: never used by input guards.
+      if (typeof message.receipt_resume_id === "string" && RECEIPT_RESUME_ID.test(message.receipt_resume_id)) claim.receiptResumeId = message.receipt_resume_id;
       if (!client.data.attached.has(message.pane_id)) client.data.attached.set(message.pane_id, claim);
       let attachment: PaneAttachment;
       try {
@@ -352,7 +361,8 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
       // the attach-complete barrier queued input waits on
       if (!alreadyAttached && attachment.recovering) send(client, { type: "output-recovering", pane_id: message.pane_id });
       if (!alreadyAttached && replay) {
-        client.data.output.get(message.pane_id)?.join(replay, client.getBufferedAmount());
+        const ahead = backlog(client);
+        client.data.output.get(message.pane_id)?.join(replay, ahead, Date.now(), client.getBufferedAmount() - ahead);
         // marked as the screen from before: the client draws it but takes no new clipboard write from it
         sendOutput(client, message.pane_id, replay, true);
         // a tail that lost the stream's start may miss what was drawn once: herdr draws it again

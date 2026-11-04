@@ -1,10 +1,24 @@
 import { createContext, useContext, useMemo } from "react";
 import * as api from "./api.ts";
+import type { HerdrIdentity } from "../../shared/machines.ts";
 import type { CreateWorktreeRequest, OpenWorktreeRequest, PaneDirection, PluginActionRequest, RemoveWorktreeRequest, SessionHistoryAgent, SessionResumeRequest, SplitPaneDirection } from "../../shared/protocol.ts";
 import type { ZoomMode } from "./layoutMap.ts";
 import { ReorderCoordinator } from "./workspaceOrder.ts";
 export const MachineContext = createContext("local");
 export const useMachineId = () => useContext(MachineContext);
+/**
+ * True where the Herdr app's window owns the PC's workspaces, tabs and splits: its herdr is herdr-core
+ * (shared/machines.ts HerdrIdentity.runtime), which refuses to rename, reorder or move them, to split,
+ * swap, zoom or resize a pane, and the worktree actions. The components offer none of those there,
+ * as VS Code's `when` clauses leave a command out of its menus where it cannot run. App provides it
+ * per PC beside MachineContext (the selected PC, each half of the split view, each PC's sidebar);
+ * false outside App, as for herdr's own TUI server.
+ */
+export const AppLayoutContext = createContext(false);
+export const useAppLayout = () => useContext(AppLayoutContext);
+/** the value AppLayoutContext carries for a PC whose herdr is `herdr` (this PC's from /api/health, a remote PC's from its roster entry);
+ * a herdr not known yet (health still loading) offers none of the layout calls either, until it says it is herdr's TUI server */
+export const appLayoutOf = (herdr: HerdrIdentity | undefined): boolean => herdr === undefined || herdr.runtime === "herdr-core";
 /** App's workspace order for every PC (lib/workspaceOrder.ts); a Sidebar outside App gets its own */
 export const ReorderContext = createContext(new ReorderCoordinator());
 export const useReorderCoordinator = () => useContext(ReorderContext);
@@ -12,9 +26,9 @@ export const useReorderCoordinator = () => useContext(ReorderContext);
 export function useMachineApi() {
   const id = useMachineId();
   return useMemo(() => ({
-    fetchPaneTranscript: (pane: string, lines: number) => api.fetchPaneTranscript(pane, lines, id),
+    fetchPaneTranscript: (pane: string, lines: number, signal?: AbortSignal) => api.fetchPaneTranscript(pane, lines, id, signal),
     fetchPaneConversation: (pane: string, page?: api.ConversationPageQuery) => api.fetchPaneConversation(pane, id, page),
-    peekPaneConversation: (pane: string) => api.peekPaneConversation(pane, id),
+    peekPaneConversation: (pane: string, prompts?: number) => api.peekPaneConversation(pane, id, prompts),
     fetchPanePrompt: (pane: string) => api.fetchPanePrompt(pane, id),
     fetchPanePromptState: (pane: string) => api.fetchPanePromptState(pane, id),
     answerPanePrompt: (answer: Parameters<typeof api.answerPanePrompt>[0]) => api.answerPanePrompt(answer, id),
@@ -28,6 +42,7 @@ export function useMachineApi() {
     fetchPaneOmoActivity: (pane: string) => api.fetchPaneOmoActivity(pane, id),
     fetchPaneBackgroundAgent: (pane: string, agent: string) => api.fetchPaneBackgroundAgent(pane, agent, id),
     fetchPanePlan: (pane: string) => api.fetchPanePlan(pane, id),
+    fetchPaneArtifacts: (pane: string) => api.fetchPaneArtifacts(pane, id),
     closePane: (pane: string) => api.closePane(pane, id),
     focusPane: (pane: string) => api.focusPane(pane, id),
     closeWorkspace: (workspace: string, closeGroup = false) => api.closeWorkspace(workspace, id, closeGroup),
@@ -63,6 +78,7 @@ export function useMachineApi() {
     renameTab: (tab: string, label: string) => api.renameTab(tab, label, id),
     closeTab: (tab: string) => api.closeTab(tab, id),
     moveTab: (tab: string, index: number) => api.moveTab(tab, index, id),
+    moveTabToWorkspace: (tab: string, workspace: string) => api.moveTabToWorkspace(tab, workspace, id),
     fetchPluginActions: () => api.fetchPluginActions(id),
     runPluginAction: (request: PluginActionRequest) => api.runPluginAction(request, id),
     fetchPluginActionStatus: (pluginId: string, logId: string) => api.fetchPluginActionStatus(pluginId, logId, id),

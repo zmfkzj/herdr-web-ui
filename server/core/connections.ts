@@ -3,7 +3,6 @@
  * sent to it, the presence beat it sends, and how it ends. Only this module changes a connection's
  * authority, its observe processes and its closing.
  */
-import type { ServerWebSocket } from "bun";
 import type { ClientRole, ServerMessage } from "../../shared/protocol.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../../shared/terminal-flow.ts";
 import type { DeviceStore } from "../devices.ts";
@@ -15,6 +14,7 @@ import { OUTPUT_HARD_BYTES, type OutputWindow } from "../output-window.ts";
 import type { PendingInputs } from "../pending-input.ts";
 import { PaneWatch } from "../watch.ts";
 import type { GuiViews } from "./gui-view.ts";
+import type { TelemetryIngress, TelemetrySurface } from "../../shared/telemetry.ts";
 
 export interface SocketData {
   /** a private desktop socket: this PC's guacd tunnel, or a relay to another PC's bridge */
@@ -28,10 +28,20 @@ export interface SocketData {
   deviceId?: string;
   readOnly?: boolean;
   relay?: MachineRelay;
+  /** another Ovis server reading this PC with its bridge token: it gets snapshots whole and applies its own sidebar rows (#2160) */
+  bridge?: boolean;
+  /** the kind of screen the page said it runs on (`?surface=`), for the daily active message; absent when it named none, named
+   * no known kind (server/telemetry.ts visitSurface) or another server reads */
+  surface?: TelemetrySurface;
+  /** how the upgrade request reached this server (shared/telemetry.ts TELEMETRY_INGRESS), for the daily active message; absent
+   * where `surface` named no known kind, or another server reads */
+  ingress?: TelemetryIngress;
+  /** a visitor Portal signed in: the socket is closed after this many ms, and the page's reconnect meets Portal's sign-in again (server/portal.ts `recheckMs`) */
+  recheckMs?: number;
   /** this connection's id, told to its page in the first snapshot: a create request names it as its first message's typist */
   connectionId: string;
   /** A fresh claim per attach lifetime; deleting it invalidates queued terminal keys. */
-  attached: Map<string, { keepSize: boolean }>;
+  attached: Map<string, { keepSize: boolean; receiptResumeId?: string }>;
   conversationInterests: Set<string>;
   output: Map<string, OutputWindow>;
 }
@@ -45,6 +55,13 @@ interface ConnectionState {
   roles: number;
   watches: Map<string, PaneWatch>;
   unwatchDevice?: () => void;
+  recheck?: ReturnType<typeof setTimeout>;
+  /**
+   * One frame larger than the whole budget, not counted as a backlog while it drains (#2566): `ahead` is what
+   * is still queued up to its end, `frame` its size in the queue, `last` the queue as last seen. Whatever is
+   * sent after it queues behind it, and the queue drains in order.
+   */
+  excused?: { ahead: number; frame: number; last: number };
 }
 
 /** Keyed by the very `data` object the upgrade passed, which Bun hands to every handler of the connection. */
@@ -57,7 +74,7 @@ function stateOf(client: Client): ConnectionState {
 }
 
 /** The data for a connection's upgrade: it starts to interact unless its access is read-only. A private desktop's socket carries its `desktop`. */
-export function connectionData(fields: Pick<SocketData, "relay" | "binding" | "desktop" | "desktopRelease"> & { deviceId: string | undefined; readOnly: boolean }): SocketData {
+export function connectionData(fields: Pick<SocketData, "relay" | "binding" | "desktop" | "desktopRelease"> & { deviceId: string | undefined; readOnly: boolean; bridge?: boolean; surface?: TelemetrySurface; ingress?: TelemetryIngress; recheckMs?: number }): SocketData {
   const data: SocketData = { connectionId: crypto.randomUUID(), attached: new Map<string, { keepSize: boolean }>(), conversationInterests: new Set<string>(), output: new Map(), ...fields };
   states.set(data, { closing: false, revoked: false, mode: fields.readOnly ? "observe" : "interact", roles: 0, watches: new Map<string, PaneWatch>() });
   return data;
@@ -80,21 +97,61 @@ export function presenceOf(raw: string | Buffer): boolean | null {
   }
 }
 
-export type Client = ServerWebSocket<SocketData>;
+export interface SocketLike {
+  data: SocketData;
+  readonly readyState: number;
+  send(data: string): number;
+  getBufferedAmount(): number;
+  close(code?: number, reason?: string): void;
+}
+
+export type Client = SocketLike;
+
+/**
+ * The bytes queued for the client that count against its budget (OUTPUT_HARD_BYTES): all of them
+ * but what may be left of one frame larger than the budget, such as a large session's snapshot,
+ * which a client that keeps up still needs time to read (#2566).
+ */
+export function backlog(client: Client): number {
+  const state = stateOf(client);
+  const buffered = client.getBufferedAmount();
+  const excused = state.excused;
+  if (!excused) return buffered;
+  // what drained since it was last seen left from the front, up to that frame's end first
+  excused.ahead = Math.max(0, excused.ahead - Math.max(0, excused.last - buffered));
+  excused.last = buffered;
+  if (excused.ahead === 0) {
+    state.excused = undefined;
+    return buffered;
+  }
+  return buffered - Math.min(excused.frame, excused.ahead);
+}
 
 export function send(client: Client, message: ServerMessage): number {
-  if (stateOf(client).closing) return 0;
+  const state = stateOf(client);
+  if (state.closing) return 0;
   try {
     const encoded = JSON.stringify(message);
+    const bytes = Buffer.byteLength(encoded);
+    // A frame larger than the whole budget is sent while the backlog is within it, and excused
+    // while it drains; only one at a time, so a client holds at most one such frame past it.
+    const queued = backlog(client);
+    const oversized = bytes > OUTPUT_HARD_BYTES && queued <= OUTPUT_HARD_BYTES && !state.excused;
     // Include JSON escaping in the transport budget, before Bun could drop a
     // frame at its own cap. An overload close is explicit and never auto-replayed.
-    if (client.getBufferedAmount() + Buffer.byteLength(encoded) > OUTPUT_HARD_BYTES) {
+    if (queued + (oversized ? 0 : bytes) > OUTPUT_HARD_BYTES) {
       client.close(OUTPUT_STALLED_CLOSE_CODE, "terminal output transport stalled");
       return 0;
     }
     // -1 means ALREADY queued. Never retry that frame, or terminal bytes repeat.
     const result = client.send(encoded);
     if (result === 0) client.close(OUTPUT_STALLED_CLOSE_CODE, "output delivery failed");
+    else {
+      const after = client.getBufferedAmount();
+      // a frame sent after the excused one queues behind it: only its own bytes are new
+      if (oversized) state.excused = after > 0 ? { ahead: after, frame: Math.min(bytes, after), last: after } : undefined;
+      else if (state.excused) state.excused.last = after;
+    }
     return result;
   } catch {
     /* client vanished mid-send */
@@ -136,6 +193,8 @@ export function createConnections({ clients, present, pending, devices, detachCl
       state.unwatchDevice = devices.onRevoke(client.data.deviceId, () => end(client, "revoked"));
       if (state.revoked) return false;
     }
+    // a plain close: the page reconnects as after any other, and Portal decides whether it gets in
+    if (client.data.recheckMs !== undefined) state.recheck = setTimeout(() => client.close(1000, "Portal sign-in check"), client.data.recheckMs);
     return true;
   }
 
@@ -216,6 +275,7 @@ export function createConnections({ clients, present, pending, devices, detachCl
       }
       case "closed": {
         state.unwatchDevice?.();
+        clearTimeout(state.recheck);
         state.closing = true;
         present.delete(client);
         if (client.data.desktop) { client.data.desktopRelease?.(); return; }

@@ -1,13 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
-import { AmbiguousClaudeStore, claudeAttachArgs, claudeAttachedJob, claudeAttachSession, claudeForegroundSession, claudeJobSession, claudeProcessSession, claudeSessionTempDir, claudeStoreKey, claudeStoreOf, claudeProjectDir, claudeTranscriptFile, claudeRecordOnlyIn, configDirInPsLine, darwinProcess, forgetClaudeSessions, herdrLaunchSource, isClaudeProcess, paneClaudeSource, processClaudeConfigDir, processClaudeSource, procArgsEnvironment } from "./claude-store.ts";
+import { AmbiguousClaudeStore, claudeAttachArgs, claudeAttachedJob, claudeAttachSession, claudeForegroundSession, claudeJobSession, claudeProcessSession, claudeSessionTempDir, claudeStoreKey, claudeStoreOf, claudeProjectDir, claudeTranscriptFile, claudeRecordOnlyIn, configDirInPsLine, darwinProcess, forgetClaudeSessions, herdrLaunchSource, isClaudeProcess, paneClaudeSource, processClaudeConfigDir, processClaudeSource, processLaunchSource, procArgsEnvironment } from "./claude-store.ts";
+import { procStartTime } from "./darwin-process.ts";
 import type { ProcessRow } from "./windows-processes.ts";
 
 const NATIVE = process.platform === "linux" || process.platform === "darwin";
 const SESSION = "0b8e6f0e-8d3f-4c1a-9a53-6c2b7a1d9e42";
+
+describe("macOS kernel process start", () => {
+  it("keeps microseconds from the leading 64-bit Darwin timeval, not its padding", () => {
+    const answer = new Uint8Array(32).fill(0xff);
+    const view = new DataView(answer.buffer, 8, 16);
+    view.setBigInt64(0, 1792929600n, true);
+    view.setInt32(8, 1, true);
+    expect(procStartTime(answer.subarray(8, 24))).toBe(1792929600000001n);
+    view.setInt32(8, 2, true);
+    expect(procStartTime(answer.subarray(8, 24))).toBe(1792929600000002n);
+    expect(procStartTime(answer.subarray(8, 23))).toBeNull();
+    for (const micros of [-1, 1_000_000]) {
+      view.setInt32(8, micros, true);
+      expect(procStartTime(answer.subarray(8, 24))).toBeNull();
+    }
+    view.setInt32(8, 0, true);
+    view.setBigInt64(0, 0n, true);
+    expect(procStartTime(answer.subarray(8, 24))).toBeNull();
+  });
+
+  it.skipIf(process.platform !== "darwin")("reads a stable birth time for the live process from kern.proc.pid", () => {
+    const started = darwinProcess.startTime(process.pid);
+    expect(started).not.toBeNull();
+    expect(started! > 0n && started! <= BigInt(Date.now()) * 1000n).toBe(true);
+    expect(darwinProcess.startTime(process.pid)).toBe(started);
+    expect(darwinProcess.startTime(0)).toBeNull();
+  });
+});
 
 describe("isClaudeProcess", () => {
   it("knows the native build, whose process is titled Claude", () => {
@@ -145,6 +174,15 @@ describe("a claude attach pane's job (#1645)", () => {
     expect(claudeAttachArgs(["claude", "attach", "dc56"])).toEqual(first("dc56"));
     expect(claudeAttachArgs(["claude", "attach", "release notes"])).toEqual(first("release notes"));
     expect(claudeAttachArgs(["claude", "attach", "release", "notes"])).toEqual(first("release", false));
+    // debug options and --setting-sources after a name: Claude still reads it as a name (#1876)
+    for (const after of [["--debug"], ["-d"], ["--debug=api"], ["-d2e"], ["--debug-to-stderr", "--setting-sources", "user,project"], ["--setting-sources=user"]]) {
+      expect(claudeAttachArgs(["claude", "attach", "release", ...after])).toEqual(first("release"));
+    }
+    // anything else after it keeps the terminal, a debug value apart from its option too: Claude (2.1.311) takes it
+    // for an extra argument and looks no name up (#2125)
+    for (const after of [["--verbose"], ["--setting-sources"], ["-d", "api,hooks"], ["--debug", "api"], ["--debug", "api", "notes"], ["-d", "--verbose"], ["--model", "opus"]]) {
+      expect(claudeAttachArgs(["claude", "attach", "release", ...after])).toEqual(first("release", false));
+    }
     // root options before it, each with the values it takes
     expect(claudeAttachArgs(["claude", "--model", "opus", "attach", JOB])).toEqual(behind);
     expect(claudeAttachArgs(["claude", "--model=opus", "--dangerously-skip-permissions", "attach", JOB])).toEqual(behind);
@@ -398,14 +436,29 @@ describe("a claude attach pane's job (#1645)", () => {
     expect(await claudeAttachSession(dir, process.pid, ["claude", "--resume", SESSION])).toBeNull();
   });
 
+  // the test process stands in for the client; its own CLAUDE_CONFIG_DIR would name another store
+  it.skipIf(Boolean(process.env["CLAUDE_CONFIG_DIR"]))("pins queued input to the session of the job an attach client opened (#1876)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ovis-claude-attach-home-"));
+    roots.push(home);
+    const dir = join(home, ".claude");
+    job(dir, JOB, { sessionId: `${JOB}-6228-4376-a66c-ad9820b26f37`, resumeSessionId: SESSION });
+    const client = { pid: process.pid, name: "claude", argv0: "claude", argv: ["claude", "attach", JOB] };
+    expect(await claudeForegroundSession([client], home)).toBe(SESSION);
+    // a job with no session (a shell command) pins none, as does a client not alone in the pane
+    job(dir, JOB, { command: "sleep 100", sessionId: undefined });
+    expect(await claudeForegroundSession([client], home)).toBeNull();
+    expect(await claudeForegroundSession([client, { ...client, pid: process.pid + 1 }], home)).toBeNull();
+  });
+
   // CLAUDE_CODE_SESSION_KIND=bg makes Claude read no subcommand behind options: it runs an interactive Claude
   it.skipIf(!NATIVE)("reads `attach` behind options only from a client whose environment is no background session's", async () => {
     const dir = store();
     job(dir, JOB, { sessionId: SESSION });
     const behind = ["claude", "--model", "opus", "attach", JOB];
-    // the shell prints once it runs with the environment it was given, then waits on its input: no exec moves its environment
+    // a started user process stands for the client: macOS 27 hides a system binary's (/bin/sh's) environment.
+    // It prints once it runs with the environment it was given, then waits on its input
     const client = async (env: Record<string, string>) => {
-      const child = Bun.spawn(["/bin/sh", "-c", "echo ready; read line"], { env: { PATH: process.env["PATH"] ?? "", ...env }, stdin: "pipe", stdout: "pipe" });
+      const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); console.log('ready')"], { env: { PATH: process.env["PATH"] ?? "", ...env }, stdin: "pipe", stdout: "pipe" });
       const reader = child.stdout.getReader();
       await reader.read();
       reader.releaseLock();
@@ -597,6 +650,12 @@ describe("claudeTranscriptFile", () => {
       { type: "user", message: { content: "Newer prompt" } },
     ].map((entry) => JSON.stringify(entry)).join("\n"));
     expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
+    // a newer turn whose keys are escaped is a newer turn all the same (#2130)
+    writeFileSync(original, [
+      JSON.stringify({ type: "continued-in", sessionId: SESSION, continuedInSessionId: other }),
+      JSON.stringify({ type: "user", message: { content: "Newer prompt" } }).replace('"type"', '"\\u0074ype"'),
+    ].join("\n"));
+    expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
     writeFileSync(original, JSON.stringify({ type: "continued-in", sessionId: SESSION, continuedInSessionId: missing }));
     expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
   });
@@ -621,6 +680,10 @@ describe("claudeTranscriptFile", () => {
       resumed(folder);
       const job = join(folder, `${BG}.jsonl`);
       writeFileSync(job, JSON.stringify({ type: "user", message: { content: "real conversation prompt" } }));
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(job);
+      // the same records written with a space after each colon (#2130)
+      const original = join(folder, `${SESSION}.jsonl`);
+      writeFileSync(original, readFileSync(original, "utf8").replaceAll('":', '": '));
       expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(job);
     });
 
@@ -662,6 +725,158 @@ describe("claudeTranscriptFile", () => {
       expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
       writeFileSync(join(state, "state.json"), JSON.stringify({ linkScanPath: job }));
       expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(job);
+    });
+
+    it.skipIf(!NATIVE)("reads the job's state bounded, and no FIFO in its place, without blocking (#1876)", async () => {
+      const { home: dir, projects } = home();
+      const folder = join(projects, claudeProjectDir("/w/project"));
+      mkdirSync(folder, { recursive: true });
+      const original = resumed(folder);
+      const job = join(folder, `${BG}.jsonl`);
+      writeFileSync(job, "{}");
+      const state = join(dir, ".claude", "jobs", "8b80137e");
+      mkdirSync(state, { recursive: true });
+      // larger than a job's state: not read to agree
+      writeFileSync(join(state, "state.json"), JSON.stringify({ linkScanPath: job, output: "x".repeat(256 * 1024) }));
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
+      rmSync(join(state, "state.json"));
+      expect(Bun.spawnSync(["mkfifo", join(state, "state.json")]).exitCode).toBe(0);
+      const started = Date.now();
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"])).toBe(original);
+      expect(Date.now() - started).toBeLessThan(2000);
+    });
+  });
+
+  describe("a /branch (#2020)", () => {
+    const BRANCH = "09512ed9-5df9-4105-954e-6597a3119b75";
+    const DEEPER = "55555555-5555-4555-8555-555555555555";
+    const OTHER = "66666666-6666-4666-8666-666666666666";
+    /** What Claude Code 2.1.311 writes for /branch: the conversation so far, each record carrying the session it came from, then the new turns. */
+    const branched = (folder: string, id: string, from: string | null, prompt = "Reply with exactly the word ALPHA"): string => {
+      const path = join(folder, `${id}.jsonl`);
+      const forkedFrom = from === null ? {} : { forkedFrom: { sessionId: from, messageUuid: "e92def5e-231f-4b62-9766-8c9c44012d9b" } };
+      writeFileSync(path, [
+        { parentUuid: null, type: "user", message: { role: "user", content: prompt }, uuid: "e92def5e-231f-4b62-9766-8c9c44012d9b", sessionId: id, ...forkedFrom },
+        { type: "assistant", message: { content: [{ type: "text", text: "ALPHA" }] }, sessionId: id, ...forkedFrom },
+        { type: "system", subtype: "local_command", content: "<local-command-stdout>Branched conversation.</local-command-stdout>", sessionId: id },
+        { type: "user", message: { content: "Reply with exactly the word BRAVO" }, sessionId: id },
+      ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      return path;
+    };
+    const setup = () => {
+      const { home: dir, projects } = home();
+      const folder = join(projects, claudeProjectDir("/w/project"));
+      mkdirSync(folder, { recursive: true });
+      const original = branched(folder, SESSION, null);
+      return { dir, projects, folder, original };
+    };
+
+    it("takes the branch the process's PID record names over the session it was copied from (regression: fails on main)", async () => {
+      const { dir, folder } = setup();
+      const branch = branched(folder, BRANCH, SESSION);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], join(dir, ".claude"), BRANCH)).toBe(branch);
+      // a branch of that branch, as a second /branch writes it
+      const deeper = branched(folder, DEEPER, BRANCH);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], join(dir, ".claude"), DEEPER)).toBe(deeper);
+    });
+
+    it("keeps the reported session when the live one is no branch of it (control)", async () => {
+      const { dir, projects, folder, original } = setup();
+      const store = join(dir, ".claude");
+      // the same session, as after /resume back to it; or none known
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, SESSION)).toBe(original);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, null)).toBe(original);
+      // a session that was never branched, one branched from another session, and a branch in another project
+      branched(folder, OTHER, null);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, OTHER)).toBe(original);
+      branched(folder, BRANCH, OTHER);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+      mkdirSync(join(projects, "-elsewhere"));
+      branched(join(projects, "-elsewhere"), DEEPER, SESSION);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, DEEPER)).toBe(original);
+      // a live session with no transcript yet
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, "77777777-7777-4777-8777-777777777777")).toBe(original);
+    });
+
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("keeps the reported transcript when an unreadable project sits beside a live session with no file (regression)", async () => {
+      const { dir, projects, original } = setup();
+      const locked = join(projects, "-locked");
+      mkdirSync(locked);
+      chmodSync(locked, 0o000);
+      try {
+        expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], join(dir, ".claude"), "77777777-7777-4777-8777-777777777777")).toBe(original);
+      } finally { chmodSync(locked, 0o700); }
+    });
+
+    it("follows the very branch file it checked, not the same id in a project a cwd names first (#2118)", async () => {
+      const { dir, projects, folder } = setup();
+      const branch = branched(folder, BRANCH, SESSION);
+      mkdirSync(join(projects, claudeProjectDir("/w/first")));
+      branched(join(projects, claudeProjectDir("/w/first")), BRANCH, null);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/first", "/w/project"], join(dir, ".claude"), BRANCH)).toBe(branch);
+    });
+
+    it("follows a branch's continuation beside it, not the same id in a project a cwd names first (#2130)", async () => {
+      const { dir, projects, folder } = setup();
+      const CONTINUED = "88888888-8888-4888-8888-888888888888";
+      const branch = branched(folder, BRANCH, SESSION);
+      appendFileSync(branch, JSON.stringify({ type: "continued-in", sessionId: BRANCH, continuedInSessionId: CONTINUED }) + "\n");
+      const beside = branched(folder, CONTINUED, null);
+      mkdirSync(join(projects, claudeProjectDir("/w/first")));
+      branched(join(projects, claudeProjectDir("/w/first")), CONTINUED, null);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/first", "/w/project"], join(dir, ".claude"), BRANCH)).toBe(beside);
+      // control: a reported transcript that is no checked branch keeps looking its continuation up by cwd first
+      expect(await claudeTranscriptFile(dir, BRANCH, ["/w/first", "/w/project"], join(dir, ".claude")))
+        .toBe(join(projects, claudeProjectDir("/w/first"), `${CONTINUED}.jsonl`));
+    });
+
+    it("reads a first record whose keys are escaped as the record it is (#2130)", async () => {
+      const { dir, folder, original } = setup();
+      const path = join(folder, `${BRANCH}.jsonl`);
+      // the first user record names no parent; only a later one claims SESSION
+      const first = JSON.stringify({ type: "user", message: { content: "hi" }, sessionId: BRANCH }).replace('"type"', '"\\u0074ype"');
+      writeFileSync(path, `${first}\n${JSON.stringify({ type: "user", message: { content: "again" }, sessionId: BRANCH, forkedFrom: { sessionId: SESSION } })}\n`);
+      expect(JSON.parse(first).type).toBe("user"); // control: the record is a user record
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], join(dir, ".claude"), BRANCH)).toBe(original);
+    });
+
+    it("takes the branch's parent only from its own first conversation record (#2118)", async () => {
+      const { dir, folder, original } = setup();
+      const store = join(dir, ".claude");
+      const path = join(folder, `${BRANCH}.jsonl`);
+      const write = (...entries: Record<string, unknown>[]) => writeFileSync(path, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      // metadata before the conversation names the parent; the conversation does not
+      write({ type: "file-history-snapshot", forkedFrom: { sessionId: SESSION } }, { type: "user", message: { content: "hi" }, sessionId: BRANCH });
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+      // a first record of another session's
+      forgetClaudeSessions();
+      write({ type: "user", message: { content: "hi" }, sessionId: OTHER, forkedFrom: { sessionId: SESSION } });
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+    });
+
+    it("reads a branch's head again once it was written afresh in the same file (#2118)", async () => {
+      const { dir, folder, original } = setup();
+      const store = join(dir, ".claude");
+      const branch = branched(folder, BRANCH, OTHER);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+      // the same inode, written again from the start
+      branched(folder, BRANCH, SESSION, "Reply with exactly the word ALPHA, again");
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(branch);
+    });
+
+    it("follows no branch whose first record is not all written, or not within the bytes it reads (control)", async () => {
+      const { dir, folder, original } = setup();
+      const store = join(dir, ".claude");
+      const branch = join(folder, `${BRANCH}.jsonl`);
+      const record = JSON.stringify({ type: "user", message: { content: "Prompt" }, sessionId: BRANCH, forkedFrom: { sessionId: SESSION } });
+      writeFileSync(branch, record);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+      // a first prompt larger than the read: its forkedFrom comes after the message
+      branched(folder, BRANCH, SESSION, "x".repeat(1024 * 1024 + 1));
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(original);
+      // once the line is whole, it is followed
+      writeFileSync(branch, `${record}\n`);
+      expect(await claudeTranscriptFile(dir, SESSION, ["/w/project"], store, BRANCH)).toBe(branch);
     });
   });
 
@@ -797,6 +1012,26 @@ describe("a Claude process's store source", () => {
     expect(await herdrLaunchSource(join(root, "nobody.sock"))).toEqual({ state: "unreadable" });
   });
 
+  it("herdr-core's launch source is its core process's environment, not this server's", async () => {
+    // a stand-in /proc: the core's environment exports a store, this server's does not
+    const proc = tempDir();
+    const store = tempDir();
+    mkdirSync(join(proc, "41"));
+    writeFileSync(join(proc, "41", "environ"), `PATH=/usr/bin\0CLAUDE_CONFIG_DIR=${store}\0`);
+    mkdirSync(join(proc, "42"));
+    writeFileSync(join(proc, "42", "environ"), "PATH=/usr/bin\0");
+    expect(await processLaunchSource(41, "linux", proc, {})).toEqual({ state: "override", dir: store });
+    expect(await processLaunchSource(42, "linux", proc, { CLAUDE_CONFIG_DIR: store })).toEqual({ state: "absent" });
+    // the core gone: no proof
+    expect(await processLaunchSource(43, "linux", proc, {})).toEqual({ state: "unreadable" });
+    // macOS reads the core's own environment too, not this server's
+    const environment = spyOn(darwinProcess, "environment").mockImplementation((pid: number) => pid === 41 ? `CLAUDE_CONFIG_DIR=${store}\0` : null);
+    try {
+      expect(await processLaunchSource(41, "darwin", proc, {})).toEqual({ state: "override", dir: store });
+      expect(await processLaunchSource(43, "darwin", proc, { CLAUDE_CONFIG_DIR: store })).toEqual({ state: "unreadable" });
+    } finally { environment.mockRestore(); }
+  });
+
   it("macOS and Windows take the bridge server's own environment for the one a new tab inherits", async () => {
     // herdr's environment cannot be found there: none exported to the bridge is none for the new tab
     const store = tempDir();
@@ -845,6 +1080,25 @@ describe("a Claude process's store source", () => {
     const home = tempDir();
     expect((await claudeStoreOf(null, home, {}))?.env).toBeNull();
     expect((await claudeStoreOf(null, home, { CLAUDE_CONFIG_DIR: join(home, "server-store") }))?.env).toEqual({ CLAUDE_CONFIG_DIR: join(home, "server-store") });
+  });
+
+  it("finds the server's default store under USERPROFILE when HOME is unset, as native Windows starts it", async () => {
+    const profile = tempDir();
+    const before = { home: process.env["HOME"], profile: process.env["USERPROFILE"] };
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    delete process.env["HOME"];
+    process.env["USERPROFILE"] = profile;
+    try {
+      // elsewhere USERPROFILE means nothing: the store stays where it was without HOME
+      Object.defineProperty(process, "platform", { value: "linux" });
+      expect((await claudeStoreOf(null, undefined, {}))?.dir).toBe(".claude");
+      Object.defineProperty(process, "platform", { value: "win32" });
+      expect((await claudeStoreOf(null, undefined, {}))?.dir).toBe(join(profile, ".claude"));
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      if (before.home === undefined) delete process.env["HOME"]; else process.env["HOME"] = before.home;
+      if (before.profile === undefined) delete process.env["USERPROFILE"]; else process.env["USERPROFILE"] = before.profile;
+    }
   });
 
   it("implicit and explicit default store routes remain distinct", async () => {

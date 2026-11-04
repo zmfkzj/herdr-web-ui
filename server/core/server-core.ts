@@ -9,14 +9,17 @@
  * calls one made after it gets a same-named wrapper (`end`, `holdPending`, `authorizeSocket`, …). The server
  * listens once this returns, and calls `start` after that.
  */
+import type { WebSocketHandler } from "bun";
+import type { SessionSnapshot } from "../../shared/protocol.ts";
 import type { DeviceStore } from "../devices.ts";
 import { ping } from "../herdr/client.ts";
+import { servingCore } from "../herdr-core/runtime.ts";
 import type { PreferenceStore } from "../preferences.ts";
 import { attachableIdentity, sidecarAvailable } from "../pty/sidecar.ts";
 import type { UsageLoginService } from "../usage-login.ts";
 import type { UsageService } from "../usage.ts";
 import { createSubmitText } from "./composer.ts";
-import { type Client, createConnections } from "./connections.ts";
+import { type Client, createConnections, type SocketData } from "./connections.ts";
 import { createInputLane } from "./input.ts";
 import { createGuiViews, type GuiViewOptions } from "./gui-view.ts";
 import { createPendingDelivery } from "./pending.ts";
@@ -36,13 +39,15 @@ type CoreOptions = Parameters<typeof createTerminalRegistry>[0]["options"] & Par
     attachHoldMs?: number;
   };
 
-export function createCore({ options, devices, preferences, usage, usageLogin, visual, TYPED_SETTLE_MS, KEY_SETTLE_MS, SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS }: {
+export function createCore({ options, devices, preferences, usage, usageLogin, browserSnapshot, visual, TYPED_SETTLE_MS, KEY_SETTLE_MS, SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS }: {
   options: CoreOptions;
   devices: DeviceStore;
   /** the shared preferences (server/preferences.ts): the status hub's web push reads the muted panes from it */
   preferences: PreferenceStore;
   usage: UsageService;
   usageLogin: UsageLoginService;
+  /** a snapshot as a browser's /ws is told it (server/herdr-sidebar.ts snapshotWithoutHiddenTokens); a bridge connection gets it whole */
+  browserSnapshot: (snapshot: SessionSnapshot) => SessionSnapshot;
   /** the Pi visual tools (server/pi-visual): `/gui view` grants (gui-view.ts), and a pane's end, before its pending messages are held */
   visual?: GuiViewOptions & { paneEnded: (paneId: string) => void };
   TYPED_SETTLE_MS: number;
@@ -71,18 +76,18 @@ export function createCore({ options, devices, preferences, usage, usageLogin, v
   const present = new Set<Client>();
   let stopped = false;
   const gui = createGuiViews({ clients, visual });
-  const { attachments, conversations, reconcileOutput, closeAttachment, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames } = createTerminalRegistry({ options, clients, stopped: () => stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending: (owner, paneId) => holdPending(owner, paneId), holdPendingPane: (paneId, fault) => holdPendingPane(paneId, fault), attached: (client, paneId) => attached(client, paneId), inputReady: (paneId) => drainPending(paneId), end: (client, reason) => end(client, reason) });
+  const { attachments, conversations, reconcileOutput, closeAttachment, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames } = createTerminalRegistry({ options, clients, stopped: () => stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending: (owner, paneId) => holdPending(owner, paneId), holdPendingPane: (paneId, fault) => holdPendingPane(paneId, fault), attached: (client, paneId) => attached(client, paneId), transcriptChanged: (paneId) => reconcilePiDeliveries(paneId), inputReady: (paneId) => drainPending(paneId), end: (client, reason) => end(client, reason) });
 
   const { serialize, lastTyped, inputFrames } = createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight, poke, terminalAttach, terminalAttachKnown: () => terminalAttachKnown, mayType: (client) => mayType(client), authorizeSocket: (client) => authorizeSocket(client), gui });
 
   const submitText = createSubmitText({ options, lastTyped, attachments, terminalAttach, SUBMIT_DEADLINE_MS, TYPED_SETTLE_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS, SUBMIT_DELAY_MS });
 
-  const { pending, holdPending, holdPendingPane, drainPending, pendingFrames, queueFirstMessage, attached, closeConnection } = createPendingDelivery({ options, clients, attachments, sight, serialize, lastTyped, submitText, authorizeSocket: (client) => authorizeSocket(client), clientSnapshot: () => clientSnapshot(), omo: { sessionOf: (paneId) => omo.sessionOf(paneId) }, gui, SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, TYPED_SETTLE_MS });
+  const { pending, holdPending, holdPendingPane, drainPending, pendingFrames, queueFirstMessage, attached, closeConnection, reconcilePiDeliveries } = createPendingDelivery({ options, clients, attachments, sight, serialize, lastTyped, submitText, authorizeSocket: (client) => authorizeSocket(client), clientSnapshot: () => clientSnapshot(), omo: { sessionOf: (paneId) => omo.sessionOf(paneId) }, gui, queueHeld: (paneId) => queueHeld(paneId), SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, TYPED_SETTLE_MS });
 
   const { mayType, authorizeSocket, admit, setRole, watchPane, unwatchPane, killWatches, end } = createConnections({ clients, present, pending: { close: closeConnection }, devices, detachClaimed, dropClaims, gui });
-  const { push, omo, gjc, claudeAgents, plans, clientSnapshot, countVisit, machines, broadcastAll, logPushError, collector, waitTimer } = createStatusHub({ options, devices, preferences, clients, present, pending, drainPending, holdPendingPane, usage, usageLogin, ...(visual ? { paneEnded: visual.paneEnded } : {}) });
-  const websocket = createSocket({
-    clients, present, stopped: () => stopped, admit, setRole, watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, countVisit, drainOutput,
+  const { push, omo, gjc, claudeAgents, opencodeAgents, plans, clientSnapshot, currentHerdrLifetime, queueHeld, countVisit, machines, broadcastAll, logPushError, collector, waitTimer } = createStatusHub({ options, devices, preferences, clients, present, pending, drainPending, holdPendingPane, usage, usageLogin, ...(visual ? { paneEnded: visual.paneEnded } : {}) });
+  const socketHandlers = createSocket({
+    clients, present, stopped: () => stopped, admit, setRole, watchable: () => !servingCore(), watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, herdrLifetime: currentHerdrLifetime, browserSnapshot, countVisit, drainOutput,
     // each frame type by name, with the handler of the module that owns it: anything else on a frame object never
     // becomes a frame a client can send, and a type named twice fails the build instead of replacing a handler
     frames: {
@@ -101,10 +106,19 @@ export function createCore({ options, devices, preferences, usage, usageLogin, v
       "pending-action": pendingFrames["pending-action"],
     },
   });
+  const websocket: WebSocketHandler<SocketData> = {
+    ...socketHandlers,
+    open: (ws) => socketHandlers.open(ws),
+    message: (ws, message) => socketHandlers.message(ws, message),
+    close: (ws, code, reason) => socketHandlers.close(ws, code, reason),
+    drain: (ws) => socketHandlers.drain(ws),
+  };
   let outputTimer: ReturnType<typeof setInterval> | undefined;
 
   return {
-    sidecar, serialize, push, logPushError, omo, claudeAgents, plans, clientSnapshot, machines, broadcastAll, collector, websocket, queueFirstMessage,
+    sidecar, serialize, push, logPushError, omo, claudeAgents, opencodeAgents, plans, clientSnapshot, machines, broadcastAll, collector, websocket, queueFirstMessage,
+    // The relay uses these same handlers with a SocketLike; websocket above remains Bun's boundary.
+    socketHandlers,
     /** once the server listens */
     start(): void {
       // ACKs can stop arriving entirely (a suspended tab). Bound the pause even then.
@@ -124,6 +138,7 @@ export function createCore({ options, devices, preferences, usage, usageLogin, v
       omo.stop();
       gjc.stop();
       claudeAgents.stop();
+      opencodeAgents.stop();
       clearInterval(waitTimer);
       plans.stop();
       machines?.stop();

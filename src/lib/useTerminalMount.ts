@@ -9,29 +9,34 @@ import { clipboardKey, hasModifiers, physicalKey, terminalChord, navigationSeque
 import { EMPTY_DRAFT, applyToDraft, draftIsEmpty, type InputDraft } from "./draft.ts";
 import { pendingMessages } from "./pendingMessages.ts";
 import { FrameGate } from "./inputRow.ts";
-import { AttachmentTooLargeError, assertAttachable, fetchPaneScroll, fetchPaneSelection, scrollPane } from "./api.ts";
+import { AttachmentTooLargeError, assertAttachable, fetchPaneConversation, fetchPaneScroll, fetchPaneSelection, scrollPane } from "./api.ts";
 import { parseOsc52 } from "./osc52.ts";
 import { matchHerdrWidths } from "./terminalWidths.ts";
+import { unwrapAgentRows } from "./agentCopy.ts";
 import { paneStorageId } from "../../shared/machines.ts";
 import { secretPrompt } from "../../shared/secret-prompt.ts";
 import type { ClientRole, ServerMessage } from "../../shared/protocol.ts";
 import { terminalTheme, type Palette, type ResolvedTheme, type Settings } from "./settings.ts";
-import { TERMINAL_FONT_STACK } from "./fontFamily.ts";
+import { measurableFontStack, openingFontStack, TERMINAL_FONT_STACK } from "./fontFamily.ts";
 import type { Translate } from "./i18n.ts";
-import { isAppShortcut } from "./shortcuts.ts";
+import { isAppShortcut, isMacPlatform } from "./shortcuts.ts";
 import { keyboardHoldsGrid, keyboardUp } from "./keyboard.ts";
-import { fileUriPath, hyperlinkFilter, isWebLink, openWebLink, terminalFileLinkProvider } from "./terminalFileLinks.ts";
+import { fileUriPath } from "../../shared/fileUri.ts";
+import { bareNameLinks, hyperlinkFilter, isWebLink, openWebLink, terminalFileLinkProvider, terminalFileLinks } from "./terminalFileLinks.ts";
+import { shouldOpenWebPage } from "./webPanel.ts";
 import { adjustTerminalGlyphs } from "./terminalGlyphs.ts";
+import { fitLineHeight } from "./terminalLineHeight.ts";
 import { keepDeleteRepeatText, keyboardNeedsText, restoreDeleteRepeatCaret } from "./deleteRepeat.ts";
 import { pinchFontSize } from "./pinchFontSize.ts";
 import { narrowPaneFontSize } from "./narrowPaneFont.ts";
 import { finalStep, HERDR_MOUSE_SCROLL_LINES, wheelSteps } from "./wheelSteps.ts";
 import { createTouchWheelPacer } from "./touchWheelPacer.ts";
 import { attachTerminalWheel, canPanTerminalGrid } from "./terminalWheel.ts";
+import { createTerminalFold, hyperlinkAt, wideGridKey, wideGrids } from "./terminalFold.ts";
 import { visibleTerminalInputBounds } from "./terminalViewport.ts";
 import type { PaneSubmitRetention } from "./paneSubmitRetention.ts";
 import type { ShortcutOverrides } from "./shortcutBindings.ts";
-import { RESIZE_SETTLE_MS, RELEASE_AFTER_MS, inUse, connectedSockets, plainError } from "./paneTerminalShared.ts";
+import { RESIZE_SETTLE_MS, RELEASE_AFTER_MS, IDLE_RELEASE_MS, RESUME_INPUT_WAIT_MS, VIEW_BUFFER_MAX, afterSwitch, dropViewChange, holdViews, inUse, connectedSockets, plainError, releaseViews } from "./paneTerminalShared.ts";
 import { copyOnSelect, herdrUiKnown, loadHerdrUi } from "./herdrUi.ts";
 import { TerminalImageLayer, terminalImageSource } from "./terminalImages.ts";
 import type { TypedGuiView } from "../../shared/pi-visual.ts";
@@ -42,11 +47,18 @@ import type { TypedGuiView } from "../../shared/pi-visual.ts";
  */
 declare const __HERDR_TEST_HOOKS__: boolean;
 
+/** One piece of typing for the pane: `keys` for a chord or an arrow herdr encodes, else `input` as typed. */
+type Typed = { input: string; keys: string[] | null; chord: boolean; stop: boolean; secret: boolean };
+
 export interface TerminalMountDeps {
   activeRef: RefObject<boolean>;
+  /** the pane's agent as herdr reports it: OpenCode takes a plain drag itself */
+  agentRef: RefObject<string | null>;
   barKeyRef: RefObject<{ key: string; chord: string | null; } | null>;
   baseFontRef: RefObject<number>;
+  pinchingRef: RefObject<boolean>;
   cachedRef: RefObject<boolean>;
+  watchedRef: RefObject<boolean>;
   cachedReleaseRef: RefObject<boolean>;
   cancelLeaveRef: RefObject<() => void>;
   cancelTouchRef: RefObject<() => void>;
@@ -75,11 +87,14 @@ export interface TerminalMountDeps {
   hostRef: RefObject<HTMLDivElement | null>;
   hyperlinksRef: RefObject<ReturnType<typeof hyperlinkFilter>>;
   keyboardHoldsRef: RefObject<(force: boolean) => boolean>;
+  keyboardToggleFocusRef: RefObject<boolean>;
   leaveRef: RefObject<() => void>;
   lineScroll: RefObject<((lines: number) => void) | null>;
   machineId: string;
   machineSessions: MachineSessionRegistry | null;
   mirroredRef: RefObject<boolean | null>;
+  /** a grid this browser does not size, wider than the screen, is drawn folded to it (Settings.terminalMirrorWrap) */
+  mirrorWrapRef: RefObject<boolean>;
   modifiersRef: RefObject<StickyModifiers>;
   modifyOtherKeysRef: RefObject<number>;
   narrowFontRef: RefObject<boolean>;
@@ -106,6 +121,10 @@ export interface TerminalMountDeps {
   reattachRef: RefObject<() => void>;
   redrawGreeting: () => void;
   releaseAwayRef: RefObject<boolean>;
+  /** the setting lets go of a pane in use after a quiet spell, and its grid is what is typed into (no input line) */
+  idleReleaseRef: RefObject<boolean>;
+  /** whether the pane was let go of for idleness: the banner says how to take it back */
+  setIdleView: (next: boolean) => void;
   releaseRef: RefObject<() => void>;
   releasedRef: RefObject<boolean>;
   retireOutputRef: RefObject<() => void>;
@@ -139,6 +158,8 @@ export interface TerminalMountDeps {
   openGuiViewRef: RefObject<(pane: string, view: TypedGuiView) => void>;
   setUnsupported: Dispatch<SetStateAction<boolean>>;
   setWatching: (next: boolean) => void;
+  /** shows the view-only banner for a view a hidden page starts only once it is shown (false: as `watching` says) */
+  setViewHeld: (held: boolean) => void;
   sharedGridRef: RefObject<{ cols: number; rows: number; } | null>;
   shortcutSettings: RefObject<ShortcutOverrides>;
   shownRef: RefObject<boolean>;
@@ -160,7 +181,7 @@ export interface TerminalMountDeps {
 }
 
 export function useTerminalMount(deps: TerminalMountDeps): void {
-  const { activeRef, barKeyRef, baseFontRef, cachedRef, cachedReleaseRef, cancelLeaveRef, cancelTouchRef, chatMountedRef, chatOutputRef, chatViewRef, clearModifiers, clipboardTimerRef, coarseRef, commitPendingText, composingRef, compositionCommitPendingRef, deferAttachRef, draftHeldForRef, draftPaneRef, endedRef, findOpenRef, fitRef, fittedRef, fixedGridRef, followCursorRef, followRef, frameGateRef, heldRef, hostRef, hyperlinksRef, imagesRef, keyboardHoldsRef, leaveRef, lineScroll, machineId, machineSessions, mirroredRef, modifiersRef, modifyOtherKeysRef, narrowFontRef, noteClipboard, observeRef, onChatSuggestion, onInputRowFrameRef, onRoleAckRef, onServerMessageRef, openFileRef, openGuiViewRef, openWebRef, osc52AllowedRef, outputTargetRef, palette, paneRef, pendingEpochRef, pendingScopeRef, pendingSubmissionsRef, pinchBadgeRef, pinchStatusRef, presentationRef, presentedRef, reassertIfStaleRef, reattachRef, redrawGreeting, releaseAwayRef, releaseRef, releasedRef, retireOutputRef, secretRef, sessionRef, setChatInvalidation, setChatRefresh, setChatSent, setComposing, setConnected, setConnectedBefore, setConversationPushes, setDraft, setEnded, setHeld, setInputError, setInputReady, setObserving, setOutputError, setOutputReady, setParsedTarget, setReleased, setSecret, setSelectionQuote, setTerminal, setTerminalImage, setUnsupported, setWatching, sharedGridRef, shortcutSettings, shownRef, sizesPty, socketRef, stackRef, stalledRef, stopKeyRef, submitRetention, t, tRef, termRef, terminalFontSize, theme, updateSettings, uploadFileRef, watchingRef, wheelStateRef } = deps;
+  const { activeRef, agentRef, barKeyRef, baseFontRef, pinchingRef, cachedRef, watchedRef, cachedReleaseRef, cancelLeaveRef, cancelTouchRef, chatMountedRef, chatOutputRef, chatViewRef, clearModifiers, clipboardTimerRef, coarseRef, commitPendingText, composingRef, compositionCommitPendingRef, deferAttachRef, draftHeldForRef, draftPaneRef, endedRef, findOpenRef, fitRef, fittedRef, fixedGridRef, followCursorRef, followRef, frameGateRef, heldRef, hostRef, hyperlinksRef, keyboardHoldsRef, keyboardToggleFocusRef, leaveRef, lineScroll, machineId, machineSessions, mirroredRef, mirrorWrapRef, modifiersRef, modifyOtherKeysRef, narrowFontRef, noteClipboard, observeRef, onChatSuggestion, onInputRowFrameRef, onRoleAckRef, onServerMessageRef, openFileRef, openWebRef, osc52AllowedRef, outputTargetRef, palette, paneRef, pendingEpochRef, pendingScopeRef, pendingSubmissionsRef, pinchBadgeRef, pinchStatusRef, presentationRef, presentedRef, reassertIfStaleRef, reattachRef, redrawGreeting, releaseAwayRef, idleReleaseRef, setIdleView, releaseRef, releasedRef, retireOutputRef, secretRef, sessionRef, setChatInvalidation, setChatRefresh, setChatSent, setComposing, setConnected, setConnectedBefore, setConversationPushes, setDraft, setEnded, setHeld, setInputError, setInputReady, setObserving, setOutputError, setOutputReady, setParsedTarget, setReleased, setSecret, setSelectionQuote, setTerminal, setUnsupported, setViewHeld, setWatching, sharedGridRef, shortcutSettings, shownRef, sizesPty, socketRef, stackRef, stalledRef, stopKeyRef, submitRetention, t, tRef, termRef, terminalFontSize, theme, updateSettings, uploadFileRef, watchingRef, wheelStateRef, imagesRef, openGuiViewRef, setTerminalImage } = deps;
 
     // Where this terminal is: its pane, and whether it is active, presented, shown and not the chat view.
     // Counted on every commit that changes it: an explicit copy still waiting for herdr's text is
@@ -182,6 +203,15 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       // xterm activates a link whenever a press and its release land on it: a drag that selects
       // part of a path and a right click do too, and neither means "open this"
       const linkPressed = (event: MouseEvent): boolean => event.button === 0 && !term.hasSelection();
+      const shouldOpenInPanel = (event: MouseEvent, uri: string): boolean =>
+        shouldOpenWebPage(event, uri, (target, shiftKey) => openWebRef.current?.(target, shiftKey) ?? false, machineId);
+      // an OSC 8 hyperlink's target: a file opens in the viewer, an http(s) address as a web link, and nothing else
+      const openHyperlink = (event: MouseEvent, uri: string): void => {
+        if (!linkPressed(event)) return;
+        const path = fileUriPath(uri);
+        if (path !== null) openFileRef.current?.(path);
+        else if (isWebLink(uri) && !shouldOpenInPanel(event, uri)) openWebLink(uri);
+      };
       const term = new Terminal({
         convertEol: false,
         // a program's own DECSCUSR still changes the cursor
@@ -194,25 +224,21 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         scrollback: 0,
         allowProposedApi: true,
         fontSize: terminalFontSize,
-        // a chosen family follows in the font effect below, once its faces have loaded
-        fontFamily: TERMINAL_FONT_STACK,
+        // a chosen family, and the bundled Latin face, follow in the font effect once their faces have loaded
+        fontFamily: measurableFontStack(openingFontStack(TERMINAL_FONT_STACK)),
         theme: terminalTheme(theme, palette),
         // a program's own colors suit one background (Claude Code's question titles are #ffffff, near
         // 1:1 on a light palette): xterm moves a foreground under 4.5:1 toward black or white. Dim text
         // needs half that, and box, block and powerline glyphs keep their color.
         minimumContrastRatio: 4.5,
         linkHandler: {
-          activate: (event, uri) => {
-            if (!linkPressed(event)) return;
-            const path = fileUriPath(uri);
-            if (path !== null) openFileRef.current?.(path);
-            else if (isWebLink(uri) && !openWebRef.current(uri, event.shiftKey)) openWebLink(uri);
-          },
+          activate: openHyperlink,
           allowNonHttpProtocols: true,
         },
         // Option+drag selects on macOS, as Shift+drag does elsewhere; a plain drag is forced below
         macOptionClickForcesSelection: true,
       });
+      fitLineHeight(term);
       const fit = new FitAddon();
       // Every fit first settles the font: a split pane under 80 columns draws smaller to reach
       // them (btop refuses a narrower screen), and returns to the user's size once it is wide enough.
@@ -229,13 +255,18 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         };
         // a grid this client does not drive gains no columns from a smaller font
         term.options.fontSize = narrowFontRef.current && !observeRef.current && !fixedGridRef.current ? narrowPaneFontSize(base, colsAt) : base;
+        fitLineHeight(term);
         fitGrid();
       };
       term.loadAddon(fit);
       matchHerdrWidths(term);
       // the same policy as the linkHandler above: an http(s) address or nothing (S10)
-      term.loadAddon(new WebLinksAddon((event, uri) => { if (isWebLink(uri) && !openWebRef.current(uri, event.shiftKey)) openWebLink(uri); }));
-      term.registerLinkProvider(terminalFileLinkProvider(() => term.buffer.active, (path, event) => { if (linkPressed(event)) openFileRef.current?.(path); }));
+      term.loadAddon(new WebLinksAddon((event, uri) => { if (isWebLink(uri) && !shouldOpenInPanel(event, uri)) openWebLink(uri); }));
+      // a bare file name (`design.md`) is a link only under Cmd (Ctrl off a Mac), drawn as the key goes down
+      const bareLinks = bareNameLinks(isMacPlatform());
+      const onLinkKey = (event: KeyboardEvent | MouseEvent): void => bareLinks.update(event);
+      const offLinkKey = (): void => bareLinks.reset();
+      term.registerLinkProvider(terminalFileLinkProvider(() => term.buffer.active, (path, event) => { if (linkPressed(event)) openFileRef.current?.(path); }, bareLinks));
       term.open(host);
       // pi images the images extension marks, asked of this PC for the pane shown now and the pi
       // session the marker names; the server checks both and the picture's digest. A marker of a
@@ -406,29 +437,89 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       /** a fit the keyboard held back was to re-assert the grid (force): the catch-up fit does so */
       let heldForce = false;
       let panned = false;
+      // A grid wider than the screen that this browser does not size is drawn folded to its width
+      // (lib/terminalFold.ts): a mirror (a Windows PC's pane keeps its size there and a phone cannot
+      // change it), an attached pane this device only watches (the pty's grid, which another device
+      // sized), or one held under the soft keyboard at another device's size until the keyboard goes.
+      // A phone that drives the pty is never folded: the program redraws at its width. Nor is a split's
+      // following half. A tap on folded rows opens a link or focuses the terminal, as on a mirror; it is
+      // no mouse click for the program (herdr's attach always reports the mouse, so that cannot tell a
+      // program that wants clicks): the pane menu's "Original width" draws the grid as it is again.
+      // The folded rows keep the cursor's row in view, as the grid does: at the top while it fits there,
+      // else at the bottom of the view (a cleared shell's prompt on the first row stays in sight).
+      const followFold = (): void => {
+        const bottom = fold.cursorBottom();
+        if (bottom !== null) host.scrollTop = bottom <= host.clientHeight ? 0 : bottom - host.clientHeight;
+      };
+      // this terminal's entry in the panes the pane menu offers the choice for
+      const wideOwner = {};
+      const fold = createTerminalFold(term, host, {
+        foreign: () => (fixedGridRef.current || observeRef.current || keyboardHeld) && !followRef.current,
+        wrap: () => mirrorWrapRef.current,
+        onWide: (wide) => {
+          const current = paneRef.current;
+          wideGrids.set(wideOwner, wide && current ? wideGridKey(machineId, current) : null);
+        },
+        onDrawn: () => {
+          if (!panned) followFold();
+          // the grid moved under the folded rows (lib/terminalFold.ts align): the input stays at its cursor
+          syncInputViewport();
+        },
+        onTap: () => { if (activeRef.current && !findOpenRef.current) term.focus(); },
+        // the grid's own links, read as its link providers read them (the policy of the linkHandler above)
+        onLink: (target, event) => {
+          if (!linkPressed(event)) return false;
+          if ("url" in target) {
+            if (!isWebLink(target.url)) return false;
+            if (!shouldOpenInPanel(event, target.url)) openWebLink(target.url);
+            return true;
+          }
+          const buffer = term.buffer.active;
+          // a labelled OSC 8 hyperlink shows no address of its own: its target is the cell's
+          const uri = hyperlinkAt(term, buffer.viewportY + target.row, target.col);
+          if (uri !== null && (isWebLink(uri) || fileUriPath(uri) !== null)) {
+            openHyperlink(event, uri);
+            return true;
+          }
+          const y = buffer.viewportY + target.row + 1;
+          const x = target.col + 1;
+          // a bare name is a link here only under its key: a plain tap on one still lands on the terminal
+          const link = terminalFileLinks(buffer, y, (path, pressed) => { if (linkPressed(pressed)) openFileRef.current?.(path); }, bareLinks.pressed(event) ? bareLinks : undefined)
+            .find(({ range: { start, end } }) => (y > start.y || (y === start.y && x >= start.x)) && (y < end.y || (y === end.y && x <= end.x)));
+          if (!link) return false;
+          link.activate(event);
+          return true;
+        },
+        onPan: () => { panned = true; },
+      });
       const followCursor = (): void => {
         host.toggleAttribute("data-adopted-grid", adopted());
         const screen = term.element?.querySelector<HTMLElement>(".xterm-screen");
         if (!(adopted() || keyboardHeld) || panned || !screen) return;
+        if (fold.active) {
+          followFold();
+          return;
+        }
         const row = screen.offsetHeight / term.rows;
         const cursorBottom = screen.offsetTop + (term.buffer.active.cursorY + 1) * row;
         const max = host.scrollHeight - host.clientHeight;
         host.scrollTop = cursorBottom <= host.clientHeight ? 0 : cursorBottom - row >= max ? max : cursorBottom - host.clientHeight;
       };
-      followCursorRef.current = () => { panned = false; followCursor(); };
+      followCursorRef.current = () => { panned = false; fold.sync(); followCursor(); };
       /** before a fit: true when the keyboard holds the grid, and the fit waits (`force`: it was to re-assert the grid) */
       const keyboardHolds = (force: boolean): boolean => {
         if (!keyboardHoldsGrid(keyboardUp(), host.clientWidth, fittedWidth)) return false;
         keyboardHeld = true;
         heldForce ||= force;
-        // the pane may be at another device's grid: drawn as it is until the keyboard goes, when the
-        // catch-up fit takes the pane back (as a tap or key in the grid would)
+        // the pane may be at another device's grid: drawn as it is (folded, when wider than the screen)
+        // until the keyboard goes, when the catch-up fit takes the pane back (as a tap or key in the grid would)
         const shared = sharedGridRef.current;
         if (shared && !adopted() && (term.cols !== shared.cols || term.rows !== shared.rows)) {
           term.resize(shared.cols, shared.rows);
           heldForce = true;
         }
         panned = false;
+        fold.sync();
         followCursor();
         return true;
       };
@@ -441,6 +532,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         // scrollable: a view panned under the keyboard would stay panned past the grid's top
         host.scrollTop = 0;
         if (!adopted()) host.scrollLeft = 0;
+        // the grid is this browser's again: a grid held under the keyboard unfolds
+        fold.sync();
         syncInputViewport();
       };
       keyboardHoldsRef.current = keyboardHolds;
@@ -448,6 +541,20 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
 
       /** herdr's text for the last drag, while its highlight is still the selection */
       let copiedText: string | null = null;
+      /** selected text as it is copied: an agent's own wrapped rows join back into their lines, as herdr's TUI copies them (#2558) */
+      /** the agent's replies as last read for a press in its pane: only they can prove a copied row break was its wrap */
+      let said: { pane: string; texts: readonly string[] } | null = null;
+      const readSaid = (pane: string): Promise<readonly string[]> => fetchPaneConversation(pane, machineId).then((answer) => {
+        // a conversation read off the screen holds the same rows, so it proves nothing
+        const texts = answer.source === "scrollback" ? [] : answer.turns.flatMap((turn) => turn.role === "assistant"
+          ? turn.parts.flatMap((part) => part.kind === "text" ? [part.text] : []) : []);
+        said = { pane, texts };
+        return texts;
+      }, () => []);
+      const saidNow = (): readonly string[] => said !== null && said.pane === paneRef.current ? said.texts : [];
+      const asCopied = (text: string, firstCol: number, texts: readonly string[]): string =>
+        agentRef.current ? unwrapAgentRows(text, term.cols, firstCol, texts) : text;
+      const visibleSelection = (): string => asCopied(term.getSelection(), term.getSelectionPosition()?.start.x ?? 0, saidNow());
       let selectionGeneration = 0;
       let disposed = false;
       // Run after xterm's own copy listener, including for Cmd+C and context-menu
@@ -481,7 +588,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       };
       host.addEventListener("copy", onCopy);
       const copySelection = (): void => {
-        const text = copiedText ?? term.getSelection();
+        const text = copiedText ?? visibleSelection();
         if (!text) return;
         reserveAwaitedText();
         // Native copy still works in a user gesture when a Chromium/PWA site has
@@ -541,6 +648,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         sending: boolean;
         /** a press the program would have had but for the forced selection, with the keys the user held: let go in place, it is a click */
         click: ClickKeys | null;
+        /** the agent's replies, read at the press in an agent's pane */
+        said: Promise<readonly string[]> | null;
       }
       interface ClickKeys { ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }
       const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
@@ -622,6 +731,13 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         const selecting = isMac ? event.altKey : event.shiftKey;
         // a press that clears a selection, or opens a link, is not the program's click
         const onLink = term.element?.querySelector(".xterm-screen")?.classList.contains("xterm-cursor-pointer") === true;
+        // OpenCode reads the mouse and selects inside the panel a drag starts in, as in a native terminal
+        // (#2362): a plain press is its own, drags included, as a click is, and it clears a selection made
+        // here. herdr reports which agent runs, never a program's mouse mode, so this goes by the agent.
+        if (reporting && agentRef.current === "opencode" && !event.shiftKey && !event.altKey && !onLink && !term.options.disableStdin) {
+          term.clearSelection();
+          return;
+        }
         const click: ClickKeys | null = reporting && !selecting && !onLink && !term.hasSelection()
           ? { ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, shiftKey: event.shiftKey } : null;
         if (reporting) Object.defineProperty(event, isMac ? "altKey" : "shiftKey", { value: true });
@@ -633,6 +749,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         const d: Drag = {
           pane: pane ?? "", anchor: cell, cursor: cell, top: null, anchorRow: 0, offset: 0, maxOffset: 0,
           scrolled: false, edge: 0, wheelPixels: 0, sentOffset: 0, sending: false, click,
+          said: pane && agentRef.current ? readSaid(pane) : null,
         };
         drag = d;
         if (!pane || !navigator.clipboard || observeRef.current) return;
@@ -710,7 +827,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           return;
         }
         if (!term.hasSelection()) return;
-        const visibleText = term.getSelection();
+        const visibleText = visibleSelection();
         copiedText = visibleText;
         // herdr's copy_on_select: letting go copies, or only selects for Ctrl+C or Copy (herdr's text below either way)
         const autoCopy = copyOnSelect();
@@ -735,7 +852,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         // herdr's text covers the whole range; the visible text in its place does not, so the quote
         // then names no line range rather than one its text does not hold
         let fromHerdr = true;
-        const herdrText = fetchPaneSelection(d.pane, range[0], range[1], machineId).catch(() => {
+        const start = range[0];
+        const herdrText = fetchPaneSelection(d.pane, range[0], range[1], machineId).then(async (value) => asCopied(value, start.col, await (d.said ?? []))).catch(() => {
           if (current() && d.scrolled) noteClipboard("could not read the selection from herdr");
           fromHerdr = false;
           return visibleText;
@@ -778,6 +896,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       window.addEventListener("mousemove", onMouseMove, { capture: true });
       window.addEventListener("blur", onBlur);
       window.addEventListener("mouseup", onMouseUp);
+      for (const type of ["keydown", "keyup", "mousemove"] as const) window.addEventListener(type, onLinkKey, { capture: true });
+      window.addEventListener("blur", offLinkKey);
       // herdr's copy_on_select, read again on each mount; a failed read is tried again once online
       void loadHerdrUi();
       const onOnline = (): void => { if (!herdrUiKnown()) void loadHerdrUi(); };
@@ -787,9 +907,12 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       // bridge marked `replay` (the screen from before this attach) is presentation history, and a
       // copy request in it was answered when it was new. The flag holds from the frame's write
       // until its callback; xterm's own parser state says whether a replayed OSC is still open.
-      const outputFrames: { data: string; replay: boolean; done?: () => void }[] = [];
+      const outputFrames: { data: string; replay: boolean; view?: boolean; done?: () => void }[] = [];
       let writingOutput = false;
       let parsingReplay = false;
+      // a hidden tab's view parsed on its return (resume): what it drew is history, and a query in it
+      // was answered when it was new, so xterm's replies to it never reach the pane (queryReplies below)
+      let parsingView = false;
       // Which output the frames belong to: a pane switch or reconnect starts new output, and the
       // frame xterm is parsing then is the old output's (`parsingOwner`), which copies nothing.
       let outputOwner = 0;
@@ -809,9 +932,11 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         }
         writingOutput = true;
         parsingReplay = frame.replay;
+        parsingView = frame.view === true;
         const owner = parsingOwner = outputOwner;
         term.write(frame.data, () => {
           parsingReplay = false;
+          parsingView = false;
           if (!disposed) {
             // retired output is history to the new output, as a replayed frame is
             if (frame.replay || owner !== outputOwner) replayOscOpen = oscMayCopy();
@@ -825,8 +950,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           }
         });
       };
-      const writeOutput = (data: string, replay = false, done?: () => void): void => {
-        outputFrames.push({ data, replay, done });
+      const writeOutput = (data: string, replay = false, done?: () => void, view = false): void => {
+        outputFrames.push({ data, replay, view, done });
         if (!writingOutput) writeNextOutput();
       };
       // A pane switch resets the parser, and a reconnect replays afresh: frames still queued from
@@ -840,6 +965,12 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       const retireOutput = (): void => {
         outputOwner++;
         outputFrames.length = 0;
+        // A renderer that left its pane (herdr could not restore it) ends that pane's recovery wait: a
+        // rejoin is told again while the attachment still recovers. A replaced terminal of the same
+        // pane keeps it until its new attach says (rejoin), so a late frame of the old replay is not
+        // taken for the current screen
+        if (recoveringPane !== paneRef.current) endRecovery();
+        else if (recoveringPane !== null) rejoin = true;
         frameGateRef.current.reset();
         if (!writingOutput) replayOscOpen = oscMayCopy();
       };
@@ -871,7 +1002,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         const replayed = parsingReplay || replayOscOpen;
         // OSCs do not nest: the replayed one the flag waited for ends here
         replayOscOpen = false;
-        if (!replayed && parsingOwner === outputOwner && osc52AllowedRef.current) {
+        // a recent tab watched off-screen draws its output but does not set the clipboard unseen
+        if (!replayed && parsingOwner === outputOwner && osc52AllowedRef.current && presentedRef.current && shownRef.current) {
           const text = parseOsc52(payload);
           if (text !== null) {
             void navigator.clipboard?.writeText(text).then(
@@ -882,6 +1014,15 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         }
         return true;
       });
+      // Every query xterm answers while parsing (device attributes and status, DECRQM, window reports,
+      // DECRQSS, color reports) is taken here while a view is parsed, so its answer is never typed into the pane.
+      const queryReplies = [
+        ...([{ final: "c" }, { prefix: ">", final: "c" }, { prefix: "=", final: "c" }, { final: "n" }, { prefix: "?", final: "n" },
+          { intermediates: "$", final: "p" }, { prefix: "?", intermediates: "$", final: "p" }, { final: "t" }] as const)
+          .map((id) => term.parser.registerCsiHandler(id, () => parsingView)),
+        term.parser.registerDcsHandler({ intermediates: "$", final: "q" }, () => parsingView),
+        ...[4, 10, 11, 12, 13, 14, 15, 16, 17, 19].map((id) => term.parser.registerOscHandler(id, (payload) => parsingView && payload.includes("?"))),
+      ];
       // OSC 8: a hyperlink this app cannot open (OmO's `omo-panel:` rows) is not drawn as one (#739).
       // A pi image marker is one of those; it is noted first (the link it opens, or the one it ends).
       const osc8 = term.parser.registerOscHandler(8, (payload) => {
@@ -919,24 +1060,111 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       // Bumped by readiness receipts: revokes only the proof that queued output is current, never
       // the parse itself (a masked prompt must still keep typing out of every draft).
       let outputLifetime = 0;
-      let outputRecovering = false;
+      // the pane whose attachment is recovering, as this client joined it: its replay is the screen from
+      // before. Kept by pane: another pane's output is its own, while the same pane's (a replaced
+      // terminal re-attaching) still waits for the attach to take (retireOutput)
+      let recoveringPane: string | null = null;
+      // output-recovering came and its join's replay has not: that replay is still the screen from before
+      let joinReplay = false;
+      // the recovering pane's terminal was replaced and attached again: a replay that output-recovering
+      // did not announce is that attach joining an attachment that recovered meanwhile, the current screen
+      let rejoin = false;
+      const endRecovery = (): void => {
+        recoveringPane = null;
+        joinReplay = false;
+        rejoin = false;
+      };
       let deferredAttach = false;
+      // a hidden recent tab's view, kept unparsed until its return (null: none, or past VIEW_BUFFER_MAX)
+      let viewBuffer: string[] | null = null;
+      let viewBytes = 0;
+      // a hidden page dropped that view, and the terminal reset it began with: the return resets itself
+      let viewDropped = false;
+      // the pane the running view was asked for: a hide stops that one, whatever pane the render moved to
+      let viewPane: string | null = null;
       // set by a disconnect: the first frame after the reconnect tries a preference that could not be read again
       let rereadHerdrUi = false;
       // Text composed while the pane could not take input (a dictated phrase still in the editor)
       // was typed offline: when input returns before its commit key, it goes to the draft and
       // waits for Send or Discard like the rest, never to the pane by the next key.
       let inputWasReady = false;
+      // A tab that let go of its pane for idleness (#712, the release machinery below) takes it back at the next key,
+      // click, paste or composition. What is typed from then until the new attach takes input waits here, and goes to
+      // the pane once, in order, when that attach takes input within RESUME_INPUT_WAIT_MS (flushResume). Anything
+      // else ends it as typing offline ends (failResume, retainTyped): an error or the end of the pane, a dropped
+      // connection, the wait running out, or the attach given up (cancelLeave: let go of again, cached, another
+      // pane). Nothing of it goes by itself after that; a masked prompt on screen keeps it out of the draft too.
+      let resumeInput: { pane: string; items: Typed[]; since: number } | null = null;
+      let resumeTimer: number | null = null;
+      const takeResume = (): { pane: string; items: Typed[]; since: number } | null => {
+        const resumed = resumeInput;
+        resumeInput = null;
+        if (resumeTimer !== null) window.clearTimeout(resumeTimer);
+        resumeTimer = null;
+        return resumed !== null && resumed.pane === paneRef.current ? resumed : null;
+      };
+      const failResume = (): void => {
+        const resumed = takeResume();
+        if (resumed === null) return;
+        for (const typed of resumed.items) retainTyped(resumed.pane, typed, secretRef.current !== null);
+      };
+      const flushResume = (): void => {
+        const resumed = takeResume();
+        if (resumed === null) return;
+        const late = performance.now() - resumed.since > RESUME_INPUT_WAIT_MS;
+        for (const typed of resumed.items) {
+          if (late) retainTyped(resumed.pane, typed, secretRef.current !== null);
+          else sendTyped(resumed.pane, typed);
+        }
+      };
+      const startResume = (pane: string): void => {
+        failResume();
+        resumeInput = { pane, items: [], since: performance.now() };
+        resumeTimer = window.setTimeout(() => { resumeTimer = null; failResume(); }, RESUME_INPUT_WAIT_MS);
+      };
+      // the masked prompt the screen shows now, if any (shared/secret-prompt.ts)
+      const screenSecret = (): string | null => {
+        const lines: string[] = [];
+        const buffer = term.buffer.active;
+        for (let row = 0; row < buffer.length; row++) {
+          const line = buffer.getLine(row);
+          const text = line?.translateToString(!buffer.getLine(row + 1)?.isWrapped) ?? "";
+          if (line?.isWrapped && lines.length) lines[lines.length - 1] += text;
+          else lines.push(text);
+        }
+        return secretPrompt(lines.join("\n"), term.cols);
+      };
+      // the idle release's clock: when the terminal was last typed, clicked or pasted in, and the check that follows it
+      // (idleCheck, with the release machinery below)
+      let lastActivity = performance.now();
+      let idleTimer: number | null = null;
+      let idleRound = 0;
+      let idleReleased = false;
+      const noteActivity = (): void => { lastActivity = performance.now(); };
+      const armIdle = (delay = IDLE_RELEASE_MS): void => {
+        if (idleTimer !== null) window.clearTimeout(idleTimer);
+        // only the latest check runs: one armed under another clock (a test's) cannot run a second time
+        const round = ++idleRound;
+        idleTimer = window.setTimeout(() => { if (round === idleRound) idleCheck(); }, delay);
+      };
       const noteInputReady = () => {
         const pane = paneRef.current;
         if (!pane) return;
         const ready = socket.canInput(pane);
-        if (ready && !inputWasReady) {
+        const resuming = resumeInput !== null && resumeInput.pane === pane;
+        // a composition begun to take an idle pane back goes on into it: it was typed for that pane
+        if (ready && !inputWasReady && !resuming) {
           holdPendingTextRef.current = true;
           try { commitPendingText(); } finally { holdPendingTextRef.current = false; }
         }
+        // the attach takes input: the quiet spell that lets go of it starts now
+        if (ready && !inputWasReady) {
+          lastActivity = performance.now();
+          armIdle();
+        }
         inputWasReady = ready;
         setInputReady(ready);
+        if (ready && resuming) flushResume();
       };
       // A refusal shorter than the readiness poll (a liveness probe whose pong comes back within
       // it) still counts: text entering the editor while input is refused marks the refusal, so
@@ -981,17 +1209,23 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           setChatInvalidation((current) => current + 1);
         }
         noteInputReady();
+        // the attach an idle pane started for typing will not take it (held, stalled, failed, ended): the typing is
+        // held as typing offline is, and never goes by itself when a later attach takes input
+        if (resumeInput !== null && (message.type === "pty-exit" || message.type === "error")
+          && (message.pane_id === undefined || message.pane_id === resumeInput.pane)) failResume();
         if (message.type === "input-ready" || message.type === "output-recovering") {
           // output-recovering: this client joined after the stream ended, so the replay is the screen from before
           if (message.type === "output-recovering" || message.ready === false) {
-            outputRecovering = true;
+            recoveringPane = message.pane_id;
+            joinReplay = message.type === "output-recovering";
+            rejoin = false;
             outputLifetime++;
             setOutputReady(false);
             setParsedTarget(undefined);
-          } else if (outputRecovering) {
+          } else if (recoveringPane === message.pane_id) {
             // Recovery revokes parses queued before this receipt too. The new stream, not
             // input permission (which observers never have), proves the screen is current.
-            outputRecovering = false;
+            endRecovery();
             outputLifetime++;
           }
         }
@@ -1002,6 +1236,14 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           // raw pty bytes: append, never repaint, so xterm keeps the screen and selection
           const acknowledge = socket.outputAcknowledgement(message);
           const owner = message.pane_id;
+          if (message.replay === true && recoveringPane === owner) {
+            if (joinReplay) joinReplay = false;
+            else if (rejoin) {
+              // what was queued before this replay is not the current screen; this replay is
+              endRecovery();
+              outputLifetime++;
+            }
+          }
           const generation = outputGeneration;
           const lifetime = outputLifetime;
           const target = outputTargetRef.current;
@@ -1021,33 +1263,43 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
               modifyOtherKeysRef.current = 0;
               return;
             }
-            if (lifetime === outputLifetime && !outputRecovering) {
+            if (lifetime === outputLifetime && recoveringPane !== owner) {
+              if (presentedRef.current) releaseViews();
               setOutputReady(true);
               setParsedTarget(target);
             }
             followCursor();
-            const lines: string[] = [];
-            const buffer = term.buffer.active;
-            for (let row = 0; row < buffer.length; row++) {
-              const line = buffer.getLine(row);
-              const text = line?.translateToString(!buffer.getLine(row + 1)?.isWrapped) ?? "";
-              if (line?.isWrapped && lines.length) lines[lines.length - 1] += text;
-              else lines.push(text);
-            }
             // A masked prompt does not close the grid: a desktop answers it there, as in any terminal,
             // and the masked input stands by for a phone (#1031). onData keeps what is typed then out
             // of every draft.
-            const prompt = secretPrompt(lines.join("\n"), term.cols);
+            const prompt = screenSecret();
             secretRef.current = prompt;
             term.options.disableStdin = observeRef.current || heldRef.current;
             setSecret((previous) => previous?.pane === owner && previous.prompt === prompt ? previous : prompt ? { pane: owner, prompt } : null);
             // a whole frame for this grid: the agent's input row may be read (a watched peek, the still-open guard)
-            if (frameGateRef.current.settle(stamp, lifetime === outputLifetime && !outputRecovering && gridMatches())) onInputRowFrameRef.current();
+            if (frameGateRef.current.settle(stamp, lifetime === outputLifetime && recoveringPane !== owner && gridMatches())) onInputRowFrameRef.current();
           });
         } else if (message.type === "watch-data") {
           // a read-only view drawn for this grid: written as it comes, never acknowledged
           if (message.pane_id !== paneRef.current || !releasedRef.current || !watchingRef.current) return;
-          writeOutput(message.data);
+          // a hidden recent tab keeps its view unparsed and parses it once on its return (resume): hidden
+          // tabs cost no parsing or drawing. Past the bound it is dropped, and the return draws from the attach.
+          if (!presentedRef.current) {
+            if (viewBuffer !== null && viewBytes + message.data.length <= VIEW_BUFFER_MAX) {
+              viewBuffer.push(message.data);
+              viewBytes += message.data.length;
+            } else {
+              // past the bound the view, and the reset it began with, are gone: the return resets itself
+              if (viewBuffer !== null) viewDropped = true;
+              viewBuffer = null;
+            }
+            return;
+          }
+          const owner = message.pane_id;
+          // a masked prompt drawn while the tab only watches: what is typed to take the pane back is not kept for it
+          writeOutput(message.data, false, () => {
+            if (!disposed && paneRef.current === owner && releasedRef.current) secretRef.current = screenSecret();
+          });
         } else if (message.type === "watch-end") {
           // the view ended: the last screen stays, and the banner says the tab is paused
           if (message.pane_id === paneRef.current) setWatching(false);
@@ -1072,7 +1324,10 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           if (observeRef.current && !nowObserving) commitPendingText();
           observeRef.current = nowObserving;
           // no fit runs while observing: a font shrunk for this client's own grid would stay
-          if (nowObserving) term.options.fontSize = baseFontRef.current;
+          if (nowObserving) {
+            term.options.fontSize = baseFontRef.current;
+            fitLineHeight(term);
+          }
           setObserving(nowObserving);
           syncInputViewport();
           term.options.disableStdin = nowObserving || heldRef.current;
@@ -1088,6 +1343,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
             if (pane && sizesPty()) socket.resize(pane, term.cols, term.rows, true);
           }
           panned = false;
+          // watching, the pty's grid (another device's) folds when wider than the screen; interacting, it is fitted
+          fold.sync();
           followCursor();
         } else if (message.type === "pane-geometry") {
           // observe clients adopt the pty's grid; interact clients drive it and ignore this,
@@ -1097,6 +1354,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
             fixedGridRef.current = true;
             // nor while the grid is fixed (a mirrored pane): back to the user's size
             term.options.fontSize = baseFontRef.current;
+            fitLineHeight(term);
             syncInputViewport();
           }
           // kept while the terminal lens ignores it: another device may drive the grid, and the
@@ -1114,6 +1372,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           }
           if (term.cols !== message.cols || term.rows !== message.rows) term.resize(message.cols, message.rows);
           panned = false;
+          // a grid that just became fixed at the size it already had: no resize says so to the fold
+          fold.sync();
           followCursor();
         } else if (message.type === "error") {
           if (message.code === "input_not_ready" || message.code === "input_failed") {
@@ -1174,7 +1434,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         pendingScopeRef.current = session.scope;
         pendingEpochRef.current = session.epoch;
         outputGeneration++;
-        outputRecovering = false;
+        endRecovery();
         retireOutputRef.current();
         setOutputReady(false);
         inputWasReady = false;
@@ -1186,6 +1446,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         setHeld(false);
         // and its stream says the keyboard modes again, from the start or in the replay
         modifyOtherKeysRef.current = 0;
+        // typing that waited for an idle pane's new attach is held for review, never sent after the reconnect
+        failResume();
       });
       session.connect();
 
@@ -1263,6 +1525,36 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         term.input(sequence);
       };
       host.addEventListener("keydown", onCommandArrow);
+      // a key, a chord or text for the pane: sent now, or, when the pane cannot take it, told or held for review
+      const sendTyped = (current: string, typed: Typed): void => {
+        if (typed.keys !== null && socket.sendKeys(current, typed.keys)) return;
+        if (!typed.chord && !holdPendingTextRef.current && socket.sendInput(current, typed.input, typed.stop)) return;
+        retainTyped(current, typed, false);
+      };
+      // what the pane could not take: told, or held for review (`secretNow`: a masked prompt is on screen now)
+      const retainTyped = (current: string, typed: Typed, secretNow: boolean): void => {
+        if (typed.chord) {
+          // Shortcuts are never retained as offline text: a chord the terminal cannot take now
+          // (not ready, disconnected) is told, not dropped in silence. Only one typed while an idle
+          // pane is taken back waits, with the keys around it, for that attach (resumeInput)
+          const t = tRef.current; // the language of now, not of the attach
+          setInputError(t("Not sent: the terminal is not ready for keys."));
+          return;
+        }
+        if (typed.secret || secretNow) {
+          const t = tRef.current;
+          setInputError(t("Not sent: the terminal is not ready, and a password is never held for later."));
+          return;
+        }
+        // A closed socket, an attachment still opening, or a failed synchronous send:
+        // keep printable input for explicit review, never replay it automatically.
+        if (draftPaneRef.current !== current) {
+          draftPaneRef.current = current;
+          setDraft(EMPTY_DRAFT);
+        }
+        setDraft((prev) => applyToDraft(prev, typed.input));
+        if (!draftIsEmpty(applyToDraft(EMPTY_DRAFT, typed.input))) draftHeldForRef.current = current;
+      };
       const onData = term.onData((data) => {
         // a key from the key bar or the Stop, or a dropped file's paths, ends the swipe before it
         if (!touchWheelDispatching && (barKeyRef.current !== null || stopKeyRef.current || pasting)) cancelTouchRef.current();
@@ -1270,6 +1562,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         // half's terminal answers the program's queries (a second answer would reach it as typing),
         // and a press or key here makes this half the active one before anything is typed
         if (followRef.current) return;
+        // the keyboard control moved the focus, not the user: its focus report is no input (#1046)
+        if (keyboardToggleFocusRef.current && (data === "\x1b[I" || data === "\x1b[O")) return;
         const barKey = barKeyRef.current;
         barKeyRef.current = null;
         const stopKey = stopKeyRef.current;
@@ -1331,30 +1625,16 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         // cannot take now goes the way typing does below, as an arrow always did.
         const arrow = chord === null && !pasting && !composingRef.current && !compositionCommitPendingRef.current && key?.startsWith("Arrow")
           ? terminalChord(key, NO_STICKY_MODIFIERS) : null;
-        if (arrow !== null && socket.sendKeys(current, [arrow])) return;
-        if (chord !== null) {
-          // Shortcuts are never retained as offline text or replayed later: a chord the
-          // terminal cannot take now (not ready, disconnected) is told, not dropped in silence
-          if (!socket.sendKeys(current, [chord])) {
-            const t = tRef.current; // the language of now, not of the attach
-            setInputError(t("Not sent: the terminal is not ready for keys."));
-          }
+        const typed: Typed = { input, keys: arrow !== null ? [arrow] : chord !== null ? [chord] : null, chord: chord !== null, stop: stopKey && input === "\u001b", secret };
+        // typed into a tab taking its pane back from idleness: it waits for the new attach (never a password)
+        if (resumeInput !== null && resumeInput.pane !== current) takeResume();
+        // a mouse report is for the grid it was pressed on: the attach redraws the pane at another, so it is not kept
+        if (resumeInput !== null && /^\x1b\[(<|M)/.test(input)) return;
+        if (resumeInput !== null && !secret) {
+          resumeInput.items.push(typed);
           return;
         }
-        if (!holdPendingTextRef.current && socket.sendInput(current, input, stopKey && input === "\u001b")) return;
-        if (secret) {
-          const t = tRef.current;
-          setInputError(t("Not sent: the terminal is not ready, and a password is never held for later."));
-          return;
-        }
-        // A closed socket, an attachment still opening, or a failed synchronous send:
-        // keep printable input for explicit review, never replay it automatically.
-        if (draftPaneRef.current !== current) {
-          draftPaneRef.current = current;
-          setDraft(EMPTY_DRAFT);
-        }
-        setDraft((prev) => applyToDraft(prev, input));
-        if (!draftIsEmpty(applyToDraft(EMPTY_DRAFT, input))) draftHeldForRef.current = current;
+        sendTyped(current, typed);
       });
 
       // Browsers expose dropped files as bytes, not local paths. Save them beside
@@ -1430,6 +1710,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           // (a soft keyboard opening must not leave the prompt under it)
           if (adopted()) {
             panned = false;
+            // a rotation may fit the whole mirror, or no longer fit it
+            fold.sync();
             followCursor();
             return;
           }
@@ -1475,7 +1757,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         touchPixels = 0;
         tracking = false;
       };
-      let pinch: { first: number; second: number; startSize: number; startDistance: number; size: number } | null = null;
+      let pinch: { first: number; second: number; startSize: number; startDistance: number; size: number; startCols: number; startRows: number } | null = null;
       // from a second finger until every finger lifts: the stroke is a pinch, never a scroll
       let pinchStroke = false;
       let pinchWatchPending = false;
@@ -1488,6 +1770,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         if (baseFontRef.current === size) return;
         baseFontRef.current = size;
         term.options.fontSize = size;
+        fitLineHeight(term);
         if (adopted() || chatViewRef.current) return;
         // a pinch under the keyboard fits what the finger sees: the keyboard going refits the rows
         try {
@@ -1499,11 +1782,15 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       };
       const finishPinch = (save: boolean): void => {
         const finished = pinch;
+        pinchingRef.current = false;
         if (finished && (!save || finished.size === finished.startSize)) applyLiveFont(finished.startSize);
         pinch = null;
         const current = paneRef.current;
         if (pinchWatchPending && current && releasedRef.current && watchingRef.current) socket.watch(current, term.cols, term.rows);
         pinchWatchPending = false;
+        // a pinch that keeps its size sizes no pty, unless the grid changed under it (the terminal's face arrived mid-pinch)
+        if (finished && !(save && finished.size !== finished.startSize) && (term.cols !== finished.startCols || term.rows !== finished.startRows)
+            && current && inUse() && !adopted() && !chatViewRef.current && sizesPty()) socket.resize(current, term.cols, term.rows, true);
         if (finished && save && finished.size !== finished.startSize) {
           // a pinch can end after the pane went behind a sibling of its split: it saves the size, sizing no pty
           if (current && inUse() && !adopted() && !chatViewRef.current && sizesPty()) socket.resize(current, term.cols, term.rows, true);
@@ -1549,7 +1836,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
               !host.contains(a.target as Node) || !host.contains(b.target as Node) ||
               spread(a, b) <= 0) return;
           const startSize = baseFontRef.current;
-          pinch = { first: a.identifier, second: b.identifier, startSize, startDistance: spread(a, b), size: startSize };
+          pinch = { first: a.identifier, second: b.identifier, startSize, startDistance: spread(a, b), size: startSize, startCols: term.cols, startRows: term.rows };
+          pinchingRef.current = true;
           if (pinchBadgeRef.current) {
             pinchBadgeRef.current.textContent = `${startSize}px`;
             pinchBadgeRef.current.hidden = false;
@@ -1600,14 +1888,20 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         const across = touchX - first.clientX;
         touchX = first.clientX;
         touchY = first.clientY;
-        if (adopted() && (!scrollableMirror() || canPanTerminalGrid(host, delta))) {
-          // the pan owns the swipe now: history travel left from before it is not sent at the lift
+        // folded rows pan in the browser too; under the keyboard (a grid this phone drives, held at another
+        // device's size) only up to their edges, past which the swipe scrolls the program as before
+        const edged = scrollableMirror() || (fold.active && !adopted());
+        if ((adopted() || fold.active) && (!edged || canPanTerminalGrid(host, delta))) {
+          // the pan owns the swipe now: history travel left from before it is not sent at the lift, nor are
+          // the reports of it still queued
           touchPixels = 0;
+          touchPacer.cancel();
           panned = true;
-          host.scrollBy(across, delta);
+          // folded rows already fit the width: only the rows pan
+          host.scrollBy(fold.active ? 0 : across, delta);
           return;
         }
-        if (scrollableMirror() && across !== 0) host.scrollBy(across, 0);
+        if (scrollableMirror() && !fold.active && across !== 0) host.scrollBy(across, 0);
         // xterm sends herdr one report per wheel event however far it went, and herdr scrolls a
         // few lines per report: one line-mode wheel per that many rows of finger travel keeps a
         // swipe as far as a slow drag, and the text under the finger
@@ -1715,21 +2009,25 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         if (releaseTimer !== null) window.clearTimeout(releaseTimer);
         releaseTimer = null;
         queueHeld = false;
+        idleReleased = false;
+        setIdleView(false);
+        // the attach an idle pane was being taken back for is given up (let go of, watched or left): its keys stay
+        failResume();
       };
       cancelLeaveRef.current = cancelLeave;
-      const release = (): void => {
+      // `idle`: a tab in use lets go after a quiet spell (idleCheck below), the setting and the tab's use already checked
+      const release = (idle = false): void => {
         cancelLeave();
         const current = paneRef.current;
         if (!current || embedded || mirroredRef.current || fixedGridRef.current) return;
         if (cachedRef.current && releasedRef.current) {
-          if (watchingRef.current) { socket.unwatch(current); setWatching(false); }
-          // Caching stops the watch, but does not turn an away release into a cache-only release.
+          afterSwitch(reconcileView);
           return;
         }
-        if (releasedRef.current || (!cachedRef.current
+        if (releasedRef.current || (!idle && !cachedRef.current
           && (!(releaseAwayRef.current || hiddenOnTouch()) || inUse() || endedRef.current))) return;
         if (queueWaits(current)) {
-          queueHeld = true;
+          queueHeld = !idle;
           return;
         }
         socket.detach(current);
@@ -1738,11 +2036,84 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         // The server's detach receipt holds pending input on this still-live PC connection.
         setReleased(true);
         cachedReleaseRef.current = cachedRef.current;
+        // A recent tab lets go of its attach, and of the input with it, as any hidden tab does; while
+        // this window is in use, herdr's read-only view keeps its screen current for the return
+        // A page hidden by then only says so: a frozen page could not draw the view (watch)
         if (!cachedRef.current) watch(current);
+        else afterSwitch(reconcileView);
+        if (idle) {
+          // the attach is gone: the next one that takes input starts the quiet spell again
+          inputWasReady = false;
+          idleReleased = true;
+          setIdleView(true);
+        }
+      };
+      // Settings → Use alongside herdr's own window lets go of a pane in use too, after IDLE_RELEASE_MS without typing,
+      // a click or a paste in its terminal (#712): herdr's TUI, on this PC or another, has the pane at its own size while
+      // this tab is only read, where before a tab left open in use kept it at the tab's size for as long as it stayed
+      // open. Only a terminal typed into straight (not the input line, not the chat lens) does, as the next key, click,
+      // paste or composition there takes the pane back, and what it typed waits for the new attach (resumeInput).
+      // A selection, the find bar, a composition, a masked prompt or a message waiting on this attach keep the pane.
+      const idleCheck = (): void => {
+        idleTimer = null;
+        const pane = paneRef.current;
+        // released, the next attach that takes input starts the clock again (noteInputReady)
+        if (disposed || !pane || releasedRef.current) return;
+        const quiet = performance.now() - lastActivity;
+        if (quiet < IDLE_RELEASE_MS) {
+          armIdle(IDLE_RELEASE_MS - quiet);
+          return;
+        }
+        if (!idleReleaseRef.current || embedded || mirroredRef.current || fixedGridRef.current || observeRef.current
+          || heldRef.current || stalledRef.current || endedRef.current || chatViewRef.current || followRef.current
+          || cachedRef.current || !shownRef.current || !presentedRef.current || !socket.canWatch() || findOpenRef.current
+          || composingRef.current || compositionCommitPendingRef.current || secretRef.current !== null || term.hasSelection()
+          || queueWaits(pane)) {
+          noteActivity();
+          armIdle();
+          return;
+        }
+        release(true);
+      };
+      // A hidden page cannot draw a view: the browser holds its frames until the page is shown,
+      // then parses the whole burst at once (the return's freeze), while the unacknowledged
+      // server queue grows until the socket is closed (4008) on a weak link. Returning attaches
+      // afresh, and the attach's replay is the screen it needs.
+      const stopWatch = (): void => {
+        if (viewPane !== null && watchingRef.current) {
+          socket.unwatch(viewPane);
+          setWatching(false);
+          // a pane let go of shows its view again once the page is shown (onVisibility)
+          if (!cachedRef.current) setViewHeld(true);
+        }
+        if (viewBuffer !== null) viewDropped = true;
+        viewBuffer = null;
+        viewBytes = 0;
       };
       // the pane's screen starts again from the view, as on a pane switch; the view's first frame is whole
       const watch = (pane: string): void => {
+        // a bridge without a read-only view (herdr-core) has nothing to start the screen again from:
+        // the pane keeps its last screen until the next attach, which resets it (resume)
+        if (!socket.canWatch()) {
+          setWatching(false);
+          return;
+        }
+        // A hidden page watches nothing (stopWatch): it says the pane is view only, and the view
+        // starts when the page is shown again (onVisibility), or the return attaches (resume)
+        if (document.visibilityState === "hidden") {
+          setViewHeld(true);
+          return;
+        }
         const generation = ++outputGeneration;
+        viewPane = pane;
+        if (!presentedRef.current) {
+          // the view of a hidden tab is parsed on its return, starting with this reset (watch-data)
+          viewBuffer = ["\x1bc"];
+          viewBytes = 2;
+          modifyOtherKeysRef.current = 0;
+          setWatching(socket.watch(pane, term.cols, term.rows));
+          return;
+        }
         // Reset in stream order: the attach's queued writes must not draw over the view.
         writeOutput("\x1bc", false, () => {
           if (disposed || paneRef.current !== pane || generation !== outputGeneration) return;
@@ -1751,11 +2122,21 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         modifyOtherKeysRef.current = 0;
         setWatching(socket.watch(pane, term.cols, term.rows));
       };
+      // A recent tab let go for caching watches its pane while this window is in use and it is among the
+      // most recent ones (watchedRef); otherwise its view stops. An away release stays one.
+      const reconcileView = (): void => {
+        const current = paneRef.current;
+        if (disposed || !current || !cachedRef.current || !releasedRef.current) return;
+        const keep = cachedReleaseRef.current && watchedRef.current && inUse() && !releaseAwayRef.current && socket.canWatch();
+        if (keep && !watchingRef.current) watch(current);
+        // the pane the view was started for, which a pane switch may have moved on from
+        else if (!keep && watchingRef.current) { socket.unwatch(viewPane ?? current); setWatching(false); }
+      };
       // keep_size prevents resizing an existing attach, but a fresh sidecar still sizes the pane.
       // The client cannot distinguish those cases atomically, so both watch until the user returns.
       const deferAttach = (pane: string): boolean => {
         deferredAttach = false;
-        if (inUse() || embedded || mirroredRef.current || fixedGridRef.current || queueWaits(pane) || !socket.canWatch()) return false;
+        if (inUse() && !cachedRef.current || embedded || mirroredRef.current || fixedGridRef.current || queueWaits(pane) || !socket.canWatch()) return false;
         cancelLeave();
         deferredAttach = true;
         setReleased(true);
@@ -1785,21 +2166,35 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         setReleased(false);
         const current = paneRef.current;
         if (!current) return;
-        if (watchingRef.current) {
-          socket.unwatch(current);
-          setWatching(false);
-        }
+        if (watchingRef.current) socket.unwatch(viewPane ?? current);
+        // also a view only held for a hidden page's return
+        setWatching(false);
         // A fresh attach says attach_held again if needed; success does not send attach-resumed.
         setHeld(false);
         // the pane's screen starts again from the new attach, as on a pane switch
         const generation = ++outputGeneration;
         // A new attach owns a new output lifetime. A recovering attachment sends output-recovering
         // before its replay, so it revokes this again before any retained bytes.
-        outputRecovering = false;
+        endRecovery();
         // Reset in stream order: synchronous reset would let old queued writes draw afterward.
         // A frame the old stream left open is not the new one's
         frameGateRef.current.reset();
-        if (!cachedReleaseRef.current) {
+        // what the view drew while this tab was hidden, parsed now in one go, before the attach's own screen
+        const drewView = viewBuffer !== null && viewBuffer.length > 1;
+        // a view started (its reset is in its buffer) or dropped: the terminal starts from a reset
+        const viewReset = viewDropped || viewBuffer !== null;
+        if (drewView && viewBuffer !== null) {
+          // marked replay: a copy request in it was answered when it was new (OSC 52 above)
+          writeOutput(viewBuffer.join(""), true, () => {
+            if (!disposed && paneRef.current === current) modifyOtherKeysRef.current = 0;
+          }, true);
+        }
+        viewBuffer = null;
+        viewBytes = 0;
+        // the hidden tabs' views start or stop once this pane drew (paneTerminalShared.ts)
+        holdViews();
+        // a recent tab starts from its view's reset; one whose view a hidden page dropped starts as any other tab
+        if (!cachedReleaseRef.current || viewReset && !drewView) {
           writeOutput("\x1bc", false, () => {
             if (disposed || paneRef.current !== current || generation !== outputGeneration) return;
             modifyOtherKeysRef.current = 0;
@@ -1807,6 +2202,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
           modifyOtherKeysRef.current = 0;
         }
         cachedReleaseRef.current = false;
+        viewDropped = false;
         setInputReady(false);
         setOutputReady(false);
         if (!observeRef.current && !chatViewRef.current && shownRef.current && !keyboardHolds(true)) {
@@ -1825,6 +2221,11 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       // Existing attaches keep their grid while away. New connections watch instead, except
       // for queued input, mirrors, embedded pages and bridges without watch support.
       const leave = (): void => {
+        // let go of for idleness, then left: it is out of use now, and says so
+        if (idleReleased) {
+          idleReleased = false;
+          setIdleView(false);
+        }
         if (cachedRef.current) { release(); return; }
         const current = paneRef.current;
         // A visible but unfocused window still shows the terminal and can receive its grid back.
@@ -1850,8 +2251,16 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       };
       reattachRef.current = reattach;
       const back = (): void => {
-        if (!presentedRef.current) return;
+        if (!presentedRef.current) {
+          // a recent tab whose view stopped when the window was left watches again on the way back
+          if (cachedRef.current && releasedRef.current) release();
+          return;
+        }
+        // the key, click or paste that takes an idle pane back is held with what follows it until the attach
+        // takes input; offline, typing is held for review as before (nothing goes by itself after a disconnect)
+        const resumeFor = idleReleased && releasedRef.current && socket.connected ? paneRef.current : null;
         cancelLeave();
+        if (resumeFor !== null) startResume(resumeFor);
         // A pane that kept its attach while put away (a queued message, a mirror) stopped because its
         // frozen page sent no ACKs, not because this device is too slow: coming back attaches again,
         // once. A stop while the page stays in use is final (no reconnect loop).
@@ -1867,16 +2276,24 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
             if (!deferAttach(paneRef.current)) back();
           }
           else if (paneRef.current && !watchingRef.current) watch(paneRef.current);
+        } else if (presentedRef.current && inUse() && paneRef.current && !observeRef.current) {
+          socket.keepSize(paneRef.current, !shownRef.current);
+          refit();
         }
       };
       // A phone or tablet put away lets go of the pane at once, whatever the setting: its page can
       // freeze before a timer runs, and its attach would keep herdr's own window at the phone's size.
       const hiddenOnTouch = (): boolean => coarseRef.current && document.visibilityState === "hidden";
       const onVisibility = (): void => {
+        const pane = paneRef.current;
+        if (document.visibilityState === "hidden") stopWatch();
         if (inUse()) back();
         else {
           leave();
           if (hiddenOnTouch()) release();
+          // shown again without the focus: a pane let go of while hidden watches again, as one left shown does
+          else if (document.visibilityState === "visible" && pane && releasedRef.current && !cachedRef.current
+            && !watchingRef.current && mirroredRef.current === false && presentedRef.current) watch(pane);
         }
       };
       // Another device can size the pty while this window keeps its focus (a phone used beside a
@@ -1889,6 +2306,12 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       // key bar sends, not a press on it), so they call this before they send: the reply is then
       // drawn for the grid that shows it.
       const reassertIfStale = (): void => {
+        noteActivity();
+        // a send from outside the grid (the input line, chosen while the pane was let go of for idleness) takes it back first
+        if (idleReleased && releasedRef.current) {
+          back();
+          return;
+        }
         const shared = sharedGridRef.current;
         if (!shared || releasedRef.current || !inUse()) return;
         if (shared.cols !== term.cols || shared.rows !== term.rows) refit();
@@ -1896,6 +2319,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       reassertIfStaleRef.current = reassertIfStale;
       const reclaim = (event: Event): void => {
         if (!(event.target instanceof Node) || !term.element?.contains(event.target)) return;
+        noteActivity();
         // an IME's first key comes before compositionstart, with isComposing still false (keyCode 229)
         if (event instanceof KeyboardEvent && (event.repeat || event.isComposing || event.keyCode === 229 || composingRef.current || compositionCommitPendingRef.current)) return;
         if (event instanceof PointerEvent && event.button !== 0) return;
@@ -1904,13 +2328,28 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
       };
       // a click or a tap is the user here, whatever the window says about its focus
       const onPointer = (event: PointerEvent): void => {
-        if (releasedRef.current && stackRef.current?.contains(event.target as Node)) back();
+        const inStack = stackRef.current?.contains(event.target as Node) ?? false;
+        if (inStack) noteActivity();
+        if (releasedRef.current && inStack) back();
         else reclaim(event);
       };
+      // Text that comes with no key first (a paste from the menu, an IME's composition, a phone keyboard's input) is
+      // typing too: it takes an idle pane back before xterm reads it, so onData holds it for the new attach.
+      const onTyping = (event: Event): void => {
+        if (!(event.target instanceof Node) || !term.element?.contains(event.target)) return;
+        noteActivity();
+        if (idleReleased && releasedRef.current) back();
+      };
+      // scrolling the pane is using it; it keeps the pane, and takes none back
+      const onWheelActivity = (): void => noteActivity();
       window.addEventListener("focus", back);
       window.addEventListener("blur", leave);
       window.addEventListener("pointerdown", onPointer, { capture: true });
       window.addEventListener("keydown", reclaim, { capture: true });
+      window.addEventListener("beforeinput", onTyping, { capture: true });
+      window.addEventListener("paste", onTyping, { capture: true });
+      window.addEventListener("compositionstart", onTyping, { capture: true });
+      host.addEventListener("wheel", onWheelActivity, { capture: true, passive: true });
       document.addEventListener("visibilitychange", onVisibility);
 
       return () => {
@@ -1919,6 +2358,8 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         pendingScopeRef.current = null;
         window.clearInterval(poll);
         observer.disconnect();
+        fold.dispose();
+        wideGrids.set(wideOwner, null);
         if (resizeTimer !== null) window.clearTimeout(resizeTimer);
         host.removeEventListener("touchstart", onTouchStart, { capture: true });
         document.removeEventListener("touchstart", onPageTouchStart, { capture: true });
@@ -1935,11 +2376,16 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         window.removeEventListener("mousemove", onMouseMove, { capture: true });
         window.removeEventListener("blur", onBlur);
         window.removeEventListener("mouseup", onMouseUp);
+        for (const type of ["keydown", "keyup", "mousemove"] as const) window.removeEventListener(type, onLinkKey, { capture: true });
+        window.removeEventListener("blur", offLinkKey);
         window.removeEventListener("online", onOnline);
         host.removeEventListener("copy", onCopy);
         stopEdge();
         selectionChange.dispose();
         if (releaseTimer !== null) window.clearTimeout(releaseTimer);
+        if (idleTimer !== null) window.clearTimeout(idleTimer);
+        if (resumeTimer !== null) window.clearTimeout(resumeTimer);
+        dropViewChange(reconcileView);
         releaseRef.current = () => {};
         presentationRef.current = () => {};
         leaveRef.current = () => {};
@@ -1954,6 +2400,10 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         window.removeEventListener("blur", leave);
         window.removeEventListener("pointerdown", onPointer, { capture: true });
         window.removeEventListener("keydown", reclaim, { capture: true });
+        window.removeEventListener("beforeinput", onTyping, { capture: true });
+        window.removeEventListener("paste", onTyping, { capture: true });
+        window.removeEventListener("compositionstart", onTyping, { capture: true });
+        host.removeEventListener("wheel", onWheelActivity, { capture: true });
         reassertIfStaleRef.current = () => undefined;
         document.removeEventListener("visibilitychange", onVisibility);
         onModifiedEnter.dispose();
@@ -1980,6 +2430,7 @@ export function useTerminalMount(deps: TerminalMountDeps): void {
         replayOscOpen = false;
         retireOutputRef.current = () => {};
         osc52.dispose();
+        for (const handler of queryReplies) handler.dispose();
         osc8.dispose();
         ris.dispose();
         onImagesParsed.dispose();

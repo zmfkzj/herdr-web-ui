@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Bell, BellOff, ChevronDown, ChevronRight, Ellipsis, Pin, PinOff, Terminal } from "lucide-react";
 
 import type { Machine } from "../../shared/machines.ts";
@@ -15,8 +15,10 @@ import { useSettings } from "../lib/settings.ts";
 import { useSidebarActivity } from "../lib/sidebarActivity.tsx";
 import { machineFilter } from "../lib/sidebarFilter.ts";
 import { useSidebarFilter } from "../lib/sidebarFilterContext.ts";
+import { useHiddenMachines } from "../lib/hiddenMachines.ts";
 import { currentSidebarPins, pruneSidebarPins, setSidebarPins, sidebarPinKey, subscribeSidebarPins, toggleSidebarPin } from "../lib/sidebarPins.ts";
 import { PANE_DRAG_TYPE, paneDragData } from "../lib/split.ts";
+import { PanePressContext } from "../lib/paneSubmitContext.ts";
 import { AgentMark, hasAgentMark } from "./AgentMark.tsx";
 import { RowMenu } from "./RowMenu.tsx";
 import { BackgroundBadge, displayPaneTitle, onRowContextMenu, PlanBadge, StatusBadge } from "./Sidebar.tsx";
@@ -87,6 +89,17 @@ export interface AgentSidebarProps {
 
 /** the width under which the sidebar is a drawer (src/styles.css) */
 const DRAWER_QUERY = "(max-width: 768px)";
+/** the reader's fold of the list, kept on this device as a PC's fold is (MachineSidebar.tsx): a phone and a desktop each keep their own */
+const FOLD_KEY = "ovis:agents-collapsed";
+
+/** the fold the reader left on this device, or with none kept the screen's: folded in the drawer, open on a desktop */
+function initialFold(): boolean {
+  try {
+    const stored = window.localStorage.getItem(FOLD_KEY);
+    if (stored === "1" || stored === "0") return stored === "1";
+  } catch { /* no storage: the screen's default */ }
+  return window.matchMedia?.(DRAWER_QUERY).matches === true;
+}
 /**
  * The row whose menu is open, by its pin key: at its ⋯, or at the pointer for a right-click. What
  * the menu says of the row is read from the row at each render, so a value that changes while it is
@@ -96,7 +109,8 @@ interface PinMenu { key: string; anchor: HTMLElement; point?: { x: number; y: nu
 
 /**
  * All PCs' live agents form a second list; workspace and PC folds do not hide these rows.
- * In the phone's drawer the list starts folded, leaving the room to the workspaces.
+ * In the phone's drawer the list starts folded, leaving the room to the workspaces, until the reader
+ * folds or opens it: that choice is kept on this device.
  * The pinned agents stand first, in a card; on a desktop only a
  * right-click (or the context-menu key) opens the menu. A row's ⋯, or a right-click on it, opens its
  * menu, which pins or unpins it, and mutes or unmutes its alerts for every browser and device.
@@ -104,8 +118,9 @@ interface PinMenu { key: string; anchor: HTMLElement; point?: { x: number; y: nu
 export function AgentSidebar({ machines, selectedMachineId, selectedPaneId, stateWord, watching = false, onSelect }: AgentSidebarProps) {
   const t = useT();
   const listId = useId();
-  const [collapsed, setCollapsed] = useState(() => window.matchMedia?.(DRAWER_QUERY).matches === true);
+  const [collapsed, setCollapsed] = useState(initialFold);
   const { settings } = useSettings();
+  const pressPane = useContext(PanePressContext);
   // shared with the other browsers of this server (lib/preferencesSync.ts)
   const pinned = useSyncExternalStore(subscribeSidebarPins, currentSidebarPins, currentSidebarPins);
   // the panes whose alerts are off, shared the same way; null on a server that keeps no such list, which then offers no mute
@@ -132,11 +147,13 @@ export function AgentSidebar({ machines, selectedMachineId, selectedPaneId, stat
   const [filterFold, setFilterFold] = useState<boolean | null>(null);
   useEffect(() => { if (!filter.active) setFilterFold(null); }, [filter.active]);
   const folded = filter.active ? filterFold ?? (collapsed && rows.length === 0) : collapsed;
+  // the PCs this device hides are not in `machines`: their pins are kept, not taken for gone panes
+  const hidden = useHiddenMachines();
   const togglePin = (key: string): void => {
     // pins of panes gone from this server leave with a change of the user's, never by themselves: the
     // list is shared, and a pane this page has not seen yet (a PC still loading) is not gone
     const live = new Set(allRows.map(({ machine, entry }) => sidebarPinKey(machine.id, entry.pane.pane_id)));
-    setSidebarPins(toggleSidebarPin(pruneSidebarPins(pinned, live, machines), key));
+    setSidebarPins(toggleSidebarPin(pruneSidebarPins(pinned, live, machines, hidden), key));
   };
   const toggleMute = (machineId: string, paneId: string): void => {
     // as the pins: the mutes of panes a connected PC no longer has leave with this change, and no other PC's
@@ -201,6 +218,7 @@ export function AgentSidebar({ machines, selectedMachineId, selectedPaneId, stat
       onMouseDownCapture={(event) => { if (event.button === 2 || (event.button === 0 && event.ctrlKey)) event.preventDefault(); }}
       onContextMenu={(event) => onRowContextMenu(event, toggleMenu)}>
       <button type="button" className="agent-select agent-row" disabled={!online} aria-current={selected ? "true" : undefined} title={tooltip} onClick={() => onSelect(machine.id, pane.pane_id)}
+        onPointerDown={(event) => { if (event.button === 0 && !event.ctrlKey && online && !selected && pane.agent != null) pressPane?.(machine.id, pane.pane_id); }}
         draggable={online}
         // dropped on the pane area, the row opens its pane in half of it (lib/split.ts)
         onDragStart={(event) => {
@@ -237,7 +255,12 @@ export function AgentSidebar({ machines, selectedMachineId, selectedPaneId, stat
   // Settings -> Sidebar rows -> One line: an agent row is one line too, its place dim after its title
   const oneLine = settings.sidebarRows === "one";
   return <section ref={sectionRef} className={`agents-sidebar${folded ? " is-collapsed" : ""}${rows.length === 0 ? " is-empty" : ""}${oneLine ? " is-one-line" : ""}`} aria-label={t("Agents")}>
-    <button type="button" className="agent-section-toggle sidebar-section-label" aria-expanded={!folded} aria-controls={listId} onClick={() => { if (filter.active) setFilterFold(!folded); else setCollapsed(!collapsed); }}>
+    <button type="button" className="agent-section-toggle sidebar-section-label" aria-expanded={!folded} aria-controls={listId} onClick={() => {
+      // the filter's fold lasts for the filter's time and is never kept; the reader's own is
+      if (filter.active) { setFilterFold(!folded); return; }
+      setCollapsed(!collapsed);
+      try { window.localStorage.setItem(FOLD_KEY, collapsed ? "0" : "1"); } catch { /* private mode: this page keeps it */ }
+    }}>
       {folded ? <ChevronRight className="agent-section-caret" aria-hidden="true" /> : <ChevronDown className="agent-section-caret" aria-hidden="true" />}
       <span>{t("Agents")}</span>
       {/* the count is of the agents running, filter or not */}

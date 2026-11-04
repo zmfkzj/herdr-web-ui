@@ -1,20 +1,23 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type DragEvent, type MouseEvent, type MutableRefObject, type PointerEvent, type ReactNode } from "react";
-import { Columns2, Ellipsis, Eraser, Maximize2, Pencil, Rows2, ArrowLeftRight, X } from "lucide-react";
+import { ArchiveRestore, Columns2, Ellipsis, Eraser, Maximize2, MoveHorizontal, Pencil, Rows2, ArrowLeftRight, TextWrap, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import type { HerdrPane, PaneLayoutSnapshot, SessionSnapshot } from "../../shared/protocol.ts";
-import { useMachineApi, useMachineId } from "../lib/machineContext.tsx";
+import { useAppLayout, useMachineApi, useMachineId } from "../lib/machineContext.tsx";
 import { PANE_DRAG_TYPE, paneDragData, type SplitSide } from "../lib/split.ts";
 import { PaneSubmitRetention } from "../lib/paneSubmitRetention.ts";
-import { PaneCachedContext, PanePresentedContext, PaneShownContext, PaneSubmitContext } from "../lib/paneSubmitContext.ts";
+import { PaneCachedContext, PanePresentedContext, PaneShownContext, PaneSubmitContext, PaneWatchedContext } from "../lib/paneSubmitContext.ts";
 import { cachedPaneCells, visitPaneTab } from "../lib/paneTabCache.ts";
 import { routeMissing } from "../lib/api.ts";
 import { layoutCells, zoomMode } from "../lib/layoutMap.ts";
 import { layoutTopology, paneContextPress, paneFieldTarget, SOLO_PANE_QUERY, soloPane, splitPath, splitRatioAt } from "../lib/paneCanvas.ts";
 import { useT } from "../lib/i18n.ts";
+import { useSettings } from "../lib/settings.ts";
+import { MIRROR_WRAP_QUERY, wideGridKey, wideGrids } from "../lib/terminalFold.ts";
 import { userErrorMessage, type UserError } from "../lib/userError.ts";
 import { useFocusTrap } from "../lib/useFocusTrap.ts";
 import { usePhoneSheetBack } from "../lib/sheetHistory.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
+import { paneLifetimes } from "../lib/paneLifetime.ts";
 import { displayPaneTitle } from "./Sidebar.tsx";
 import { RowMenu, type RowMenuItem } from "./RowMenu.tsx";
 import { ConfirmDialog } from "./ConfirmDialog.tsx";
@@ -33,6 +36,10 @@ interface Props {
   actionsRef?: MutableRefObject<((target: HerdrPane) => RowMenuItem[]) | null>;
   /** where the split view can be drawn: a pane opened in a half of it, from its menu or by dragging its title (lib/split.ts) */
   onOpenInHalf?: (paneId: string, side: SplitSide) => void;
+  /** the PC's panes are mirrored (no terminal attach there): their grid can be wider than this screen */
+  mirrored?: boolean;
+  /** opens Recover unsent text for the pane, offered while earlier herdrs' panes left some (UnsentText) */
+  onRecoverUnsent?: (target: HerdrPane) => void;
 }
 type Menu = { paneId: string; anchor: HTMLElement; point?: { x: number; y: number }; previousFocus: HTMLElement | null };
 interface Drag {
@@ -55,9 +62,16 @@ interface Drag {
 }
 
 /** The active tab, drawn from herdr's rectangles. No browser-owned layout or PTY state. */
-export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged, renderPane, actionsRef, onOpenInHalf }: Props) {
+export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged, renderPane, actionsRef, onOpenInHalf, mirrored = false, onRecoverUnsent }: Props) {
   const t = useT();
+  const { settings, update: updateSettings } = useSettings();
+  const narrowScreen = useMediaQuery(MIRROR_WRAP_QUERY);
+  const mirrorWraps = settings.terminalMirrorWrap ?? narrowScreen;
+  // attached panes drawn here at a grid this device does not size, wider than the screen (watched, or held under the keyboard)
+  const wideGrid = useSyncExternalStore(wideGrids.subscribe, wideGrids.snapshot, wideGrids.snapshot);
   const machineId = useMachineId();
+  // the Herdr app's window owns this PC's splits (lib/machineContext.tsx): its panes are not named, swapped, split, zoomed or resized here
+  const appLayout = useAppLayout();
   const apple = /Mac|iPhone|iPad/.test(navigator.platform);
   const coarse = useMediaQuery("(pointer: coarse)");
   const narrow = useMediaQuery(SOLO_PANE_QUERY);
@@ -153,7 +167,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
     else run(() => api.closePane(target.pane_id));
   };
   const target = menu ? snapshot?.panes.find((item) => item.pane_id === menu.paneId) : null;
-  const itemsFor = (target: HerdrPane): RowMenuItem[] => [
+  const layoutItems = (target: HerdrPane): RowMenuItem[] => appLayout ? [] : [
     { id: "rename", label: t("Rename pane"), icon: Pencil, run: () => setRenaming(target) },
     ...(target.label ? [{ id: "clear-name", label: t("Clear pane name"), icon: Eraser, run: () => run(() => api.renamePane(target.pane_id, "")) }] : []),
     ...(pane && target.pane_id !== pane.pane_id ? [{ id: "swap-focused", label: t("Swap with focused pane"), icon: ArrowLeftRight,
@@ -167,6 +181,16 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         await api.zoomPane(target.pane_id, layout ? zoomMode(layout, target.pane_id) : "on");
         if (alive.current && latest.current.tabId === tabId && latest.current.selection === selection) onSelect(target.pane_id);
       }) },
+  ];
+  const itemsFor = (target: HerdrPane): RowMenuItem[] => [
+    ...layoutItems(target),
+    // a mirror, or a pane watched at another device's grid, wider than the screen is folded to it
+    // (lib/terminalFold.ts); a full-screen program reads better at its own width, panned sideways.
+    // This device's choice, for every such pane
+    ...(mirrored || wideGrid.has(wideGridKey(machineId, target.pane_id)) ? [{ id: "mirror-width", label: t(mirrorWraps ? "Original width" : "Wrap to screen"),
+      icon: mirrorWraps ? MoveHorizontal : TextWrap,
+      run: () => updateSettings({ terminalMirrorWrap: !mirrorWraps }) }] : []),
+    ...(onRecoverUnsent && paneLifetimes.unsent().length > 0 ? [{ id: "recover-unsent", label: t("Recover unsent text"), icon: ArchiveRestore, run: () => onRecoverUnsent(target) }] : []),
     { id: "close", label: t("Close pane"), icon: X, danger: true, run: () => requestClose(target) },
   ];
   const items = target ? itemsFor(target) : [];
@@ -219,6 +243,9 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
   const shownIds = new Set(cells.map((cell) => cell.paneId));
   visitedTabs.current = visitPaneTab(visitedTabs.current, presented?.tab_id ?? null,
     new Set(snapshot?.panes.map((item) => item.tab_id) ?? []));
+  // every recent tab keeps its screen; a phone watches only the one before the current tab, a view
+  // costing its battery, and the older ones show their last screen until the user is back
+  const watchedTabs = new Set(visitedTabs.current.slice(0, narrowScreen ? 2 : 4));
   const cachedCells = cachedPaneCells(visitedTabs.current, presented?.tab_id ?? null, snapshot?.panes ?? [], lastCells.current, shownIds);
   const cachedIds = new Set(cachedCells.map((cell) => cell.paneId));
   // Every frame stays under the same keyed array, including a frame returning before its ACK.
@@ -305,10 +332,10 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
           <button type="button" className="icon-button pane-frame-menu" aria-label={t("Pane actions for {name}", { name: displayPaneTitle(item) })}
             onClick={(event) => showMenu(item, event.currentTarget)}><Ellipsis aria-hidden="true" /></button>
         </div>
-        <div className="pane-frame-body"><PaneCachedContext.Provider value={cell.cached && !cell.retained}><PanePresentedContext.Provider value={!offTab}><PaneShownContext.Provider value={!hidden}>{renderPane(item, active, alone === null && cells.length > 1)}</PaneShownContext.Provider></PanePresentedContext.Provider></PaneCachedContext.Provider></div>
+        <div className="pane-frame-body"><PaneCachedContext.Provider value={cell.cached && !cell.retained}><PaneWatchedContext.Provider value={cell.cached && !cell.retained && watchedTabs.has(item.tab_id)}><PanePresentedContext.Provider value={!offTab}><PaneShownContext.Provider value={!hidden}>{renderPane(item, active, alone === null && cells.length > 1)}</PaneShownContext.Provider></PanePresentedContext.Provider></PaneWatchedContext.Provider></PaneCachedContext.Provider></div>
       </section>;
     })}
-    {alone === null && layout?.splits.map((item) => {
+    {alone === null && !appLayout && layout?.splits.map((item) => {
       const vertical = item.direction === "right";
       const path = splitPath(item.id);
       if (path === null) return null;

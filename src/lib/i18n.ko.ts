@@ -8,8 +8,11 @@ import { WORKSPACE_KO } from "./i18n/workspace.ko.ts";
 import { FILES_KO } from "./i18n/files.ko.ts";
 import { DEVICES_KO } from "./i18n/devices.ko.ts";
 import { USAGE_KO } from "./i18n/usage.ko.ts";
+import { SETUP_KO } from "./i18n/setup.ko.ts";
+import { GUIDE_KO } from "./i18n/guide.ko.ts";
 import { UPDATES_KO } from "./i18n/updates.ko.ts";
 import { PALETTE_KO } from "./i18n/palette.ko.ts";
+import { RELAY_KO } from "./i18n/relay.ko.ts";
 
 /**
  * Korean for every `t("…")` in src/ that no part in lib/i18n/ holds: keys more than one feature
@@ -21,7 +24,11 @@ import { PALETTE_KO } from "./i18n/palette.ko.ts";
  * braces keep their English names.
  */
 const BASE: Record<string, string> = {
+  "Remove": "제거",
+  "Remove {name}": "{name} 제거",
   "Save": "저장",
+  "Goal": "목표",
+  "Waiting for your answer": "답변을 기다리는 중",
   "Zoom in": "확대",
   "Zoom out": "축소",
   "Attached image": "첨부한 이미지",
@@ -91,7 +98,6 @@ const BASE: Record<string, string> = {
   "Saved": "저장됨",
   "Unknown": "알 수 없음",
   "Use /orche commands for control; existing Pi approval rules are unchanged.": "제어는 /orche 명령을 사용하세요. 기존 Pi 승인 규칙은 그대로 유지됩니다.",
-
   "Back": "뒤로",
   "Scroll pane up": "패널 위로 스크롤",
   "Scroll pane down": "패널 아래로 스크롤",
@@ -109,7 +115,7 @@ const BASE: Record<string, string> = {
   "Chat": "채팅",
   "Agent default": "에이전트 기본값",
   "Phone & devices": "폰 및 기기",
-  "Install app": "앱 설치",
+  "Access token": "접속 토큰",
 
   // ---- shortcuts (lib/shortcuts.ts labels) ----
   "Command palette": "명령 팔레트",
@@ -119,6 +125,10 @@ const BASE: Record<string, string> = {
   "New workspace": "새 워크스페이스",
   "Previous pane": "이전 패널",
   "Next pane": "다음 패널",
+  "Previous tab": "이전 탭",
+  "Next tab": "다음 탭",
+  "Previous workspace": "이전 워크스페이스",
+  "Next workspace": "다음 워크스페이스",
 
   // ---- agent status words (lib/status.ts) ----
   "READY": "대기",
@@ -160,6 +170,8 @@ const BASE: Record<string, string> = {
   "The other PC's answer could not be read": "다른 PC의 응답을 읽을 수 없습니다",
   "Browse files": "파일 찾아보기",
   "Copy link": "링크 복사",
+  "Share link": "링크 공유",
+  "Copy address": "주소 복사",
   "Link copied": "링크를 복사했습니다",
   "That agent has closed: its workspace is open": "그 에이전트는 닫혔습니다. 대신 워크스페이스를 열었습니다",
   "That link's workspace is closed": "그 링크의 워크스페이스는 닫혔습니다",
@@ -191,6 +203,7 @@ const BASE: Record<string, string> = {
   "Rename failed: {reason}": "이름 바꾸기 실패: {reason}",
 
   // ---- PCs sidebar ----
+  "Filter workspaces and agents": "워크스페이스와 에이전트 필터",
   "Connecting…": "연결 중…",
   "Connected": "연결됨",
   "Reconnecting…": "재연결 중…",
@@ -206,6 +219,10 @@ const BASE: Record<string, string> = {
   // ---- new workspace ----
   "Browse": "찾아보기",
   "Cancel": "취소",
+  "Install": "설치",
+  "Installed": "설치됨",
+  "Not installed": "설치되지 않음",
+  "Sign in": "로그인",
   "Starting…": "시작 중…",
   "Start": "시작",
   // the launch's model, effort, first message and skills (lib/agentLaunchMode.ts, lib/newSession.ts)
@@ -232,6 +249,17 @@ const BASE: Record<string, string> = {
   // ---- prompt card ----
   "Submit": "제출",
   "Recommended": "추천",
+  "Agents": "에이전트",
+  "Check again": "다시 확인",
+  "Setup guide": "설정 안내",
+  "Could not confirm this browser is paired. Check that cookies are enabled, then try again.": "이 브라우저의 페어링을 확인할 수 없습니다. 쿠키가 허용되어 있는지 확인한 뒤 다시 시도하세요.",
+  "New code": "새 코드",
+  "Paired: {name}.": "페어링됨: {name}.",
+  "QR code that pairs a phone with code {code}": "코드 {code}로 폰을 페어링하는 QR 코드",
+  "Connect a phone": "폰 연결",
+  "Pairing code": "페어링 코드",
+  "Open this address on your phone": "폰에서 이 주소를 여세요",
+  "{agent} is ready": "{agent} 준비 완료",
 
 
   // ---- composer ----
@@ -291,6 +319,18 @@ const BASE: Record<string, string> = {
   "…": "…",
   "Alerts": "알림",
   "Sending…": "보내는 중…",
+  // the alerts health notice over the pane and Settings → Alerts say these alike (lib/pushHealth.ts)
+  "This device's push subscription is missing. Turn alerts on again.": "이 기기의 푸시 구독이 없습니다. 알림을\u00a0다시\u00a0켜세요.",
+  "The push service retired this device's subscription. Turn alerts on again to make a new one.": "푸시 서비스가 이 기기의 구독을 끝냈습니다. 알림을\u00a0다시\u00a0켜세요.",
+  "Turn alerts on again": "알림 다시 켜기",
+  "Turning alerts on…": "알림을 켜는 중…",
+  "This device's push subscription was made for another server key. Turn alerts on again to make a new one.": "이 기기의 푸시 구독은 다른 서버 키로 만들어졌습니다. 새로 만들려면 알림을\u00a0다시\u00a0켜세요.",
+  "The push service refused the last alert to this device. Send a test to check whether it still does.": "푸시 서비스가 이 기기로 보낸 마지막 알림을 거부했습니다. 테스트를 보내 지금도\u00a0그런지\u00a0확인하세요.",
+  "This page's service worker is not running, so it cannot make a push subscription. Reload the page, then try again.": "이 페이지의 서비스 워커가 실행되고 있지 않아 푸시 구독을 만들 수 없습니다. 페이지를 새로고침한 뒤 다시 시도하세요.",
+  "The PC did not take this device's push subscription. Try again.": "PC가 이 기기의 푸시 구독을 받지 않았습니다. 다시 시도하세요.",
+  "Brave would not make a push subscription. Turn on Use Google services for push messaging in Brave's privacy settings, then try again.": "Brave가 푸시 구독을 만들지 않았습니다. Brave 개인정보 설정에서 \"Use Google services for push messaging\"을 켠 뒤 다시 시도하세요.",
+  "This device would not make a push subscription. Check that push messaging is allowed in its settings, then try again.": "이 기기에서 푸시 구독을 만들지 못했습니다. 설정에서 푸시 메시지가 허용되어 있는지 확인한 뒤 다시 시도하세요.",
+  "This device can only watch.": "이 기기는 보기만 할 수 있습니다.",
   "Needs input": "입력 필요",
   "Finished": "작업 완료",
   "Open pane": "패널 열기",
@@ -309,11 +349,20 @@ const BASE: Record<string, string> = {
   "{n} background task": "백그라운드 작업 {n}개",
   "{n} background tasks": "백그라운드 작업 {n}개",
   "Try again": "다시 시도",
+  "The relay did not start: {message}": "릴레이를 시작하지 못했습니다: {message}",
+  "Turning on the relay closes the device gate: a new browser then needs a pairing code or the access token.": "릴레이를 켜면 기기 게이트가 닫힙니다. 그 뒤 새 브라우저는 페어링 코드나 접속 토큰이 필요합니다.",
   // tabs: the strip over the pane, and the New tab dialog
   "New tab": "새 탭",
+  "Rename tab": "탭 이름 바꾸기",
   "Zoom pane": "패널 확대",
   "Unzoom pane": "패널 확대 해제",
   "This PC's bridge does not offer this yet": "이 PC의 브리지는 아직 이 기능을 제공하지 않습니다.",
+  "Move failed: {reason}": "이동 실패: {reason}",
+  "Pane swap was refused: {reason}": "패널 교환이 거부되었습니다: {reason}",
+  "The panes are in different tabs.": "패널이 서로 다른 탭에 있습니다.",
+  "Choose two different panes.": "서로 다른 두 패널을 선택하세요.",
+  "A pane is no longer available.": "패널을 더 이상 사용할 수 없습니다.",
+  "There is no pane on that side.": "해당 방향에 패널이 없습니다.",
   "Split pane right": "패널을 오른쪽으로 분할",
   "Split pane down": "패널을 아래로 분할",
   "Plan: {done} of {total} done": "계획: {total}개 중 {done}개 완료",
@@ -329,7 +378,33 @@ const BASE: Record<string, string> = {
   // t3code ports (a)
   // t3code ports (d)
   "Change PC": "PC 바꾸기",
+  "Forget this PC": "이 PC 잊기",
   "Selected": "선택됨",
+  // Recover unsent text (components/UnsentText.tsx)
+  "Unsent text": "보내지 않은 글",
+  "Text you had not sent when herdr restarted. A new herdr gives pane IDs out again, so it waits here rather than in a pane it was not written for. Nothing here is sent.": "herdr가 다시 시작될 때 보내지 않았던 글입니다. 새 herdr는 패널 ID를 다시 나눠 주므로, 그 글이 다른 패널에 나타나지 않도록 여기에 보관합니다. 여기서는 아무것도 보내지 않습니다.",
+  "Put in message box": "입력창에 넣기",
+  "Adds the text to this pane's message box. Nothing is sent.": "이 패널의 입력창에 글을 추가합니다. 보내지는 않습니다.",
+  "Message box": "입력창",
+  "Terminal line": "터미널 입력 줄",
+  "Held message": "보관한 메시지",
+  "Held input": "보관한 입력",
+  "Other accounts": "다른 계정",
+  "Plan limits": "요금제 한도",
+  "Auto": "자동",
+  "Hub request failed": "허브 요청에 실패했어요",
+  "On this PC": "이 PC",
+  "Hub": "허브",
+  "Add account": "계정 추가",
+  "Check the hub connection": "허브 연결을 확인하세요",
+  "Meters show": "미터 표시",
+  "Limit shown": "표시할 한도",
+  "Show plan limits": "요금제 한도 표시",
+  "Session": "세션",
+  "Weekly": "주간",
+  "Open terminal": "터미널 열기",
+  "Sign in to {agent}": "{agent}에 로그인",
+  "differs": "다름",
 };
 
 /** The parts KO is made of; src/lib/i18n.test.ts fails when a key is in two parts, since a spread keeps only the last. */
@@ -345,8 +420,11 @@ export const KO_PARTS: Record<string, Record<string, string>> = {
   files: FILES_KO,
   devices: DEVICES_KO,
   usage: USAGE_KO,
+  setup: SETUP_KO,
+  guide: GUIDE_KO,
   updates: UPDATES_KO,
   palette: PALETTE_KO,
+  relay: RELAY_KO,
 };
 
 export const KO: Record<string, string> = Object.assign({}, ...Object.values(KO_PARTS));

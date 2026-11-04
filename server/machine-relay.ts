@@ -1,8 +1,14 @@
 import { authenticatedWebSocket } from "./remote-websocket.ts";
-import type { ServerWebSocket } from "bun";
 import { OUTPUT_HARD_BYTES, OUTPUT_HIGH_BYTES, OUTPUT_STALL_MS } from "./output-window.ts";
 import { OUTPUT_STALLED_CLOSE_CODE } from "../shared/terminal-flow.ts";
 import type { MachineManager } from "./machines.ts";
+import type { ServerMessage, SessionSnapshot } from "../shared/protocol.ts";
+
+interface RelayClient {
+  send(data: string): number;
+  getBufferedAmount(): number;
+  close(code?: number, reason?: string): void;
+}
 
 /**
  * The relay's backstop against its own sockets backing up, with this PC's rule (reconcileOutput):
@@ -30,7 +36,7 @@ export function upstreamCloseCode(code: number): number {
 /** Relay ACK frames unchanged: only xterm parsing releases remote output credit. */
 export class MachineRelay {
   private upstream: WebSocket;
-  private client?: ServerWebSocket<unknown>;
+  private client?: RelayClient;
   private waiting: string[] = [];
   private bytes = 0;
   private closed = false;
@@ -40,10 +46,12 @@ export class MachineRelay {
   readonly ready: Promise<void>;
 
   /**
+   * `browserSnapshot`: the PC's snapshot frame as the browser is told it, without the token values this
+   * server's sidebar rows hide (#2160). Other frames pass as they came.
    * `frames`: each frame the browser sent, once it went to the PC, and each the PC sent back (the
    * `/gui view` grants read typing, submits and refusals there: pi-visual/grants.ts)
    */
-  constructor(manager: MachineManager, id: string, private readonly readOnly = false, private readonly frames?: { client(text: string): void; server(text: string): boolean | void }) {
+  constructor(manager: MachineManager, id: string, private readonly readOnly: boolean, private readonly browserSnapshot: (snapshot: SessionSnapshot) => SessionSnapshot, private readonly frames?: { client(text: string): void; server(text: string): boolean | void }) {
     const endpoint = manager.endpoint(id);
     if (!endpoint) throw new Error("This PC is disconnected");
     this.upstream = authenticatedWebSocket(endpoint.url.replace("http:", "ws:") + "/ws", endpoint.token);
@@ -58,7 +66,7 @@ export class MachineRelay {
       this.upstream.addEventListener("close", () => { clearTimeout(timeout); reject(new Error("Remote websocket closed")); }, { once: true });
     });
     this.upstream.onmessage = (event) => {
-      const raw = String(event.data);
+      const raw = this.told(String(event.data));
       if (this.closed) return;
       // a frame the browser is not to get (a `gui-view` its own keys already opened: grants.ts)
       if (this.frames?.server(raw) === false) return;
@@ -72,6 +80,18 @@ export class MachineRelay {
     this.timer = setInterval(() => this.tick(), 100);
     this.timer.unref();
   }
+  /**
+   * A frame as the browser is told it: a frame that names `tokens` anywhere is read, whatever its key
+   * order, and a snapshot among them re-written where a value leaves; the rest pass unread.
+   */
+  private told(raw: string): string {
+    if (!raw.includes('"tokens"')) return raw;
+    let message: ServerMessage;
+    try { message = JSON.parse(raw) as ServerMessage; } catch { return raw; }
+    if (message.type !== "snapshot") return raw;
+    const snapshot = this.browserSnapshot(message.snapshot);
+    return snapshot === message.snapshot ? raw : JSON.stringify({ ...message, snapshot });
+  }
   /** One stall-clock sample of both sockets' queues; the 100 ms timer calls it, and tests inject `now`. */
   tick(now = Date.now()): void {
     if (this.closed) return;
@@ -79,7 +99,7 @@ export class MachineRelay {
     const code = this.stall.sample(buffered, now);
     if (code) this.close(code, "terminal transport stalled");
   }
-  bind(client: ServerWebSocket<unknown>): void {
+  bind(client: RelayClient): void {
     this.client = client;
     if (this.closed) { client.close(1012, "Remote connection ended"); return; }
     for (const raw of this.waiting) this.send(raw);
@@ -94,12 +114,17 @@ export class MachineRelay {
     if (this.closed) return;
     if (this.upstream.readyState !== WebSocket.OPEN) { this.close(); return; }
     let text = String(raw);
-    if (this.readOnly) {
-      try {
-        const message = JSON.parse(text);
-        if (message?.type === "role") text = JSON.stringify({ type: "role", mode: "observe" });
-      } catch { /* malformed frames are answered by the upstream server */ }
-    }
+    try {
+      const message = JSON.parse(text);
+      if (message?.type === "attach") {
+        // Receipt resumption is local-only: the shared bridge token carries no trusted
+        // origin-device namespace, so forwarding a browser UUID would cross devices.
+        delete message.receipt_resume_id;
+        text = JSON.stringify(message);
+      } else if (this.readOnly && message?.type === "role") {
+        text = JSON.stringify({ type: "role", mode: "observe" });
+      }
+    } catch { /* malformed frames are answered by the upstream server */ }
     if (this.upstream.bufferedAmount + Buffer.byteLength(text) > OUTPUT_HARD_BYTES) { this.close(OUTPUT_STALLED_CLOSE_CODE, "input overflow"); return; }
     this.upstream.send(text);
     if (!this.readOnly) this.frames?.client(text);

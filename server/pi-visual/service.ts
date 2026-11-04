@@ -119,7 +119,7 @@ export class PiVisualService {
           const found=await this.deps.image(paneId,source.ref); if(!found) throw new VisualError("image_not_found","Image not found",404);
           image={bytes:found.bytes,mime:found.mediaType,name:typeof value.name==="string" ? value.name.slice(0,1024):"Image"};
         } else {
-          const found=locateFile(source.path,pane.cwd);
+          const found=await locateFile(source.path,pane.cwd);
           if(!found || !("info" in found)) throw new VisualError("image_not_found","Image path is unavailable or ambiguous",404);
           const fd=openSync(found.info.path,"r");
           try { const stat=fstatSync(fd); if(!stat.isFile() || stat.size>MAX_REVIEW_IMAGE_BYTES) throw new VisualError("image_too_large","Review images must be at most 16 MiB",413);
