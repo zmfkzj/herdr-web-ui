@@ -411,7 +411,8 @@ for (const backend of backends) describe.skipIf(!backend.available)(`pi-visual-s
   it("rolls back a guacd that fails without starting the server", async () => {
     const result = await launch("start", { MOCK_GUACD: "exit" });
     expect(result.code).toBe(1);
-    expect(result.err).toContain("guacd exited during startup");
+    // a guacd gone before the launcher reads its start time (fast on the macOS variant's ps) fails as "immediately"
+    expect(result.err).toMatch(/guacd exited (?:during startup|immediately)/);
     expect(result.err).toContain("guacd mock failing on purpose");
     expect(existsSync(join(stack, "web-ui.log"))).toBe(false);
   }, 30_000);
