@@ -96,6 +96,16 @@ describe("private desktop boundary",()=>{
     const expired=tickets.issue(identity,request(),"binding");now=31000;expect(()=>tickets.take(expired.ticket,"binding")).toThrow();
     expect(desktopBinding(new Request("https://local",{headers:{cookie:"token=a"}}))).not.toBe(desktopBinding(new Request("https://local",{headers:{cookie:"token=b"}})));
   });
+  it("binds a browser's first terminal socket, given its stream key, as the requests it sends after it",()=>{
+    const issued="ovis_stream_"+"a".repeat(32)+"=1; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000";
+    const at=(cookie?:string)=>new Request("https://local",cookie===undefined?{}:{headers:{cookie}});
+    // a fresh browser: the socket's request had no cookie, every later one carries the key it was given
+    expect(desktopBinding(at(),undefined,issued)).toBe(desktopBinding(at("ovis_stream_"+"a".repeat(32)+"=1")));
+    expect(desktopBinding(at(),undefined,issued)).not.toBe(desktopBinding(at()));
+    // after the cookies it already sent
+    expect(desktopBinding(at("token=a"),"d1",issued)).toBe(desktopBinding(at("token=a; ovis_stream_"+"a".repeat(32)+"=1"),"d1"));
+    expect(desktopBinding(at("token=a"),undefined,issued)).not.toBe(desktopBinding(at("token=b; ovis_stream_"+"a".repeat(32)+"=1")));
+  });
   it("parses fragmented Unicode Guacamole instructions and rejects malformed frames",()=>{
     const got:string[][]=[];const parser=new InstructionParser(p=>got.push(p));const wire=instruction("name","한글🙂;comma,")+instruction("sync","123");
     for(const char of wire)parser.write(char);expect(got).toEqual([["name","한글🙂;comma,"],["sync","123"]]);

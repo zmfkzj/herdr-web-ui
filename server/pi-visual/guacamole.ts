@@ -81,8 +81,14 @@ export class DesktopTickets {
   }
   close(): void { clearInterval(this.timer); for(const t of this.tickets.values()) t.request.password=""; this.tickets.clear(); }
 }
-export function desktopBinding(request: Request, deviceId?: string): string {
-  return createHash("sha256").update(JSON.stringify([deviceId??"",request.headers.get("cookie")??"",request.headers.get("authorization")??"",request.headers.get("tailscale-user-login")??""])).digest("hex");
+/**
+ * The browser a request came from, as desktop tickets and `/gui view` grants know it. `issued`: the
+ * Set-Cookie this request's own answer gives it (a first terminal socket's stream key, dispatch.ts),
+ * which every later request of that browser carries after the ones it sent: it is bound as those are.
+ */
+export function desktopBinding(request: Request, deviceId?: string, issued?: string): string {
+  const cookie=[request.headers.get("cookie")??"",issued?.split(";")[0]?.trim()??""].filter(Boolean).join("; ");
+  return createHash("sha256").update(JSON.stringify([deviceId??"",cookie,request.headers.get("authorization")??"",request.headers.get("tailscale-user-login")??""])).digest("hex");
 }
 export interface DesktopWebSocket { send(data: string): number; close(code?: number,reason?: string): void; getBufferedAmount(): number }
 /** keys one connection may hold down at once, as the tunnel remembers them for their release */

@@ -499,7 +499,8 @@ export async function handleRequest(request: Request, ctx: ServerContext): Promi
     const presentedKeys = streamKeys(request);
     const issuedKey = useMachineEvents && presentedKeys.length === 0 ? newStreamKey() : null;
     const keys = issuedKey === null ? presentedKeys : [issuedKey];
-    if (issuedKey !== null) headers.append("set-cookie", streamCookie(issuedKey, isSecureRequest(request)));
+    const issuedCookie = issuedKey === null ? undefined : streamCookie(issuedKey, isSecureRequest(request));
+    if (issuedCookie !== undefined) headers.append("set-cookie", issuedCookie);
     const openAccess = access.level === "full" && access.via === "open";
     // relay pairings waiting for approval reach only a window that may approve one, as on /api/machines/events
     const approver = access.level === "full" && access.role === "drive" && access.via !== "open" && access.via !== "relay" && access.via !== "portal";
@@ -519,7 +520,8 @@ export async function handleRequest(request: Request, ctx: ServerContext): Promi
         return () => { stopPaired(); stopRemoved?.(); stopRelay?.(); };
       } },
     } : undefined;
-    const upgraded = ctx.upgrade(request, { headers, data: connectionData({ machineEvents, deviceId, readOnly, binding: desktopBinding(request, deviceId), bridge: bridgeAuthorized, ...(surface ? { surface } : {}), ...(surface === false ? {} : { ingress }), ...recheck }) });
+    // its `/gui view` grants are bound as the browser's later requests are, a stream key issued here included
+    const upgraded = ctx.upgrade(request, { headers, data: connectionData({ machineEvents, deviceId, readOnly, binding: desktopBinding(request, deviceId, issuedCookie), bridge: bridgeAuthorized, ...(surface ? { surface } : {}), ...(surface === false ? {} : { ingress }), ...recheck }) });
     if (upgraded) return undefined;
     return new Response("websocket upgrade required", { status: 426 });
   }
