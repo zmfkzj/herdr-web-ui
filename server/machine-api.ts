@@ -1,19 +1,33 @@
-import type { DevicePairedEvent, Machine, MachineEvent, MachineRoster, SetupAction, SetupRequest } from "../shared/machines.ts";
+import { subscribeMachineEvents } from "./machine-events.ts";
+import type { DevicePairedEvent, DeviceRemovedEvent, MachineRoster, RelayPairingsEvent, RemotePairingsEvent, SetupAction, SetupRequest } from "../shared/machines.ts";
 import type { AgentRowTokens } from "../shared/pane-tokens.ts";
 import type { SharedPreferences } from "../shared/preferences.ts";
 import type { PanePromptResponse, SessionSnapshot } from "../shared/protocol.ts";
 import type { SeenFinish } from "../shared/seen.ts";
 import { MachineManager } from "./machines.ts";
+import { TypedCodeError, type TypedCodeFailure } from "../shared/relay-code-offer.ts";
+import { TailnetPcError } from "./tailnet-pcs.ts";
 import { canSendSecret, sameOrigin } from "./machine-security.ts";
 import { isJsonObject, jsonResponse, setRequestRoute } from "./http.ts";
 import { crossSiteFileRead } from "./file-view.ts";
 import type { PiGuiViewers } from "../shared/pi-visual.ts";
 import { PI_SESSION_HEADER } from "../shared/terminal-images.ts";
 import { bridgeProblem, relayedViewers, type RemoteDesktops } from "./pi-visual/relay.ts";
-import { decidedRowTokens, reportedTokenValues, snapshotWithoutHiddenTokens, withoutHiddenTokens } from "./herdr-sidebar.ts";
+import { snapshotWithoutHiddenTokens, withoutHiddenTokens } from "./herdr-sidebar.ts";
 import { parseJson, readCapped, REMOTE_LIMITS, RemoteResponseInvalid, RemoteResponseTooLarge } from "./remote-json.ts";
 
 const fail = (code: string, message: string, status: number) => jsonResponse({ error: { code, message } }, status);
+
+/** POST /api/machines/relay/code: why a typed code found no PC, as `typed_code_<failure>` (the app words each one). */
+const CODE_FAILURES: Record<TypedCodeFailure, [string, number]> = {
+  "not-a-code": ["A code has ten letters and digits", 400],
+  "no-pc": ["No PC shows this code", 404],
+  wrong: ["That code did not work", 400],
+  expired: ["That code ran out", 410],
+  busy: ["Another device is trying this code", 409],
+  unreachable: ["The relay could not be reached", 502],
+  forged: ["The answer did not come from a PC this app can pair with", 502],
+};
 
 /**
  * How far one browser's machine events may fall behind before its stream is ended (it reconnects and
@@ -89,7 +103,7 @@ export const slowMachinePath = (path: string): boolean => path === "worktree/cre
  * forwards, so such a path must be no route at all rather than "some other route".
  */
 export const nonCanonicalPath = (pathname: string): boolean => pathname.includes("//") || (pathname.length > 1 && pathname.endsWith("/")) || /%2f|%5c/i.test(pathname);
-export const MACHINE_PROXY_PATH = /^(?:session|sessions\/(?:history|resume)|agents|agent-catalog(?:\/(?:install|sign-in))?|integrations|usage\/statusline|pane\/(?:read|scroll|find|selection|conversation(?:\/image|\/tool-output)?|commands|files|omo-tasks|background-agent|plan|artifacts|prompt|prompt\/answer|input|keys|close|rename|image|split|zoom|swap|resize|clear|focus|pi-visual\/(?:workers|viewers|review|review\/open|review\/image))|workspace\/(?:create|rename|move|close|directories|diff\/files|diff\/file|diff\/refs)|worktree\/(?:create|list|open|remove)|tab\/(?:create|rename|close|move|move-to-workspace)|layout\/ratio|agent\/(?:rename|commands)|plugins\/actions|plugin\/action|fs\/(?:stat|file|favicon))$/;
+export const MACHINE_PROXY_PATH = /^(?:session|sessions\/(?:history|resume)|agents|agent-catalog(?:\/(?:install|sign-in))?|integrations|system|usage\/statusline|pane\/(?:read|scroll|find|selection|conversation(?:\/image|\/tool-output)?|commands|files|docs|omo-tasks|background-agent|plan|artifacts|btw|prompt|prompt\/answer|input|keys|close|rename|image|split|zoom|swap|move|resize|clear|focus|pi-visual\/(?:workers|viewers|review|review\/open|review\/image))|workspace\/(?:create|rename|move|close|directories|diff\/files|diff\/file|diff\/refs|git\/log|git\/branches|git\/show|pr|pr\/log|pr\/merge)|worktree\/(?:create|list|inventory|open|remove)|tab\/(?:create|rename|close|move|move-to-workspace)|layout\/ratio|agent\/(?:rename|commands)|plugins\/actions|plugin\/action|fs\/(?:stat|file|favicon|text))$/;
 /** Answer headers a PC's response keeps: a review image's sandbox and nosniff must not be lost on the way. */
 const KEPT_HEADERS = ["content-security-policy", "x-content-type-options", PI_SESSION_HEADER];
 
@@ -122,8 +136,8 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
   preferences?: { get(): SharedPreferences; subscribe(listener: (preferences: SharedPreferences) => void): () => void }, readOnly = false,
   herdrSidebar?: { get(): AgentRowTokens | null; subscribe(listener: (agents: AgentRowTokens | null) => void): () => void },
   seen?: { list(): SeenFinish[]; subscribe(listener: (finish: SeenFinish) => void): () => void },
-  /** durable device enrollments (server/devices.ts), already without the ones this stream's own device made */
-  pairings?: { subscribe(listener: (event: DevicePairedEvent) => void): () => void },
+  /** durable device enrollments (server/devices.ts), already without the ones this stream's own device made, and relay pairings waiting for approval */
+  pairings?: { subscribe(listener: (event: DevicePairedEvent | DeviceRemovedEvent | RelayPairingsEvent | RemotePairingsEvent) => void): () => void },
   relayBudget?: EventStreamBudget,
   visual?: { desktops: RemoteDesktops; deviceId?: string; /** straight over Tailscale (access.ts directTailnetRequest) */ encrypted?: boolean }): Promise<Response> {
   const url = new URL(request.url);
@@ -160,10 +174,6 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
     if (parts[0] === "events" && parts.length === 1 && request.method === "GET") {
       setRequestRoute("/api/machines/events");
       let stop: (() => void) | undefined;
-      let stopPreferences: (() => void) | undefined;
-      let stopSidebar: (() => void) | undefined;
-      let stopSeen: (() => void) | undefined;
-      let stopPairings: (() => void) | undefined;
       let unwatchDevice: (() => void) | undefined;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
       let close = () => {};
@@ -174,7 +184,7 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
       // the browser went away: what still waits for it is dropped, not kept for a reader that is gone
       const aborted = () => drop();
       const cleanup = () => {
-        stop?.(); stopPreferences?.(); stopSidebar?.(); stopSeen?.(); stopPairings?.(); unwatchDevice?.(); clearInterval(heartbeat);
+        stop?.(); unwatchDevice?.(); clearInterval(heartbeat);
         request.signal.removeEventListener("abort", aborted);
         if (queue) forgetQueue(queue);
         relayBudget?.release(charged);
@@ -246,52 +256,8 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
             if (bytes.byteLength > MACHINE_EVENTS_QUEUE_BYTES) large.push({ end: written, bytes: bytes.byteLength });
             retell();
           };
-          // herdr's sidebar rows are this PC's config, as herdr's own sidebar takes the client's for every PC.
-          // A roster leaves without the values their hide rules hide (withoutHiddenTokens), so no browser holds one;
-          // the rules' decisions (decidedRowTokens) go first, in the same write, showing the values of this roster and
-          // of the one the browser holds until it lands, and hiding any other where a rule hides, as a value kept from
-          // a roster told under other rows. New rows are told with the roster again under them.
-          // Read before listening: a change this read finds is told to the browsers already listening, and to this one once.
-          let rows = herdrSidebar?.get() ?? null;
-          let reported = new Map<string, Set<string>>();
-          let roster: Machine[] | undefined;
-          let toldSidebar: string | undefined;
-          const sidebarFrame = (...values: Map<string, Set<string>>[]): string => {
-            if (!herdrSidebar) return "";
-            const told = JSON.stringify({ type: "herdr-sidebar", agents: decidedRowTokens(rows, ...values) } satisfies MachineEvent);
-            if (told === toldSidebar) return "";
-            toldSidebar = told;
-            return `data: ${told}\n\n`;
-          };
-          const sendSidebar = () => { const frame = sidebarFrame(reported); if (frame) send(frame); };
-          const sendRoster = (machines: Machine[]) => {
-            roster = machines;
-            const shown = withoutHiddenTokens(rows, machines);
-            const incoming = reportedTokenValues(shown);
-            const frame = sidebarFrame(reported, incoming);
-            reported = incoming;
-            send(`${frame}data: ${JSON.stringify({ type: "machines", machines: shown } satisfies MachineEvent)}\n\n`);
-          };
-          stop = manager.subscribe((event) => {
-            if (event.type === "machines") { sendRoster(event.machines); return; }
-            // a PC's own snapshot, relayed as it came: told as the roster is, without what the rows hide
-            const told = event.type === "machine-message" && event.message.type === "snapshot"
-              ? { ...event, message: { ...event.message, snapshot: snapshotWithoutHiddenTokens(rows, event.message.snapshot) } }
-              : event;
-            send(`data: ${JSON.stringify(told)}\n\n`);
-          });
-          // the shared preferences ride the same stream, one connection per browser; the document
-          // opens it, so a page that reconnects (or whose GET lost a race) holds the latest
-          const sendPreferences = (shared: SharedPreferences) => send(`data: ${JSON.stringify({ type: "preferences", preferences: shared } satisfies MachineEvent)}\n\n`);
-          stopPreferences = preferences?.subscribe(sendPreferences);
-          if (preferences) sendPreferences(preferences.get());
-          sendSidebar();
-          stopSidebar = herdrSidebar?.subscribe((next) => { rows = next; if (roster) sendRoster(roster); else sendSidebar(); });
-          const sendSeen = (finishes: SeenFinish[]) => send(`data: ${JSON.stringify({ type: "seen", finishes } satisfies MachineEvent)}\n\n`);
-          if (seen) sendSeen(seen.list());
-          stopSeen = seen?.subscribe((finish) => sendSeen([finish]));
-          // a device paired after this stream opened: the one event, as it happens (nothing is replayed on reconnect)
-          stopPairings = pairings?.subscribe((event) => send(`data: ${JSON.stringify(event satisfies MachineEvent)}\n\n`));
+          stop = subscribeMachineEvents({ manager, preferences, herdrSidebar, seen, pairings },
+            (event) => send(`data: ${JSON.stringify(event)}\n\n`));
           if (closed) { cleanup(); return; }
           heartbeat = machineEventsClock.heartbeat(() => send(": heartbeat\n\n"));
           request.signal.addEventListener("abort", aborted, { once: true });
@@ -301,6 +267,52 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
         cancel() { close(); },
       }, new ByteLengthQueuingStrategy({ highWaterMark: MACHINE_EVENTS_QUEUE_BYTES }));
       return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" } });
+    }
+    if (parts[0] === "relay" && parts.length === 1 && request.method === "POST") {
+      setRequestRoute("/api/machines/relay");
+      // the link holds a one-time pairing code, a secret like an SSH password
+      if (!canSendSecret(request)) return fail("https_required", "A pairing link requires HTTPS or localhost", 403);
+      const body: unknown = await request.json().catch(() => null);
+      if (!isJsonObject(body)) return fail("invalid_body", "Expected a pairing link", 400);
+      return jsonResponse({ machine: await manager.addRelay(body.link, body.name, body.found) }, 201);
+    }
+    if (parts[0] === "relay" && parts[1] === "code" && parts.length === 2 && request.method === "POST") {
+      setRequestRoute("/api/machines/relay/code");
+      // the code is a secret, and what it finds holds the other PC's one-time pairing code, which stays on this server
+      if (!canSendSecret(request)) return fail("https_required", "A pairing code requires HTTPS or localhost", 403);
+      const body: unknown = await request.json().catch(() => null);
+      if (!isJsonObject(body)) return fail("invalid_body", "Expected a pairing code", 400);
+      try { return jsonResponse(await manager.relayFoundByCode(body.code, request.signal)); }
+      catch (error) {
+        if (!(error instanceof TypedCodeError)) throw error;
+        const [message, status] = CODE_FAILURES[error.failure];
+        return fail(`typed_code_${error.failure}`, message, status);
+      }
+    }
+    if (parts[0] === "ssh-candidates" && parts.length === 1) {
+      setRequestRoute("/api/machines/ssh-candidates");
+      // adding a PC is a driving device's; a watching one is not told which hosts this PC knows either
+      if (readOnly) return fail("read_only", "this device can only watch", 403);
+      if (request.method !== "GET") return fail("method_not_allowed", "Use GET", 405);
+      return jsonResponse({ pcs: await manager.listSshCandidates() }, 200, { "cache-control": "no-store" });
+    }
+    if (parts[0] === "tailnet" && parts.length === 1) {
+      setRequestRoute("/api/machines/tailnet");
+      // adding a PC is a driving device's; a watching one is not told which PCs are there either
+      if (readOnly) return fail("read_only", "this device can only watch", 403);
+      if (request.method === "GET") return jsonResponse({ pcs: await manager.listTailnet() }, 200, { "cache-control": "no-store" });
+      if (request.method !== "POST") return fail("method_not_allowed", "Use GET or POST", 405);
+      const body: unknown = await request.json().catch(() => null);
+      if (!isJsonObject(body)) return fail("invalid_body", "Expected the address of a PC found on Tailscale", 400);
+      try { return jsonResponse({ machine: await manager.addTailnet(body.url) }, 201); }
+      catch (error) {
+        if (error instanceof TypedCodeError) {
+          const [message, status] = CODE_FAILURES[error.failure];
+          return fail(`typed_code_${error.failure}`, message, status);
+        }
+        if (!(error instanceof TailnetPcError)) throw error;
+        return fail(`tailnet_${error.failure}`, error.message, error.failure === "not_found" ? 404 : error.failure === "unreachable" ? 502 : 409);
+      }
     }
     if (parts[0] === "setup") {
       if (parts.length === 1 && request.method === "POST") { setRequestRoute("/api/machines/setup"); return jsonResponse(manager.setup(await request.json() as SetupRequest), 202); }
@@ -357,7 +369,7 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
     // earlier sessions carry their first prompts, and a folder's command files name what is in it (the new-tab
     // dialog's agent commands, a pane's command rows), as do the paths under a pane's folder and a plugin run's
     // output, and a repository's checkouts: never asked for a watching device with the PC's credential
-    if (readOnly && (path === "sessions/history" || path === "agent/commands" || path === "pane/commands" || path === "pane/files" || path === "plugin/action" || path === "worktree/list")) return fail("read_only", "this device can only watch", 403);
+    if (readOnly && (path === "sessions/history" || path === "agent/commands" || path === "pane/commands" || path === "pane/files" || path === "pane/docs" || path === "plugin/action" || path === "worktree/list" || path === "worktree/inventory")) return fail("read_only", "this device can only watch", 403);
     if (path.startsWith("pane/pi-visual/")) {
       if (!manager.endpoint(id)) return fail("machine_offline", "This PC is disconnected", 503);
       // an upstream bridge has no such routes: say what to do instead of a bare 404, and never
@@ -419,6 +431,8 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
         const response = await fetch(target, { method: request.method, headers, body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body, redirect: "error", signal: AbortSignal.any([request.signal, abort.signal, AbortSignal.timeout(slowMachinePath(path) ? 165_000 : 75_000)]) });
         if (moved && response.ok) moved();
         const etag = response.headers.get("etag");
+        // that PC's clock as it answered a conversation read, a 304 too (src/lib/sentWaiting.ts)
+        const serverTime = response.headers.get("x-server-time");
         // a PC's "try again in a moment" (a 503 file_busy: its file threads or a commands scan were busy)
         const retryAfter = response.status === 503 ? response.headers.get("retry-after") : null;
         // held whole before it is passed on (and parsed, for a watcher's prompt), so only up to a size
@@ -449,7 +463,7 @@ export async function handleMachineRequest(request: Request, manager: MachineMan
         for (const name of KEPT_HEADERS) { const value = response.headers.get(name); if (value) kept[name] = value; }
         return new Response(body, { status: response.status, headers: {
           "content-type": response.headers.get("content-type") ?? "application/json", "cache-control": "no-store", ...(etag ? { etag } : {}), ...kept,
-          ...(retryAfter ? { "retry-after": retryAfter } : {}),
+          ...(retryAfter ? { "retry-after": retryAfter } : {}), ...(serverTime ? { "x-server-time": serverTime } : {}),
         } });
       } catch (error) {
         if (error instanceof RemoteResponseTooLarge || error instanceof RemoteResponseInvalid) return unusableAnswer(id, path, error);

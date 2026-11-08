@@ -12,6 +12,11 @@ bun run dev      # Vite on :5173, proxies /api and /ws
 
 `bun run server` and `bun run dev` never update themselves; only `bun run start` and the plugin run the update supervisor.
 
+For a loopback-only server, `HOST=127.0.0.1 OVIS_IPV6_LOOPBACK=1 bun run server` also listens on
+`::1` at the same port. Both listeners share the API and WebSocket services; `localhost`,
+`127.0.0.1` and `[::1]` keep their own URLs and browser storage. This option does not change a
+non-loopback bind and requires IPv6 loopback to be available.
+
 The plugin's `start` and `stop` (`scripts/plugin.ts`) take turns through `lifecycle.lock` in the
 plugin's state directory (the owner lock of `server/owner-guard.ts`, taken over once its owner is
 proved gone): a start holds it until its server answers or the start fails, a stop until the server
@@ -45,6 +50,36 @@ The close reason, input, credentials, peer names, socket paths and raw exception
 included. A remote machine's opaque UUID may appear, not its name or SSH address. These records are
 separate from the request-completion log and do not add timestamps to older console messages.
 
+Chat failures use `conversation.failed` and `conversation.recovered` on the same standard-error
+stream. The fixed `operation` names the rejected evidence, not the conversation: for example,
+`copilot_marker_missing` means no session-store hold was found; `copilot_report_mismatch` means
+the native report disagrees with that hold; `copilot_log_metadata_changed` means a same-size
+owned log changed timestamps; and `copilot_log_rewritten`, `copilot_log_missing` or
+`copilot_session_unregistered` identify lost continuity or an explicit release.
+The reader retains a continuity-loss reason across ordinary appends, rather than reducing
+later failures to a generic resume error. A new valid registration can establish ownership again.
+Copilot rotates its process log by copying it to `process-<ts>-<pid>.1.log` (older copies shift to
+`.2`, `.3`, …) and truncating the open file. The reader continues through the newest copy that
+starts with every byte it already read, without reading older copies; with no such copy the lines
+in between are unknown, so ownership stays rejected until the log registers a session again.
+`copilot_log_read_raced` and `copilot_log_partial` describe the current read, not a permanent
+revocation. They still require a later successful ownership check; they do not authorize cached
+history by themselves.
+
+Chat records retain the same 30-second per-pane throttle, a global 16-line/30-second budget,
+and opaque episode/request IDs. They never contain pane/session IDs, paths, commands or transcript
+text. Correlate a browser request's `X-Request-Id` with its failure and the request-completion
+log. `time` uses the current wall clock; Chat throttling and elapsed failure duration use a
+separate monotonic clock so a clock correction or host suspend does not fabricate the event time.
+A verified transcript-read failure remains retryable (`conversation_read_pending`, HTTP 503);
+unknown or conflicting ownership still fails closed, without returning the previous session.
+When a refresh names the history this server last proved for the pane, herdr reports no other
+session for it, and the rejection is not a settled one (an observed release, a peer claim or a
+report naming another session), the scrollback answer carries
+`recovery: "waiting"`: the chat keeps its turns, appends nothing, marks them paused and reads again
+on the pane's next activity (a send, a status change, a transcript push, terminal output, a session
+change or the tab showing) instead of on a timer.
+
 Every request reaching the server's fetch boundary gets a new server UUID in `X-Request-Id`.
 Same-origin API calls also send a fresh client UUID unless the caller supplies one. Client IDs
 are accepted only as 1-64 ASCII letters, digits, dots, underscores or hyphens; repeated client
@@ -70,6 +105,35 @@ is one 101 completion; its handshake carries the same response headers, and the 
 still returns `undefined`. Ordinary responses carry the server ID too. The default
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` fill absent headers only,
 preserving each route's CSP, framing, MIME, caching and compression headers.
+
+## Machine event transport and rollback
+
+New browser clients subscribe to `machine-events` on the existing local `/ws` connection when
+its `features` frame advertises that capability. The `machine-event` frames carry the same
+machine roster, redacted sidebar values, shared preferences, seen finishes and filtered device
+pairings as `/api/machines/events`. The local connection is kept even while a remote PC is
+selected; remote terminal sockets do not subscribe to this document.
+
+Older servers still use SSE. Set `OVIS_MACHINE_EVENTS_WS=0` in the server environment and restart
+only Ovis to disable the capability and return new clients to SSE without changing stored data.
+Removing that override and restarting restores the WebSocket transport. The SSE endpoint remains
+available to older clients and bridge/relay consumers. A reconnect negotiates the transport again;
+no terminal input is replayed by this subscription.
+
+A page takes machine events over SSE whenever its socket does not carry them: a connection that
+has not said whether it does within five seconds, a socket stopped for output (4008, which only
+reconnects on an attach), or a connection whose server sent `machine-events-ended`. Machine events
+never close the terminal or stall its output: one that would put more than `OUTPUT_LOW_BYTES`
+(64 KiB) on the socket, counting what is queued already, ends the subscription with that frame
+instead. A roster carries every PC's snapshot, so a page whose roster is larger than that takes
+machine events over SSE, one stream per tab as before this transport. The next connection that offers the capability takes over
+from SSE again.
+
+This avoids consuming one long-lived HTTP/1.1 request per browser tab. It does not make every tab
+share its rendered conversation, terminal or JavaScript heap, and is not a claim of a measured RAM
+reduction. Compare the same pages, conversation sizes and activity before claiming one. In
+particular, the conversation cache's byte budget is an upper bound on retained serialized answers,
+not a measurement of a tab's resident memory or its parsed objects and rendered nodes.
 
 ## Checks
 
@@ -192,16 +256,30 @@ bun scripts/key-bar-customization-demo-regression.ts # mobile key layout, handle
 bun scripts/key-bar-hold-repeat-regression.ts # phone touch key-bar taps, holds (arrows and editing keys), swipes and sticky Ctrl on demo fixtures
 bun scripts/settings-pages-demo-regression.ts # every Settings page on a 390px and a 320px phone, and Back stepping out of the dialog
 bun scripts/agent-entry-points-demo-regression.ts # Add another agent… in New workspace and New worktree, Settings' agent list (installed, the tiles to install) and Open setup guide, and none of it on a watching device, at 1280 and 390
+bun scripts/terminal-served-font-regression.ts # a Terminal or Chat font only the PC has, served from the state folder's fonts/, at 1280 and 390, light and dark: the terminal is measured from it and attached once; no font named asks nothing
 bun scripts/interface-font-demo-regression.ts # Interface font at 390 and 1440: System and a typed list lead --font-ui, a reload keeps it, Default restores it; the message box takes the Chat font
+bun scripts/file-text-size-demo-regression.ts # Settings → File text size at 390 and 1280, light and dark: a Markdown preview follows the chat and a source the interface until a size is chosen, then both take it while the chat and the viewer's header stay; Reset drops it
+bun scripts/text-file-edit-regression.ts # Settings → Chat → File viewer → Edit text files at 1280 and 390, light and dark, on an owned herdr pane: off by default; on, Save asks once more and writes, Cancel leaves the file, a file changed on the PC is not overwritten (Reload file shows it), a read-only file says it can't be written
+bun scripts/files-panel-demo-regression.ts # Settings → Chat → Files beside the pane at 1280 and 390, light and dark: off, Files is the dialog; on, a wide window shows it right of the pane with the pane live, a docked file takes its place and closing it brings the list back; a phone keeps the sheet
+bun scripts/files-documents-demo-regression.ts # Files' Documents tab, always there (a stored old off ignored), at 1280 and 390, light and dark: it lists the pane folder's Markdown files newest first, the filter narrows them and Escape clears it, a row opens the file viewer, in the dialog, beside the pane at its narrowest and on a phone's sheet with the four tabs on their own row, and closing the file after a reload under the palette goes back to the pane
+bun scripts/palette-local-page-demo-regression.ts # Web links on In the app, at 1280 and 390, light and dark: the palette opens a page this PC serves by its typed address (`localhost:<port>`) beside the pane, a phone's popup closes with Back, and Close page over two stacked pages closes it, as it does after a reload under the palette, and so does closing a file docked over them; off by default, the palette offers no page
 bun scripts/theme-first-paint-demo-regression.ts # the saved theme in every painted frame before and after the app starts, root and demo builds under the app's CSP
 bun scripts/boot-loading-demo-regression.ts # index.html's loading spinner while the app's script is held, as on a slow link: centred, stepped, still under reduced motion, gone with the app's first frame (#2329)
-bun scripts/old-safari-demo-regression.ts # a chat pane and a terminal pane draw with the built-ins iOS 16 lacks (Promise.withResolvers, AbortSignal.any, and crypto.randomUUID on plain http) taken away before the app's script runs, under the app's CSP (#2513)
+bun scripts/old-safari-demo-regression.ts # a chat pane and a terminal pane draw with the built-ins iOS 16 lacks (Promise.withResolvers, AbortSignal.any, and crypto.randomUUID on plain http) taken away before the app's script runs, under the app's CSP (#2513), and again with each lookbehind handed to RegExp as text refused, as Safari before 16.4 refuses it; the build turns every regular expression with one into such a call (#2534)
+bun scripts/alert-webhook-demo-regression.ts # Settings → Alerts → Also send to on demo fixtures: a Discord webhook saved and shown only masked, a test sent, Telegram's chat id, Off removing it, at 390 and 1280, light and dark
 bun scripts/push-health-demo-regression.ts # the alerts health notice with a stand-in PushManager: a retired subscription told once over the pane and in Settings, repaired once; a refusal, a key mismatch, denied, unsupported, offline, loading and a watching device's refused test, at 390 and 1440, light and dark, Korean at 390
+bun scripts/install-hint-demo-regression.ts # the add-to-home-screen line on a phone's browser tab: iPhone steps with the share glyph, Android's menu item then one-tap Install, dismissal and install remembered, none in the home-screen app or on desktop, light and dark, Korean
 bun scripts/device-security-demo-regression.ts # Phone & devices on demo fixtures: revoking every device (the caller's warning, the confirmation, a refused write, a watching device) and the line every window gets when a device pairs
 bun scripts/chat-browser-qa.ts  # chat lens end to end
+bun scripts/conversation-search-browser-qa.ts # Search conversation at 1280 and 390: matches newest first, a pick four pages back read and put at the top, no match, a match no longer there
+bun scripts/conversation-search-demo-regression.ts # Search conversation in the app on demo fixtures at 1280 and 390: the pane's menu and the palette open it, a pick opens the chat there, and a bridge without `conversation-search` offers none
 bun scripts/omo-plan-browser-regression.ts # OmO todo progress and plan panel on isolated native fixtures
 bun scripts/pane-input-focus-demo-regression.ts # the input focus shortcut against fictional panes
 bun scripts/mirror-scroll-demo-regression.ts # fixed mirror wheel/touch, native history, no guessed program input, observe guards
+bun scripts/terminal-images-demo-regression.ts # Settings -> Pictures in the terminal: a picture is drawn, goes while off, and on again the next one is drawn only where it was printed
+bun scripts/core-history-scroll-demo-regression.ts # a herdr-core server's history kept in xterm: wheel and swipe scroll it, a replay erases the last one, nothing typed; herdr's own keeps none (#2663)
+bun scripts/codex-drag-demo-regression.ts         # a plain drag in a Codex pane stays Ovis's selection unless Settings' Codex panes is on; then it is Codex's, with a Shift+drag note on herdr (#2384)
+bun scripts/terminal-ghostty-demo-regression.ts # libghostty draws every pane: a herdr-core pane from its first byte, a Kitty picture placed and deleted, typing still through xterm, herdr's own panes too; xterm draws an iTerm2 picture by itself
 bun scripts/mirror-fold-demo-regression.ts # a mirror, or an attached pane a phone watches at a wider grid, folded whole (portrait, landscape), Original width from the pane menu, driving phones and desktops unfolded
 bun scripts/shortcut-exact-modifiers-demo-regression.ts # recording exact-modifier chords: confirm, refusals, dispatch
 bun scripts/output-browser-qa.ts # terminal output flow control end to end
@@ -232,8 +310,10 @@ For isolated phone viewer and keyboard layout regressions (no herdr session; the
 bun scripts/file-viewer-mobile-regression.ts  # 8 viewport cases × tall/wide images
 bun scripts/keyboard-viewport-regression.ts   # keyboard, rotation and measured standalone status inset
 bun scripts/keyboard-viewport-demo-regression.ts # original real-app viewport suite on disposable demo fixtures
-bun scripts/terminal-keyboard-demo-regression.ts # the key bar's Show/Hide keyboard control: current-mode focus, measured state, composition refusal, observe/held/offline/ended; `--serve-ios` only serves the build on loopback for a Simulator
+bun scripts/unconfirmed-input-demo-regression.ts # typing the socket took but the server never read, then a dropped connection: held for review, not lost and not sent after the reconnect (#2587)
+bun scripts/terminal-keyboard-demo-regression.ts # the key bar's Show/Hide keyboard control: current-mode focus, measured state, Keyboard only from the key bar (inputmode=none until Show), Fold the key bar (the row folded under the line, Terminal keys, held modifiers let go on a fold), composition refusal, observe/held/offline/ended; `--serve-ios` only serves the build on loopback for a Simulator
 bun scripts/droplet-demo-regression.ts        # real-app alerts below the header, keyboard and landscape
+bun scripts/phone-safe-area-demo-regression.ts # sheets, dialogs and menus clear of emulated safe-area insets: upright, short and landscape
 bun scripts/chat-greeting-demo-regression.ts  # an empty chat's greeting: centred on a desktop, docked on a phone
 bun scripts/reply-comments-demo-regression.ts # comments on a reply (#511): the floating Comment moves nothing, one chip, the next message carries them for an agent alone, a slash command leaves them; 1280 and 390, Codex palette in UI_EVIDENCE_DIR
 bun scripts/chat-select-quote-demo-regression.ts # Quote on a chat selection: Quote first and Comment second, the words go in the message box as a `> ` quote after the draft, it takes the keyboard, quotes stack, nothing is sent until Send, then for an agent alone; 1280 and 390, Codex palette in UI_EVIDENCE_DIR
@@ -243,12 +323,22 @@ bun scripts/diff-line-notes-demo-regression.ts # a note on a diff line (#1603): 
 bun scripts/composer-fit-demo-regression.ts   # one Send/Stop control, pending Send now actions, context/label fit and Chat font sizing
 bun scripts/plan-chip-demo-regression.ts      # the plan chip's step in progress: one row at 390 and 1440, cut when long, with tasks, the list's read states, offline and in a split, Korean too
 bun scripts/held-rows-demo-regression.ts      # held messages: the fold under an approval card, its button, a row's error
-bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms before the pane rests, and a finished turn not reopened when the agent begins another by itself
+bun scripts/chat-working-line-demo-regression.ts # the Working head: none before a working pane's first read, none under an answer drawn 300 ms or 1.5 s before the pane rests or read in with the last answer's start time or drawn while blocked, a finished turn not reopened when the agent begins another by itself, a turn kept at work until its answer is read after herdr rests, and an empty chat's greeting kept through a /clear's short working status
+bun scripts/sidebar-split-demo-regression.ts # PCs/Agents height split at 390 and 1280, both orders, light and dark: default, drag, per-order persistence, reset, keyboard and snap-folds (Agents only; the PCs stop at a row), list scrolling and containment, touch target and a short-window clamp; synthetic screenshots in UI_EVIDENCE_DIR
+bun scripts/sidebar-split-access-demo-regression.ts # divider review regressions: filter context and focus return, forced-colors focus, short folded phone windows, a drag or Home to the PCs' top never folding them, click-to-focus, live drag percentage, pointer ownership and cancellation, held-snap regrouping and two-line Agents minimums in both densities/orders; synthetic demo only
+bun scripts/sidebar-peek-demo-regression.ts # Settings → Show the sidebar on hover (#2588): off by default; on, the collapsed sidebar's toggle hover shows it over the pane at 1280 without moving the pane or the focus, the trip in keeps it, a row opens its pane, a field focused by keyboard and a row dragged in it hold it, an empty filter's Escape and leaving or Escape hide it, a click keeps it open; a phone's drawer unchanged at 390; light and dark screenshots in UI_EVIDENCE_DIR
+bun scripts/sidebar-heads-demo-regression.ts # no PCs head (also for a lone Host), and the Agents head counts and always shows its caret, open and folded, in both orders; a PC header's agent count traded for its actions on hover and keyboard focus, actions always under a finger, a press on the name folding it; folded PCs one row each; each list fading only at an edge with rows past it, none in forced colors; synthetic screenshots at 390 and 1280 in UI_EVIDENCE_DIR
 bun scripts/sidebar-activity-demo-regression.ts # Agents order Activity and pins: blocked pinned, recency, Pin agent / Unpin agent and Pin workspace / Unpin workspace from a right-click and the context-menu key, the ⋯ on a phone, and a finish opened here drawn as ready until the next one
-bun scripts/hide-pc-demo-regression.ts       # Remote PCs → Show in sidebar at 390 and 1440 on two demo PCs: a hidden PC leaves the sidebar, Agents and palette, the selection moves, the last PC stays, a reload keeps it, its link still opens, the sidebar's note shows it again
+bun scripts/hide-pc-demo-regression.ts       # Remote PCs → Show in sidebar at 390 and 1440 on two demo PCs: a hidden PC leaves the sidebar, Agents and palette, the selection moves, the last PC stays, a reload keeps it, its link still opens, Settings shows it again; on three PCs at 390 and 1280, light and dark, no PCs head or hidden count, the list starting the section, and Settings listing the hidden ones off, showing one again and keeping the last PC shown on
+bun scripts/pc-load-demo-regression.ts       # Remote PCs → PC load in the sidebar on three demo PCs at 390 and 1280: on by default, red from 85%, none for a herdr-core machine, no ask while the drawer or list is out of view, off in its own key; the meters fit a 240px sidebar; screenshots light and dark in UI_EVIDENCE_DIR
 bun scripts/sidebar-filter-demo-regression.ts # the roster's label filter on two demo PCs: fuzzy matches with their ancestors, the selection kept as context, pins and folds untouched, a live and an offline roster, the drawer and a reload clearing it; screenshots at 390 and 1440 in UI_EVIDENCE_DIR
 bun scripts/sidebar-branch-line-demo-regression.ts # herdr's branch line: a repository and an unmarked git folder say their branch under the name, worktrees and folders outside git stay one line, desktop and phone, dark and light
+bun scripts/agent-lock-demo-regression.ts # Lock agent on a pinned Agents row (#2432): only a pinned row locks, a locked one keeps its pin, draws a lock and its tab offers no Close tab; Unlock brings Unpin back; 390 and 1280, light and dark
+bun scripts/agent-groups-demo-regression.ts # Named agent groups (#2431): a row's menu moves it into a group, drawn under its own heading with its count, which folds it; New workspace offers the groups; 390 and 1280, light and dark
 bun scripts/sidebar-tokens-demo-regression.ts # herdr plugin tokens on agent rows: a dim line of their own on One line and Two lines, cut with the whole text in the tooltip and a phone's sheet, as text, following herdr's `$name` rows, and changing live
+bun scripts/sidebar-context-ring-demo-regression.ts # Settings → Context left on agent rows (#1305): off by default; on, the composer's context ring, words and 20% threshold on the rows whose window is known, the row's height kept, following the roster; 390 and 1280, light and dark
+bun scripts/sidebar-background-workspaces-demo-regression.ts # Settings → Background workspaces apart (#770): off keeps herdr's order; on, workspaces tagged role=background stand after the others under a folded heading with their count, a tagged worktree stays with its repository, the open one and a question stay in sight, the fold kept per PC; 390 and 1280, light and dark
+bun scripts/agent-helpers-fold-demo-regression.ts # Settings → Fold helpers under their agent (#772): off by default; on, an agent's helpers fold under a counted line that keeps a blocked helper in sight, opens and stays open on this device, and gives way to the filter; 390 and 1280, light and dark
 bun scripts/sidebar-selection-contrast-demo-regression.ts # the selected workspace and agent rows in every theme entry, selected, hovered and focused: the fill alone with no leading stroke (its contrast recorded), every text at 4.5:1, a Highlight bar at 3:1 in forced colors; the table and the Codex shots at 1280 and 390 in UI_EVIDENCE_DIR
 bun scripts/pane-mute-demo-regression.ts    # Mute alerts from an agent's row menu: one shared list for push, droplet, chime and tab notification, two tabs of one server, a second PC's same-named pane, an older server and a watching device
 bun scripts/prompt-dock-demo-regression.ts    # the prompt card docked over the input card: its place, its height on a short phone, the grip, a typed pick
@@ -260,6 +350,7 @@ bun scripts/agent-skill-menu-demo-regression.ts [agent …] # each agent's `/` (
 bun scripts/install-state-demo-regression.ts  # Install app against a real CDP install on a throwaway profile and HOME: never in the sidebar; Settings > Install shows the help or the prompt before, Installed in the app window and a tab of its origin, the help again after uninstall
 bun scripts/terminal-paste-insert-demo-regression.ts # a phone's Paste key into the terminal's input line and Insert without Enter on the demo shell: the caret, a held or refused clipboard read, the acknowledged clear, an older bridge; with UI_EVIDENCE_DIR, every state at 390 and 1440, light and dark, and Korean
 bun scripts/link-menu-demo-regression.ts       # a long press on a chat link in the Android app: Copy link, Open link and, where the WebView shares, Share link; a tap, other words, a mouse's menu, a swipe and a browser keep their own; with UI_EVIDENCE_DIR, the sheet at 390 in English and Korean
+bun scripts/external-link-tab-regression.ts  # the app's link opener in Chromium on loopback pages: with Reuse tab for external links on, a second link replaces the first one's tab; off, each gets its own tab with no opener; no referrer either way
 ```
 
 `FILE_VIEWER_CASE=landscape-notch` selects a viewer case; `FILE_VIEWER_CSS=/path/to/before.css` compares another stylesheet. These checks use Chromium mobile emulation and synthetic safe-area/keyboard geometry; they cannot verify actual iOS Safari keyboard dismissal or notch insets. The existing `bun scripts/file-viewer-regression.ts` separately checks history with an owned herdr pane. The original `scripts/mobile-viewport-regression.ts` exports `checkMobileViewport` for the real-app `bun run test:ui` suite; it also checks the command palette and xterm focus transitions. The demo runners build the real client into a temporary directory, inject the committed fictional-session transport and serve it only on loopback; they do not use a live herdr session or download website media. Run on its own, each builds the client itself (`scripts/demo-build.ts`); the browser lane builds it once and names the directory in `HERDR_DEMO_BUILD`, and each runner copies that instead. They exercise real-app viewport and alert geometry, but not live herdr connectivity.
@@ -319,7 +410,9 @@ their progress and hide older sessions; ordinary Pi headers are only a few hundr
 A file whose header is not yet complete has no row yet, never a
 guessed identity. Files completed in that first chunk publish their EOF-checked labels immediately.
 The subsequent full label scans share a two-second deadline measured from before the header pass,
-including all queue time. Tests may lengthen both phase deadlines with `piSessionDeadlineMs`.
+including all queue time. When the header pass leaves less than a quarter of that deadline, the
+label scans still get a quarter of it, so a slow disk fills labels over later opens instead of
+never. Tests may lengthen both phase deadlines with `piSessionDeadlineMs`.
 No full scan begins or continues past its deadline. Concurrent listings keep
 independent deadlines, even when reading the same transcript.
 Only clipped metadata and a bounded record projection are retained during a scan. A size and
@@ -471,6 +564,29 @@ timer. Terminal-only and hidden clients do not keep a conversation monitor alive
 resolves through existing provider/process evidence, checks file identity, size and timestamps
 without parsing turns, and rechecks session resolution every 5 s (2 s while a transcript is
 missing). The last interested client, failed/ended attachment and server stop release it.
+
+A client that shows a pane's chat and no terminal follows it without attaching it: bridges that
+advertise `"conversation-watch-detached"` take `conversation-watch {pane_id, enabled, detached:true}`.
+That interest survives the same connection attaching and detaching the pane, and ends with a
+`detached:true` disable or the connection; at most 32 per connection
+(`too_many_conversation_watches`). The browser does not send it.
+
+Prompts an idle agent opens (Codex's or Claude's folder-trust menu) change no agent status.
+Bridges that advertise `"prompt-watch"` take `prompt-watch {pane_id, enabled}` and send
+`prompt-changed {pane_id, signature}` with the watch's first read and whenever the prompt on the
+pane's screen opens, closes or becomes another one; GET `/api/pane/prompt` stays authoritative.
+One 500 ms loop for the whole server reads each watched pane once however many clients watch it,
+at most four at a time, blocked panes included: a form of several steps moves to its next one while
+the pane stays blocked, with no pane-status to say so. A working pane is read: Codex asks the
+questions in its queue while it works. A pi pane is not read at all, as its pi-ask card keeps the
+answers to earlier steps in a draft a late read of an older form would replace. The prompt is compared by its text alone, and OpenCode's forms and omp's session lookups are read into a state of the
+watches' own, so a watch's reads start or end no asking and never move the ids, drafts or call
+bindings `/api/pane/prompt` hands out. A blocked screen no reader knows is told by the fallback card
+GET offers for it, and an OpenCode form with the route's draft (read only), so an answer that moves
+its card to the next question is told too. A closed pane, or 10 failed reads of it in a row, ends the watch with
+an error `prompt_watch_ended`; a snapshot herdr does not answer (a restart) ends none. At most 32
+per connection (`too_many_prompt_watches`); a second watcher of a pane already read gets the
+current `prompt-changed` at once. The browser does not send it.
 
 Newest-page refreshes are single-flight. Push-triggered reads start at least 1 s apart using
 monotonic elapsed time, with one trailing refresh at a fixed deadline: continuous writes cannot
@@ -697,6 +813,36 @@ signing secrets are unset ([app/mac/README.md](../app/mac/README.md#releases)), 
 `Ovis.exe` ([app/windows/README.md](../app/windows/README.md#releases)); the release becomes GitHub's
 latest only once it has both. A red `mac-dmg` or `windows-app` job leaves the release published: run
 **Actions → Mac app** or **Actions → Windows app** for its tag instead of releasing again.
+
+The **Desktop app** job (`.github/workflows/desktop.yml`) builds the desktop app
+([app/electron](../app/electron/README.md)) from the tag, each on its own OS and CPU, under names
+without the version, so `releases/latest/download/<name>` always gives the newest:
+`Ovis-linux-x64.deb`, `Ovis-linux-arm64.deb` (the download for Ubuntu and Debian),
+`Ovis-linux-x64.AppImage`, `Ovis-linux-arm64.AppImage`, `Ovis-mac-arm64.dmg`, `Ovis-mac-x64.dmg`, and
+`Ovis-mac-arm64.zip`, `Ovis-mac-x64.zip` (what a Mac app updates from), and `Ovis-win-x64.exe` (a
+per-user NSIS installer; signed only once the repository variable `DESKTOP_WIN_SIGN` is `true`, with
+the `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` secrets), with their `.blockmap` files.
+The AppImage carries the static AppImage runtime (electron-builder's `toolsets.appimage`), so it
+needs no libfuse2, only the fuse3 a desktop has; without FUSE at all it runs with
+`APPIMAGE_EXTRACT_AND_RUN=1`. Its version is the tag's: the build
+stops unless `package.json` says the same. It attaches them with the update feed: `latest-linux.yml`,
+`latest-linux-arm64.yml`, `latest.yml` for Windows and one `latest-mac.yml` for both Macs (the two Mac
+builds' feeds merged by `bun app/electron/scripts/build.ts merge-feed`). The app is built to update from
+`https://github.com/devswha/ovis/releases/latest/download` (electron-updater's generic provider), so
+an installed app sees a version once it is GitHub's latest, the same moment `ovis.sh/Ovis.dmg` and
+`ovis.sh/Ovis.exe` move (that `Ovis.exe` is still the Windows setup app, `windows-app.yml`). The
+AppImage, the Mac app and the Windows app update themselves; a deb is updated by installing the new
+one.
+The Macs' files are unsigned, and a Mac app updates itself only when signed, until the repository
+variable `DESKTOP_MAC_SIGN` is `true`: then the build signs and notarizes with the same
+`MAC_*` secrets as Ovis for Mac ([app/electron](../app/electron/README.md)'s signing, with
+`OVIS_REQUIRE_NOTARIZATION=1`) and fails if one is missing or the dmg is not notarized. The `mac-dmg` and `windows-app` jobs
+wait for `desktop`, so the release becomes latest only with the desktop files in it; a red `desktop`
+job leaves the release published but holds them back: **Re-run failed jobs** on the Release run
+builds and attaches it again (`--clobber`), then runs them. **Actions → Desktop app** from `main`
+with a tag does the same for one release alone, and refuses the latest release, whose feed installed
+apps read (fix that one with a new patch release); without a tag it only builds, as on a pull
+request touching the app. A release build skips the app's unit tests, which its pull requests ran.
 Do not push release tags by hand: installed updaters read Git tags directly, so a tag is
 visible to them even without a GitHub release. Existing tags cannot be reused; fix a
 published version with a new patch release. If publishing fails after a tag was created,
@@ -911,12 +1057,14 @@ The [CI workflow](../.github/workflows/ci.yml) runs on every PR and `main` push:
     Missing herdr fails the run. Its herdr servers are stopped even on failure.
     Integration tests have a 15-second default timeout so their bounded process-startup
     probes can finish; individual tests can still specify a longer timeout.
-  - **Browser regression (ui-regression)** runs `scripts/ui-regression.ts` and
-    `scripts/ui-contexts-regression.ts` concurrently. The core's stateful flow stays serial;
-    the extracted feature checks own a separate temporary herdr config/session, Chromium
-    process, server and fixture panes. Those helpers stay sequential within their own fixture.
-    The context suite prints each helper's elapsed time and stops its owned daemon on exit.
-    `bun run test:ui` also runs both suites.
+  - **Browser regression (ui-regression)** runs `scripts/ui-regression.ts`,
+    `scripts/ui-contexts-regression.ts` and `scripts/ui-contexts-layout-regression.ts`, two at a
+    time. The core's stateful flow stays serial; the extracted feature checks own a separate
+    temporary herdr config/session, Chromium process, server and fixture panes. Those helpers stay
+    sequential within their own fixture. The two slowest (split view, a background tab's terminal
+    size) run in the layout script, on a fixture of their own, so neither context script nears
+    the per-script cap. Each context script prints each helper's elapsed time and stops its owned
+    daemon on exit. `bun run test:ui` also runs all three.
   - **Browser regression (other scripts)** runs every other browser script: six at a time in
     one job on self-hosted CI, and on hosted CI split over four jobs (`BROWSER_SHARD=k/4`,
     balanced by `scripts/ci-browser-timings.json`) that run three at a time each.
@@ -1000,17 +1148,33 @@ pages or credentials.
 ### Self-hosted runner
 
 `ci.yml`'s Linux jobs of a push run on the maintainer PC's runners (labels
-`["self-hosted","self-hosted-ovis"]`) by default; other events, pull requests included, stay on
-`ubuntu-24.04`, so a pull request's timing-sensitive browser checks do not share that PC's CPU with
-the agents working there. The repository variable `CI_SELF_HOSTED_LABELS` overrides that (labels
-send same-repository pull requests back to the self-hosted runners) with another JSON array of runner labels that contains `"self-hosted"`, or with the
-JSON string `"ubuntu-24.04"` to keep every job GitHub-hosted while that PC is offline. `pages.yml`
-and `release.yml` stay on `ubuntu-24.04` unless the variable holds labels. The variable routes:
+`["self-hosted","self-hosted-ovis"]`) by default. A same-repository pull request goes there too
+while those runners have room for its four Linux jobs, and to `ubuntu-24.04` (with the browser
+checks sharded) when they do not, so neither pool queues while the other sits idle. The workflow
+token cannot list runners, so Detect changes counts room from the Actions API: the repository
+variable `CI_SELF_HOSTED_CAPACITY` (default 10, the PC's `self-hosted-ovis` runners) minus the
+queued and running jobs of every workflow that target those labels. When that count fails, the
+pull request stays hosted. Other events stay on `ubuntu-24.04`. The repository variable
+`CI_SELF_HOSTED_LABELS` overrides that (labels send every same-repository pull request to the
+self-hosted runners) with another JSON array of runner labels that contains `"self-hosted"`, or with the
+JSON string `"ubuntu-24.04"` to keep every job GitHub-hosted while that PC is offline (unless
+`CI_LIGHT_LABELS`, below, holds labels: it wins for the light jobs). `release.yml`
+stays on `ubuntu-24.04` unless the variable holds labels. The variable routes:
 
 - in `ci.yml`: Fast checks, Integration tests and both Browser regression jobs;
-- in `pages.yml`: the site build and the deploy after successful same-repository main push CI,
-  or on a manual dispatch with reusable CI validation;
 - in `release.yml`: the preflight and publish jobs.
+
+Light jobs, which wait longest in GitHub's hosted queue for the few seconds they run, take the
+self-hosted runners for every same-repository run: Detect changes, the herdr-core live contract and
+the Integration and browser summary in `ci.yml`, `pr-title.yml`, `remote-bundles.yml`'s Windows
+bundle, and `pages.yml`'s site build and deploy (after successful same-repository main push CI, or
+on a manual dispatch with reusable CI validation). Their `runs-on` sends a fork pull request to
+`ubuntu-24.04` before it reads any variable; a push to main then takes `CI_MAIN_SELF_HOSTED_LABELS`
+when it is set (on a push or a run started from main), so main's Detect changes never waits behind pull requests; otherwise the job takes the repository variable `CI_LIGHT_LABELS`,
+else `CI_SELF_HOSTED_LABELS`, else `["self-hosted","self-hosted-ovis"]`; `"ubuntu-24.04"` in
+either variable keeps them hosted. They ignore the `self_hosted_labels` dispatch input, and
+`scripts/ci-runner-route.sh` leaves them out of the busy count, since each holds a runner for seconds. `scripts/light-runner-workflow.test.ts` fails when a job a pull
+request runs can reach a self-hosted runner without that guard or the route below.
 
 A push to main takes the repository variable `CI_MAIN_SELF_HOSTED_LABELS` over
 `CI_SELF_HOSTED_LABELS` when it is set: `["self-hosted","self-hosted-ovis-main"]` sends main's Linux
@@ -1019,9 +1183,9 @@ request runs, and `"ubuntu-24.04"` keeps only main GitHub-hosted. `CI_SELF_HOSTE
 `"ubuntu-24.04"` still keeps every job hosted. Delete the variable while no reserved runner is online,
 or main's jobs wait for one.
 
-Detect changes, the Integration and browser summary, the Windows and macOS jobs,
-`remote-bundles.yml`, `windows-install.yml`, `windows-terminal-qa.yml` and `pr-title.yml` always
-stay GitHub-hosted.
+The Windows and macOS jobs, the Rust PTY host job (the runner image has no Rust toolchain),
+`remote-bundles.yml`'s other jobs (Rust builds, and the SSH job's `sudo apt-get` and Docker),
+`desktop.yml`, `windows-install.yml` and `windows-terminal-qa.yml` always stay GitHub-hosted.
 
 In `ci.yml`, Detect changes picks the runner with `scripts/ci-runner-route.sh`. A fork pull request
 always gets `ubuntu-24.04`, whatever the variable says. Since that script runs from the pull

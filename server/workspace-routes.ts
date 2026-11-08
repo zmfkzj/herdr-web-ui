@@ -8,7 +8,8 @@ import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { MAX_LABEL_CHARS } from "../shared/labels.ts";
-import { firstMessageFault } from "../shared/launch-rules.ts";
+import { MAX_INVENTORY_WORKSPACES, type WorktreeInventoryEntry } from "../shared/workspace-lifecycle.ts";
+import { argumentText, firstMessageFault } from "../shared/launch-rules.ts";
 import type { DirectoryCreated, PendingMessage, ServerMessage, TabMoved, TabMovedToWorkspace, WorkspaceMoved } from "../shared/protocol.ts";
 import type { MoveReceipt } from "./order-sequence.ts";
 import { agentFault, agentLaunch, type AgentPayload } from "./agent-launch.ts";
@@ -16,7 +17,9 @@ import { createDirectory, listDirectories } from "./directories.ts";
 import { HerdrError, paneMoveToNewTab, sessionSnapshot, tabClose, tabCreate, tabMove, tabRename, workspaceClose, workspaceCreate, workspaceMove, workspaceRename, worktreeCreate, worktreeList, worktreeOpen, worktreeRemove } from "./herdr/client.ts";
 import { badRequest, conflictResponse, errorResponse, isJsonObject, jsonResponse, readJsonObject, setRequestRoute } from "./http.ts";
 import { paneContext } from "./pane-context.ts";
+import { PullRequestError, mergeInputOf, mergePullRequest, pullRequestLog, pullRequestView } from "./pull-request.ts";
 import { repoDiffResponse } from "./repo-diff.ts";
+import { repoLogResponse } from "./repo-log.ts";
 import type { ShellAgentLocator } from "./shell-agent.ts";
 
 /** `value` as an absolute path (`~` expanded) when it is a directory this user can read; null otherwise. */
@@ -29,6 +32,61 @@ export function expandedDirectory(value: string): string | null {
   }
 }
 
+/**
+ * The folder a repository route reads: the pane's own, or `directory` (absolute, `~/…`, or relative to
+ * the pane's folder). A refusal in the API's envelope when there is none.
+ */
+async function routeFolder(paneId: string | null, directory: string): Promise<string | Response> {
+  if (!paneId && directory === "") return badRequest("missing_directory", "pane_id or directory query parameter is required");
+  let base: string | undefined;
+  if (paneId) {
+    try { base = (await paneContext(paneId)).cwd; } catch (error) {
+      // a named folder is still read; the pane's own folder is gone with the pane
+      if (directory === "") return errorResponse(error);
+    }
+  }
+  let cwd = base;
+  if (directory !== "") {
+    const relative = directory !== "~" && !directory.startsWith("~/") && !isAbsolute(directory);
+    if (relative && base === undefined) return badRequest("invalid_cwd", "a relative directory needs the pane it belongs to");
+    cwd = expandedDirectory(relative ? resolve(base!, directory) : directory) ?? undefined;
+  }
+  return cwd ?? badRequest("invalid_cwd", "directory must be a directory this user can read");
+}
+
+/** the most variables a create request's `env` may set */
+export const MAX_ENV_VARS = 64;
+/** the most a create request's `env` may hold, its names and values in UTF-8 bytes */
+export const MAX_ENV_BYTES = 32 * 1024;
+/** an environment variable's name as a shell takes it in `NAME=value` */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * How long one inventory read keeps asking herdr: a workspace still unread then is answered as a timed-out
+ * read, so a stalled herdr (10 s per call) cannot hold the answer past the request's 60 s idle limit.
+ */
+export const INVENTORY_BUDGET_MS = 30_000;
+
+/**
+ * What is wrong with a create request's `env`, in the API's words; null when herdr can set it (or there
+ * is none). Values are text without control characters, a tab or line break included; the answer
+ * never repeats a value, which may be a key.
+ */
+function envFault(env: unknown): string | null {
+  if (env === undefined) return null;
+  if (!isJsonObject(env)) return "env must be an object of names to string values";
+  const entries = Object.entries(env);
+  if (entries.length > MAX_ENV_VARS) return `env may set at most ${MAX_ENV_VARS} variables`;
+  let bytes = 0;
+  for (const [name, value] of entries) {
+    // the name is quoted and cut: before this check it may hold anything
+    if (!ENV_NAME.test(name)) return `env name ${JSON.stringify(name.slice(0, 64))} must be letters, digits and _, not starting with a digit`;
+    if (typeof value !== "string" || !argumentText(value)) return `env.${name} must be a string without control characters`;
+    bytes += Buffer.byteLength(name) + Buffer.byteLength(value);
+  }
+  if (bytes > MAX_ENV_BYTES) return `env may hold at most ${MAX_ENV_BYTES} bytes`;
+  return null;
+}
+
 /** a create request's first message the bridge could not queue for the agent that did start: its own refusal */
 const notQueued = (error: unknown): { error: { code: string; message: string } } => ({ error: {
   code: typeof (error as { code?: unknown } | null)?.code === "string" ? (error as { code: string }).code : "first_message_not_queued",
@@ -39,7 +97,9 @@ const notQueued = (error: unknown): { error: { code: string; message: string } }
 export async function handleWorkspaceRequest(request: Request, url: URL, pathname: string, bunServer: Pick<ServerContext, "timeout">, broadcastAll: (message: ServerMessage) => void,
   queueFirstMessage: (paneId: string, text: string, kind: string, requester: string | null, launchedPid: number | null) => Promise<PendingMessage>,
   /** a move herdr confirmed: its receipt in this server's order (server/order-sequence.ts), taken at once */
-  workspaceMoved: () => MoveReceipt, shellAgents?: ShellAgentLocator): Promise<Response | null> {
+  workspaceMoved: () => MoveReceipt, shellAgents?: ShellAgentLocator,
+  /** false: the folders are another machine's, which hc checks as it starts the shell there */
+  localFolders = true): Promise<Response | null> {
   if (pathname === "/api/workspace/directories" && request.method === "POST") {
     setRequestRoute(pathname);
     let payload: unknown;
@@ -76,24 +136,52 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
     if (request.method !== "GET") return badRequest("method_not_allowed", "use GET");
     // file contents, like /api/fs/file: this app reads them, another site's page does not
     if (request.headers.get("sec-fetch-site") === "cross-site") return jsonResponse({ error: { code: "cross_site", message: "A repository's changes are read from this app" } }, 403);
-    const paneId = url.searchParams.get("pane_id");
-    const directory = (url.searchParams.get("directory") ?? "").trim();
-    if (!paneId && directory === "") return badRequest("missing_directory", "pane_id or directory query parameter is required");
-    let base: string | undefined;
-    if (paneId) {
-      try { base = (await paneContext(paneId)).cwd; } catch (error) {
-        // a named folder is still read; the pane's own folder is gone with the pane
-        if (directory === "") return errorResponse(error);
-      }
-    }
-    let cwd = base;
-    if (directory !== "") {
-      const relative = directory !== "~" && !directory.startsWith("~/") && !isAbsolute(directory);
-      if (relative && base === undefined) return badRequest("invalid_cwd", "a relative directory needs the pane it belongs to");
-      cwd = expandedDirectory(relative ? resolve(base!, directory) : directory) ?? undefined;
-    }
-    if (cwd === undefined) return badRequest("invalid_cwd", "directory must be a directory this user can read");
+    const cwd = await routeFolder(url.searchParams.get("pane_id"), (url.searchParams.get("directory") ?? "").trim());
+    if (cwd instanceof Response) return cwd;
     return repoDiffResponse(pathname.endsWith("/files") ? "files" : pathname.endsWith("/refs") ? "refs" : "file", cwd, url.searchParams);
+  }
+
+  if (pathname === "/api/workspace/git/log" || pathname === "/api/workspace/git/branches" || pathname === "/api/workspace/git/show") {
+    setRequestRoute(pathname);
+    if (request.method !== "GET") return badRequest("method_not_allowed", "use GET");
+    // commit messages and branch names are the repository's contents, read like its changes
+    if (request.headers.get("sec-fetch-site") === "cross-site") return jsonResponse({ error: { code: "cross_site", message: "A repository's history is read from this app" } }, 403);
+    const cwd = await routeFolder(url.searchParams.get("pane_id"), (url.searchParams.get("directory") ?? "").trim());
+    if (cwd instanceof Response) return cwd;
+    return repoLogResponse(pathname.endsWith("/log") ? "log" : pathname.endsWith("/branches") ? "branches" : "show", cwd, url.searchParams);
+  }
+
+  // The branch's pull request, through this PC's own gh sign-in: read like the changes, merged only on a POST
+  if (pathname === "/api/workspace/pr" || pathname === "/api/workspace/pr/log" || pathname === "/api/workspace/pr/merge") {
+    setRequestRoute(pathname);
+    const merging = pathname.endsWith("/merge");
+    if (request.method !== (merging ? "POST" : "GET")) return badRequest("method_not_allowed", merging ? "use POST" : "use GET");
+    // review comments and job logs are the repository's contents: this app reads them, another site's page does not
+    if (request.headers.get("sec-fetch-site") === "cross-site") return jsonResponse({ error: { code: "cross_site", message: "A pull request is read from this app" } }, 403);
+    let paneId = url.searchParams.get("pane_id");
+    let directory = (url.searchParams.get("directory") ?? "").trim();
+    let merge = null;
+    if (merging) {
+      const payload = await readJsonObject<Record<string, unknown>>(request);
+      if (payload instanceof Response) return payload;
+      merge = mergeInputOf(payload);
+      if (merge === null) return badRequest("invalid_body", "number, head_oid (a full commit hash) and method (merge, squash or rebase) are required");
+      paneId = typeof payload["pane_id"] === "string" ? payload["pane_id"] : null;
+      directory = typeof payload["directory"] === "string" ? payload["directory"].trim() : "";
+    }
+    const cwd = await routeFolder(paneId, directory);
+    if (cwd instanceof Response) return cwd;
+    try {
+      if (merge !== null) {
+        await mergePullRequest(cwd, merge);
+        return jsonResponse({ ok: true });
+      }
+      const body = pathname.endsWith("/log") ? await pullRequestLog(cwd, url.searchParams.get("job_id") ?? "", url.searchParams.get("host") ?? "github.com") : await pullRequestView(cwd);
+      return jsonResponse(body, 200, { "cache-control": "private, no-store" });
+    } catch (error) {
+      if (error instanceof PullRequestError) return jsonResponse({ error: { code: error.code, message: error.message } }, error.status);
+      return errorResponse(error);
+    }
   }
 
   // A tab is made the way a workspace is: herdr opens it with a shell in its root pane, and
@@ -103,7 +191,7 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
     setRequestRoute(pathname);
     const inWorkspace = pathname === "/api/tab/create";
     if (request.method !== "POST") return badRequest("method_not_allowed", "use POST");
-    const payload = await readJsonObject<{ workspace_id?: unknown; cwd?: unknown; label?: unknown; agent?: { kind?: unknown; name?: unknown; args?: unknown } | null; first_message?: unknown; first_message_connection?: unknown }>(request);
+    const payload = await readJsonObject<{ workspace_id?: unknown; cwd?: unknown; label?: unknown; agent?: { kind?: unknown; name?: unknown; args?: unknown } | null; first_message?: unknown; first_message_connection?: unknown; env?: unknown }>(request);
     if (payload instanceof Response) return payload;
     if (inWorkspace && (typeof payload.workspace_id !== "string" || payload.workspace_id.trim() === "")) {
       return badRequest("missing_workspace_id", "workspace_id is required");
@@ -113,8 +201,11 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
     if (payload.label === null) delete payload.label;
     if (payload.agent === null) delete payload.agent;
     if (payload.first_message === null) delete payload.first_message;
+    if (payload.env === null) delete payload.env;
+    const envProblem = envFault(payload.env);
+    if (envProblem !== null) return badRequest("invalid_env", envProblem);
     if (payload.cwd !== undefined && typeof payload.cwd !== "string") return badRequest("invalid_cwd", "cwd must be an existing directory");
-    const cwd = payload.cwd === undefined ? undefined : expandedDirectory(payload.cwd);
+    const cwd = payload.cwd === undefined ? undefined : localFolders ? expandedDirectory(payload.cwd) : payload.cwd;
     if (payload.cwd !== undefined && cwd === null) return badRequest("invalid_cwd", "cwd must be an existing directory");
     if (payload.label !== undefined && typeof payload.label !== "string") return badRequest("missing_label", "label must be a string");
     if (typeof payload.label === "string") {
@@ -139,6 +230,7 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
       const options = {
         ...(cwd === undefined || cwd === null ? {} : { cwd }),
         ...(typeof payload.label === "string" ? { label: payload.label } : {}),
+        ...(payload.env === undefined ? {} : { env: payload.env as Record<string, string> }),
       };
       const created = inWorkspace
         ? await tabCreate({ ...options, workspaceId: payload.workspace_id as string })
@@ -157,7 +249,11 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
       // the request's first message is the user's send: queued for the agent's first ready turn through the
       // bridge's pending path (server/core/pending.ts), never typed here; an agent that did not start gets none
       const firstMessage = launched.agent_started && typeof payload.first_message === "string"
-        ? await queueFirstMessage(created.root_pane.pane_id, payload.first_message, payload.agent.kind as string, requester, launchedPid).then((message): { id: string } | ReturnType<typeof notQueued> => ({ id: message.id }), (error: unknown) => {
+        ? await queueFirstMessage(created.root_pane.pane_id, payload.first_message, payload.agent.kind as string, requester, launchedPid).then((message): { id: string; held?: string } | ReturnType<typeof notQueued> => ({
+          id: message.id,
+          // held from the start (no page to type it, #2743): said, so a client tells it from a queued one
+          ...(message.state === "held" && message.error ? { held: message.error.code } : {}),
+        }), (error: unknown) => {
           console.warn(`first message for ${created.root_pane.pane_id} not queued: ${error instanceof Error ? error.message : String(error)}`);
           // the agent runs and the message did not go in: told apart from an agent that did not start (null)
           return notQueued(error);
@@ -183,6 +279,37 @@ export async function handleWorkspaceRequest(request: Request, url: URL, pathnam
     } catch (error) {
       return errorResponse(error);
     }
+  }
+
+  // The sidebar's branch labels: every repository and unmarked git workspace of this PC in one request
+  // instead of one each (#2661). herdr is still asked once per workspace, one after another: four at once
+  // left about one read in four waiting ~100 ms longer, where one at a time took ~22 ms for eight.
+  if (pathname === "/api/worktree/inventory") {
+    setRequestRoute(pathname);
+    if (request.method !== "GET") return badRequest("method_not_allowed", "use GET");
+    const asked = url.searchParams.getAll("workspace_id");
+    if (asked.length === 0 || asked.includes("")) return badRequest("missing_workspace_id", "workspace_id is required");
+    const workspaceIds = [...new Set(asked)];
+    if (workspaceIds.length > MAX_INVENTORY_WORKSPACES) return badRequest("too_many_workspaces", `at most ${MAX_INVENTORY_WORKSPACES} workspaces per read`);
+    const entries: WorktreeInventoryEntry[] = [];
+    const deadline = Date.now() + INVENTORY_BUDGET_MS;
+    for (const workspaceId of workspaceIds) {
+      // a client that left, or a herdr too slow to finish in time: the rest is not asked (the client keeps their last branches)
+      if (request.signal.aborted || Date.now() >= deadline) {
+        entries.push({ workspace_id: workspaceId, error: { status: 502, code: "timeout", message: "not read: the inventory ran out of time" } });
+        continue;
+      }
+      try {
+        const listing = await worktreeList(workspaceId);
+        entries.push({ workspace_id: workspaceId, listing: { source: listing.source, worktrees: listing.worktrees } });
+      } catch (error) {
+        // the status and words GET /api/worktree/list would have answered for it alone
+        const refused = errorResponse(error);
+        const body = (await refused.json()) as { error: { code: string; message: string } };
+        entries.push({ workspace_id: workspaceId, error: { status: refused.status, code: body.error.code, message: body.error.message } });
+      }
+    }
+    return jsonResponse({ entries });
   }
 
   if (pathname === "/api/worktree/remove") {

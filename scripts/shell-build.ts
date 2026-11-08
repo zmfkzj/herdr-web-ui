@@ -15,10 +15,11 @@
  * nothing here runs (src/lib/shellMode.ts).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Plugin } from "vite";
 import { pagePolicy } from "../server/file-view.ts";
-import { IMMUTABLE_CACHE, REVALIDATE, shellContentSecurityPolicy } from "../server/static.ts";
+import { accountServiceOrigin, DEFAULT_ACCOUNT_SERVICE, IMMUTABLE_CACHE, REVALIDATE, shellContentSecurityPolicy } from "../server/static.ts";
+import { REGIONAL_APPS } from "../shared/relay-regions.ts";
 
 /** Vite's `--mode` that builds the shell; the build's output directory. */
 export const SHELL_MODE = "shell";
@@ -33,12 +34,25 @@ const MANIFEST_LINK = /<link rel="manifest" href="\/manifest\.webmanifest(\?[^"]
  * page, so a PC's page at `/s/<id>/` installs from `/s/<id>/manifest.webmanifest` (its own scope)
  * and the front page from `/manifest.webmanifest`.
  */
-export function shellIndexHtml(html: string): string {
+/**
+ * The account metas the shell is built with: `ovis-account-service`, account.ovis.sh unless
+ * OVIS_ACCOUNT_SERVICE_URL names another https origin (none when it is `off` or not https, and the
+ * shell offers no sign-in), as on the PC's own pages; and `ovis-account-providers` from
+ * OVIS_ACCOUNT_PROVIDERS (GitHub alone without it, until the service's own list answers).
+ */
+export function accountMetas(env: Record<string, string | undefined>): string[] {
+  const origin = accountServiceOrigin(env["OVIS_ACCOUNT_SERVICE_URL"] ?? DEFAULT_ACCOUNT_SERVICE);
+  if (origin === null) return [];
+  const providers = (env["OVIS_ACCOUNT_PROVIDERS"] ?? "").split(",").map((name) => name.trim()).filter((name) => name === "github" || name === "google" || name === "apple");
+  return [`<meta name="ovis-account-service" content="${origin}" />`, ...(providers.length > 0 ? [`<meta name="ovis-account-providers" content="${providers.join(",")}" />`] : [])];
+}
+
+export function shellIndexHtml(html: string, env: Record<string, string | undefined> = {}): string {
   if (!MANIFEST_LINK.test(html)) throw new Error("index.html must link /manifest.webmanifest for the shell to make it relative");
   const linked = html.replace(MANIFEST_LINK, (_, query: string | undefined) => `<link rel="manifest" href="manifest.webmanifest${query ?? ""}"`);
   const head = linked.indexOf("</head>");
   if (head === -1) throw new Error("index.html must hold a </head>");
-  return `${linked.slice(0, head)}  ${SHELL_META}\n  ${linked.slice(head)}`;
+  return `${linked.slice(0, head)}${[SHELL_META, ...accountMetas(env)].map((meta) => `  ${meta}\n`).join("")}  ${linked.slice(head)}`;
 }
 
 /**
@@ -48,6 +62,40 @@ export function shellIndexHtml(html: string): string {
  */
 export function shellManifest(manifest: string): string {
   return `${JSON.stringify({ ...JSON.parse(manifest) as Record<string, unknown>, id: "./", start_url: "./", scope: "./" }, null, 2)}\n`;
+}
+
+/** The phone apps' id: the Android package and the iOS bundle (app/capacitor.config.json). */
+export const APP_ID = "sh.ovis.app";
+
+/**
+ * The certificates an Android app that may open `https://app.ovis.sh/s/` links is signed with:
+ * Google Play's app signing key (Play Console, App integrity), which signs every copy Play
+ * installs, and the upload key (the certificate in a bundle built for upload), which signs a
+ * release build installed by hand.
+ */
+export const ANDROID_APP_FINGERPRINTS = [
+  "7A:F3:97:1A:B8:7A:22:3B:A4:6D:58:13:89:ED:7A:EB:A9:31:3F:97:E5:A1:03:87:63:74:BE:CB:54:1C:1D:63",
+  "BD:49:0B:C8:3D:3F:22:C8:55:9E:57:60:C4:7D:71:63:7D:34:22:92:95:82:C9:B4:05:E3:E6:79:AD:8E:29:C6",
+];
+
+/** The iOS app as Apple names it in a Universal Link: the Apple team, then the bundle id. */
+export const IOS_APP_ID = `5987KT43TJ.${APP_ID}`;
+
+/**
+ * The files that let the phone apps open a PC's page on app.ovis.sh (a pairing link tapped in a
+ * message, or the camera reading the PC's QR code) instead of the browser: Android checks
+ * `assetlinks.json` for the app's `autoVerify` link (app/android/app/src/main/AndroidManifest.xml),
+ * iOS `apple-app-site-association` for an app whose Associated Domains name this host. Only a PC's
+ * scope, `/s/`, is the app's: the front page stays the hosted shell's.
+ */
+export function appLinkFiles(): Record<string, string> {
+  return {
+    ".well-known/assetlinks.json": `${JSON.stringify([{
+      relation: ["delegate_permission/common.handle_all_urls"],
+      target: { namespace: "android_app", package_name: APP_ID, sha256_cert_fingerprints: ANDROID_APP_FINGERPRINTS },
+    }], null, 2)}\n`,
+    ".well-known/apple-app-site-association": `${JSON.stringify({ applinks: { details: [{ appIDs: [IOS_APP_ID], components: [{ "/": "/s/*" }] }] } }, null, 2)}\n`,
+  };
 }
 
 /** Where the hosted shell's render host for a PC's rendered pages answers (todo 17's page); only its policy is reserved here. */
@@ -78,9 +126,9 @@ export function shellRedirects(): string {
  */
 export function shellHeaders(): string {
   return [
-    "# Derived from the PC server's policy: server/static.ts shellContentSecurityPolicy() (scripts/shell-build.ts)",
+    "# Derived from the PC server's policy: server/static.ts shellContentSecurityPolicy(Object.values(REGIONAL_APPS)) (scripts/shell-build.ts)",
     "/*",
-    `  Content-Security-Policy: ${shellContentSecurityPolicy()}`,
+    `  Content-Security-Policy: ${shellContentSecurityPolicy(Object.values(REGIONAL_APPS))}`,
     "",
     `${RENDER_PATH}`,
     "  ! Content-Security-Policy",
@@ -89,7 +137,49 @@ export function shellHeaders(): string {
     "/assets/*",
     `  Cache-Control: ${IMMUTABLE_CACHE}`,
     "",
+    // the app links' files (appLinkFiles): apple-app-site-association has no extension
+    "/.well-known/*",
+    "  Content-Type: application/json",
+    "",
     ...["/", "/index.html", "/sw.js", "/manifest.webmanifest", "/s/*"].flatMap((path) => [path, `  Cache-Control: ${REVALIDATE}`, ""]),
+  ].join("\n");
+}
+
+/**
+ * The same site for Caddy, for a copy of the shell served beside a regional relay
+ * (relay/shell-mirror.ts keeps `<root>` current): the rewrites of shellRedirects() and the headers
+ * of shellHeaders(), from the same sources. `bun scripts/shell-caddy.ts <site> [root]` prints it.
+ */
+export function shellCaddyfile(site: string, root = "/opt/ovis-shell/current"): string {
+  if (!/^[a-z0-9.-]+$/.test(site) || !/^\/[\w./-]+$/.test(root)) throw new Error("not a site address or a folder");
+  const scope = "^/s/[0-9a-f]{32}";
+  return [
+    `${site} {`,
+    `\troot * ${root}`,
+    `\t@bare path_regexp bare ^/s/([0-9a-f]{32})$`,
+    `\tredir @bare /s/{re.bare.1}/ 301`,
+    `\t@render path_regexp render ${scope}/~render$`,
+    `\t@notrender not path_regexp ${scope}/~render$`,
+    `\t@manifest path_regexp manifest ${scope}/manifest\\.webmanifest$`,
+    `\t@worker path_regexp worker ${scope}/sw\\.js$`,
+    `\t@revalidate path / /index.html /sw.js /manifest.webmanifest /s/*`,
+    `\t@hidden path /_headers /_redirects`,
+    `\theader @notrender Content-Security-Policy "${shellContentSecurityPolicy(Object.values(REGIONAL_APPS))}"`,
+    `\theader @render Content-Security-Policy "${pagePolicy(null)}"`,
+    `\theader /assets/* Cache-Control "${IMMUTABLE_CACHE}"`,
+    `\theader @revalidate Cache-Control "${REVALIDATE}"`,
+    // as Pages answers it: the first script on app.ovis.sh compares this copy's build with its own
+    `\theader /build.json Access-Control-Allow-Origin "*"`,
+    `\trespond @hidden 404`,
+    `\thandle @render {\n\t\trewrite * /render.html\n\t}`,
+    `\thandle @manifest {\n\t\trewrite * /manifest.webmanifest\n\t}`,
+    `\thandle @worker {\n\t\trewrite * /sw.js\n\t}`,
+    `\thandle_path /s/* {\n\t\trewrite * /index.html\n\t}`,
+    // relay/shell-mirror.ts drops the precompressed copies, which Pages never serves as files
+    `\tencode zstd gzip`,
+    `\tfile_server`,
+    "}",
+    "",
   ].join("\n");
 }
 
@@ -110,6 +200,7 @@ parent.postMessage({ type: "ovis-render-ready" }, "*");
     "manifest.webmanifest": shellManifest(manifest),
     _redirects: shellRedirects(),
     _headers: shellHeaders(),
+    ...appLinkFiles(),
   };
 }
 
@@ -126,13 +217,16 @@ export function shellBuild(): Plugin {
     },
     transformIndexHtml: {
       order: "post",
-      handler: (html) => shellIndexHtml(html),
+      handler: (html) => shellIndexHtml(html, process.env),
     },
     // after Vite copied public/ (the app's manifest among it), which these replace or join
     writeBundle(options) {
       if (!options.dir) throw new Error("the shell build has no output directory");
       mkdirSync(options.dir, { recursive: true });
-      for (const [name, content] of Object.entries(shellFiles(manifest))) writeFileSync(join(options.dir, name), content);
+      for (const [name, content] of Object.entries(shellFiles(manifest))) {
+        mkdirSync(dirname(join(options.dir, name)), { recursive: true });
+        writeFileSync(join(options.dir, name), content);
+      }
     },
   };
 }

@@ -27,10 +27,11 @@ import { pairThisBrowser, UnconfirmedPairing } from "../lib/pairing.ts";
 import { isLoopbackHost, phonePlan } from "../lib/phone.ts";
 import { recentDirectories } from "../lib/recent-directories.ts";
 import { useSettings } from "../lib/settings.ts";
-import { agentRows, checkList, foundAgents, installedHere, phoneBoxMode, phoneWay, openInFolder, preferredAgent, relayStep, settleDelay, setupView, signedInAgents, turnsUsageOn, type CheckStatus, type GuideEvent, type GuideState, type PcCheck } from "../lib/setupGuideFlow.ts";
+import { agentRows, checkList, foundAgents, installedHere, phoneBoxMode, phoneBoxOpensFirst, phoneBoxStays, phoneWay, openInFolder, preferredAgent, relayStep, settleDelay, setupView, signedInAgents, turnsUsageOn, type CheckStatus, type GuideEvent, type GuideState, type PcCheck, type PhoneBoxOpening } from "../lib/setupGuideFlow.ts";
 import { inRelayShell, useRelay, type RelayState } from "../lib/useRelay.ts";
 import { useSignedInUsage } from "../lib/useSetupGuide.ts";
 import { userErrorMessage } from "../lib/userError.ts";
+import { AccountSection } from "./AccountSection.tsx";
 import { AgentMark } from "./AgentMark.tsx";
 import { AgentTile } from "./AgentTile.tsx";
 import { UsageSignInDialog } from "./UsageSignInDialog.tsx";
@@ -77,6 +78,8 @@ export function SetupGuide(props: SetupGuideProps) {
   const [known, setKnown] = useState<readonly KnownAgent[]>([]);
   // the agents installed from the tiles: installed, before the PC is read again
   const [ready, setReady] = useState<readonly string[]>([]);
+  // Connect your phone's box closed once (a tap, or withdrawn): the agents screen made anew (Look again) leaves it closed
+  const [phoneClosed, setPhoneClosed] = useState(false);
   // said to a screen reader once the screen settles; its heading changes without focus
   const [announced, setAnnounced] = useState("");
   const asked = useRef(0);
@@ -144,7 +147,7 @@ export function SetupGuide(props: SetupGuideProps) {
         </div>
         <p className="visually-hidden" role="status">{announced}</p>
         {view === "checking" && <Checking known={known} catalog={catalog} />}
-        {view === "agents" && catalog !== null && <AgentsScreen catalog={catalog} ready={ready} machineId={machineId} onInstalled={agentInstalled} onLookAgain={loadCatalog} onOpenTerminal={props.onOpenTerminal} onOpened={props.onOpened} onOpenSettings={props.onOpenSettings} auth={props.auth} security={props.security} onStarting={props.onStarting} onPaired={props.onPaired} usageOn={turnsUsageOn(props.state)} />}
+        {view === "agents" && catalog !== null && <AgentsScreen catalog={catalog} ready={ready} machineId={machineId} onInstalled={agentInstalled} onLookAgain={loadCatalog} onOpenTerminal={props.onOpenTerminal} onOpened={props.onOpened} onOpenSettings={props.onOpenSettings} auth={props.auth} security={props.security} onStarting={props.onStarting} onPaired={props.onPaired} usageOn={turnsUsageOn(props.state)} phoneFirst={!phoneClosed && phoneBoxOpensFirst(props.state, isLoopbackHost(window.location.hostname))} onPhoneClosed={() => setPhoneClosed(true)} />}
         {view === "failed" && <CheckFailed error={catalogError} onLookAgain={loadCatalog} />}
       </div>
     </div>
@@ -153,6 +156,10 @@ export function SetupGuide(props: SetupGuideProps) {
 
 function Welcome({ dispatch, onClose, hidden }: Pick<SetupGuideProps, "dispatch" | "onClose" | "hidden">) {
   const t = useT();
+  // Not now folds the sign-in away for this welcome; Settings → Devices and PCs keeps it
+  const [later, setLater] = useState(false);
+  // Not now takes its box away: the keyboard's place goes to the first choice, not to the page
+  const firstChoice = useRef<HTMLButtonElement>(null);
   return (
     <div className="setup-guide" role="region" aria-label={t("Setup guide")} hidden={hidden}>
       <div className="setup-guide-inner setup-welcome">
@@ -160,7 +167,7 @@ function Welcome({ dispatch, onClose, hidden }: Pick<SetupGuideProps, "dispatch"
         <h2>{t("Welcome to Ovis")}</h2>
         <p className="setup-lead">{t("Is this your first time using Ovis?")}</p>
         <div className="setup-choices">
-          <button type="button" className="setup-choice" onClick={() => dispatch({ type: "begin" })}>
+          <button ref={firstChoice} type="button" className="setup-choice" onClick={() => dispatch({ type: "begin" })}>
             <span className="setup-choice-icon"><Sparkles aria-hidden="true" /></span>
             <span className="setup-choice-text"><strong>{t("I'm new to Ovis")}</strong><span>{t("Ovis finds or installs an AI coding helper and opens your first project.")}</span></span>
             <ChevronRight aria-hidden="true" />
@@ -171,6 +178,11 @@ function Welcome({ dispatch, onClose, hidden }: Pick<SetupGuideProps, "dispatch"
             <ChevronRight aria-hidden="true" />
           </button>
         </div>
+        {/* the account's sign-in, as Settings → Devices and PCs has it; none where this page has no account service */}
+        {!later && <AccountSection welcome={{
+          lead: <p className="setup-muted">{t("Sign in to use this PC from your phone and your other PCs.")}</p>,
+          later: <button type="button" className="setup-link" onClick={() => { setLater(true); firstChoice.current?.focus(); }}>{t("Not now")}</button>,
+        }} />}
         <p className="setup-note"><Info aria-hidden="true" />{t("You can open this again any time from Settings → Agents.")}</p>
       </div>
     </div>
@@ -224,6 +236,10 @@ function CheckFailed({ error, onLookAgain }: { error: string | null; onLookAgain
 interface AgentsScreenProps extends Pick<SetupGuideProps, "onOpenTerminal" | "onOpened" | "onOpenSettings" | "auth" | "security" | "onStarting" | "onPaired"> {
   /** a first run turns plan usage on for a signed-in account; a reopened guide leaves the setting alone */
   usageOn: boolean;
+  /** a first run on the PC itself: Connect your phone's box is open from the start (phoneBoxOpensFirst) */
+  phoneFirst: boolean;
+  /** the box closed: Look again does not open it by itself again */
+  onPhoneClosed: () => void;
   catalog: readonly AgentCatalogRow[];
   ready: readonly string[];
   machineId: string;
@@ -232,7 +248,7 @@ interface AgentsScreenProps extends Pick<SetupGuideProps, "onOpenTerminal" | "on
   onLookAgain: () => void;
 }
 
-function AgentsScreen({ catalog, ready, machineId, onInstalled, onLookAgain, onOpenTerminal, onOpened, onOpenSettings, auth, security, onStarting, onPaired, usageOn }: AgentsScreenProps) {
+function AgentsScreen({ catalog, ready, machineId, onInstalled, onLookAgain, onOpenTerminal, onOpened, onOpenSettings, auth, security, onStarting, onPaired, usageOn, phoneFirst, onPhoneClosed }: AgentsScreenProps) {
   const t = useT();
   const { settings, update } = useSettings();
   const agents = agentRows(catalog, ready);
@@ -299,7 +315,9 @@ function AgentsScreen({ catalog, ready, machineId, onInstalled, onLookAgain, onO
 
   const locked = opening || madeWithout !== null;
   // Connect your phone: the relay's QR code, or the page's own and its address, right here
-  const [phone, setPhone] = useState(false);
+  // open from the start on a first run on the PC, where a phone is the next device to add
+  const [phone, setPhoneState] = useState<PhoneBoxOpening | null>(phoneFirst ? "first-run" : null);
+  const setPhone = (next: PhoneBoxOpening | null): void => { setPhoneState(next); if (next === null) onPhoneClosed(); };
   return (
     <section className="setup-step" aria-labelledby="setup-step-title">
       {installed.length > 0 ? (
@@ -335,9 +353,9 @@ function AgentsScreen({ catalog, ready, machineId, onInstalled, onLookAgain, onO
         <button type="button" className="btn btn-primary" disabled={opening || (chosen === null && madeWithout === null)} onClick={() => void start()}>
           <Play aria-hidden="true" />{madeWithout !== null ? t("Open the workspace") : chosen !== null ? t("Start with {agent}", { agent: chosen.name }) : t("Start")}
         </button>
-        <button type="button" className="btn" disabled={opening} aria-expanded={phone} onClick={() => setPhone((show) => !show)}><Smartphone aria-hidden="true" />{t("Connect your phone")}</button>
+        <button type="button" className="btn" disabled={opening} aria-expanded={phone !== null} onClick={() => setPhone(phone === null ? "tap" : null)}><Smartphone aria-hidden="true" />{t("Connect your phone")}</button>
       </div>
-      {phone && <PhoneBox auth={auth} security={security} onOpenSettings={() => { setPhone(false); onOpenSettings("devices"); }} onPaired={onPaired} />}
+      {phone !== null && <PhoneBox opening={phone} auth={auth} security={security} onOpenSettings={() => { setPhone(null); onOpenSettings("devices"); }} onPaired={onPaired} onWithdraw={() => setPhone(null)} />}
       {!busy && !locked && (
         <p className="setup-muted setup-again">{t("Already installed one?")} <button type="button" className="setup-link" onClick={onLookAgain}>{t("Look again")}</button></p>
       )}
@@ -357,6 +375,10 @@ let pairingOut: Promise<PairingCode> | null = null;
 const guidePairingCode = (): Promise<PairingCode> => pairingOut ??= startPairing().finally(() => { pairingOut = null; });
 
 interface PhoneBoxProps {
+  /** a tap, or by itself on a first run on the PC (phoneBoxStays) */
+  opening: PhoneBoxOpening;
+  /** a box that came open by itself where the relay cannot lead: it closes again */
+  onWithdraw: () => void;
   auth: HealthAuth | null;
   security: SecurityFacts;
   onOpenSettings: () => void;
@@ -368,12 +390,18 @@ interface PhoneBoxProps {
  * page's own QR code and address (PhoneQr), which is all the box shows where the relay cannot lead.
  * The relay is asked about only while the box is open.
  */
-function PhoneBox({ auth, security, onOpenSettings, onPaired }: PhoneBoxProps) {
+function PhoneBox({ opening, onWithdraw, auth, security, onOpenSettings, onPaired }: PhoneBoxProps) {
   const t = useT();
   const relay = useRelay();
-  // Use Tailscale or Wi-Fi instead: the other ways, until the box is closed
+  // Use Tailscale or Wi-Fi instead: the other ways, until the box is closed (a tap of its own)
   const [other, setOther] = useState(false);
   const way = other ? "other" : phoneWay(relay, inRelayShell(), auth);
+  // the relay led in this box once (phoneBoxStays)
+  const led = useRef(false);
+  if (way === "relay") led.current = true;
+  const stays = phoneBoxStays(other ? "tap" : opening, way, led.current);
+  useEffect(() => { if (!stays) onWithdraw(); }, [stays]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!stays) return null;
   // the relay's first answer may never come (it keeps failing): the other ways stay one tap away meanwhile
   if (way === "wait") return (
     <div className="setup-phone-relay">

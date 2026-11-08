@@ -1,7 +1,7 @@
 // The connect screen: the app's first page until a PC is chosen. Opening a PC goes through the
 // native HerdrShell plugin, which makes the PC's address the WebView's first page: navigating
 // there from this page would cost every launch about 1.5 s (docs/native-app.md, Spike results).
-import { APP_ORIGIN, localize, parseAddress, publicHttp, relayLink, shell, t } from "./shell.js";
+import { ACCOUNT_SIGN_IN, APP_ORIGIN, localize, parseAddress, publicHttp, relayLink, shell, t } from "./shell.js";
 
 localize();
 
@@ -58,6 +58,17 @@ async function open(text) {
 
 form.addEventListener("submit", (event) => { event.preventDefault(); void open(input.value); });
 
+// the hosted shell's front page: sign in there, and every PC of the account shows (src/components/AccountPcs.tsx)
+const account = document.getElementById("account");
+if (ACCOUNT_SIGN_IN) {
+  account.hidden = false;
+  account.addEventListener("click", async () => {
+    error.textContent = "";
+    try { await shell("open", { url: `${APP_ORIGIN}/`, name: t("Your PCs", "내 PC") }); }
+    catch (err) { error.textContent = String(err?.message ?? err); }
+  });
+}
+
 document.getElementById("scan").addEventListener("click", async () => {
   error.textContent = "";
   try {
@@ -99,3 +110,15 @@ async function load() {
 }
 
 void load();
+
+// a PC's link on the app's origin tapped outside the app (a message, the camera reading the PC's QR
+// code), which Android hands to the app (MainActivity's app link): opened as a scanned QR code is
+async function openAppLink() {
+  if (window.Capacitor?.getPlatform?.() !== "android") return;
+  const { url } = await shell("takeLink");
+  if (!url) return;
+  input.value = url;
+  await open(url);
+}
+
+void openAppLink();

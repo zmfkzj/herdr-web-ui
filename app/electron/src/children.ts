@@ -5,9 +5,10 @@
  */
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, type WriteStream } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { ovisName } from "../../../server/legacy-env.ts";
 
 type Env = Record<string, string | undefined>;
@@ -16,12 +17,13 @@ type Env = Record<string, string | undefined>;
  * Chromium keeps files, sockets and pipes open without close-on-exec, so a program the app starts
  * would hold them, and the core (which outlives the app) for good. Started through this, bash
  * closes every descriptor above stderr, then becomes the program (same pid). Without /bin/bash
- * (NixOS) the program starts directly.
+ * (NixOS) the program starts directly. Windows hands a child only the handles marked inheritable,
+ * and has no /bin/bash: there the program always starts directly.
  */
 const CLOSE_INHERITED = `for fd in $(ls /proc/$$/fd 2>/dev/null || ls /dev/fd); do if [ "$fd" -gt 2 ] 2>/dev/null; then eval "exec $fd>&-" 2>/dev/null; fi; done; exec "$@"`;
 
-export function withoutInherited(command: string, args: string[], bash = "/bin/bash"): [string, string[]] {
-  return isFile(bash) ? [bash, ["-c", CLOSE_INHERITED, "ovis", command, ...args]] : [command, args];
+export function withoutInherited(command: string, args: string[], bash = "/bin/bash", platform: NodeJS.Platform = process.platform): [string, string[]] {
+  return platform !== "win32" && isFile(bash) ? [bash, ["-c", CLOSE_INHERITED, "ovis", command, ...args]] : [command, args];
 }
 
 /** Where the staged programs sit: `resources/ovis` in a packaged app, `app/electron/stage` in development. */
@@ -31,23 +33,41 @@ export interface Layout {
   server: string;
 }
 
-export function layout(root: string): Layout {
-  return { bun: join(root, "bin", "bun"), hc: join(root, "bin", "herdr-core"), server: join(root, "server") };
+export function layout(root: string, platform: NodeJS.Platform = process.platform): Layout {
+  const exe = platform === "win32" ? ".exe" : "";
+  return { bun: join(root, "bin", `bun${exe}`), hc: join(root, "bin", `herdr-core${exe}`), server: join(root, "server") };
 }
 
 /** hc's session for the app's own core, apart from the `default` one another hc client may run. */
 export const HC_SESSION = "ovis";
 
+/** the lists an AppImage's AppRun puts its own folders in front of */
+const APPIMAGE_LISTS = ["PATH", "LD_LIBRARY_PATH", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR"];
+
 /**
  * The environment hc runs in: the caller's, with the app's own core session unless one is named.
- * Electron's own settings are not passed on.
+ * Electron's own settings are not passed on, nor an AppImage's: the core and its terminals outlive
+ * the app, and its mount (APPDIR) goes away with it, so they would load its libraries meanwhile
+ * and then point at a folder that is gone. Only this app's own mount (`execPath` inside it): an
+ * AppImage's settings the app was merely started under stay, as for any other program.
  */
-export function coreEnv(base: Env): Env {
+export function coreEnv(base: Env, execPath: string = process.execPath): Env {
   const env: Env = { ...base, HC_SESSION: base["HC_SESSION"]?.trim() || HC_SESSION };
   // the app's own core: never one another client named with HC_SOCKET
   delete env["HC_SOCKET"];
   delete env["ELECTRON_RUN_AS_NODE"];
   delete env["ELECTRON_NO_ATTACH_CONSOLE"];
+  const mount = base["APPIMAGE"] ? base["APPDIR"]?.replace(/\/+$/, "") : undefined;
+  if (mount && execPath.startsWith(`${mount}/`)) {
+    for (const name of ["APPDIR", "APPIMAGE", "ARGV0", "OWD"]) delete env[name];
+    for (const name of APPIMAGE_LISTS) {
+      const value = env[name];
+      if (value === undefined) continue;
+      const kept = value.split(":").filter((entry) => entry.replace(/\/+$/, "") !== mount && !entry.startsWith(`${mount}/`));
+      if (kept.some((entry) => entry !== "")) env[name] = kept.join(":");
+      else delete env[name];
+    }
+  }
   return env;
 }
 
@@ -64,6 +84,8 @@ export function serverEnv(base: Env, options: { hc: string; stateDir: string; po
     OVIS_STATE_DIR: options.stateDir,
     HOST: "127.0.0.1",
     PORT: String(options.port),
+    // the app updates itself and this server with it: Settings says so instead of the plain server's way (shared/update.ts)
+    OVIS_DESKTOP_APP: "1",
   };
   const dropped = new Set(["HERDR_PLUGIN_ROOT", "HERDR_SOCKET", "OVIS_MANAGED", "OVIS_BOOT_ID", "OVIS_TOKEN"]);
   // the server would take a dropped setting back from its name before the rename (server/legacy-env.ts)
@@ -74,7 +96,8 @@ export function serverEnv(base: Env, options: { hc: string; stateDir: string; po
 export function openLog(path: string): WriteStream {
   mkdirSync(dirname(path), { recursive: true });
   if (existsSync(path)) renameSync(path, `${path}.1`);
-  return createWriteStream(path, { flags: "a" });
+  // opened now, not on a later tick: the file exists once this returns, and a folder removed meanwhile cannot fail the stream
+  return createWriteStream(path, { fd: openSync(path, "a") });
 }
 
 export function tail(text: string, lines = 20): string {
@@ -86,13 +109,16 @@ export function tail(text: string, lines = 20): string {
  * file itself. The core and its terminal holders outlive the app, and the bundled file does not
  * stay where it was (an AppImage's mount ends with the app; an update replaces the app). A newer
  * bundled hc replaces the copy the way hc's installer does (`hc update --from`), so the terminals
- * keep running.
+ * keep running. On Windows hc runs its terminals on the ConPTY beside it (`conpty\`): a first copy
+ * takes that folder too, before the exe, and `hc update --from` brings the bundled one's along.
  */
 export async function installCore(bundled: string, dir: string, env: Env, log: WriteStream, timeoutMs = 120_000): Promise<string> {
-  const installed = join(dir, "herdr-core");
+  const installed = join(dir, basename(bundled));
   if (isFile(installed) && sameBytes(bundled, installed)) return installed;
   if (!isFile(installed)) {
     mkdirSync(dir, { recursive: true });
+    const conpty = join(dirname(bundled), "conpty");
+    if (existsSync(conpty)) cpSync(conpty, join(dir, "conpty"), { recursive: true });
     copyFileSync(bundled, `${installed}.new`);
     chmodSync(`${installed}.new`, 0o755);
     renameSync(`${installed}.new`, installed);
@@ -129,10 +155,13 @@ function sameBytes(a: string, b: string): boolean {
 /**
  * Starts the app's core (`hc server start`, which returns once the core runs, or at once when it
  * already does). The core runs apart from the app, as hc runs it for every client: its terminals
- * outlive the window, and the next start finds them.
+ * outlive the window, and the next start finds them. It starts in the home folder: a workspace
+ * made without a folder opens in the core's, and the app's own (where the installer and the Start
+ * menu start it on Windows) is replaced by an update and removed with the app. A home folder that
+ * is not there leaves it in the app's: a missing folder would keep the core from starting at all.
  */
-export async function startCore(hc: string, env: Env, log: WriteStream, timeoutMs = 30_000): Promise<void> {
-  const { code, output } = await run(hc, ["server", "start"], env, log, timeoutMs);
+export async function startCore(hc: string, env: Env, log: WriteStream, timeoutMs = 30_000, home = homedir()): Promise<void> {
+  const { code, output } = await run(hc, ["server", "start"], env, log, timeoutMs, isDirectory(home) ? home : undefined);
   if (code !== 0) throw new Error(`herdr-core did not start (${code === null ? "timed out" : `exit code ${code}`})\n${tail(output)}`);
 }
 
@@ -150,7 +179,7 @@ const LISTENING = /^Ovis listening on (http:\/\/\S+)$/m;
  */
 export function startServer(layout: Layout, env: Env, log: WriteStream, timeoutMs = 60_000, onSpawn?: (child: ChildProcess) => void): Promise<RunningServer> {
   const [command, args] = withoutInherited(layout.bun, [join(layout.server, "server", "index.ts")]);
-  const child = spawn(command, args, { cwd: layout.server, env, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(command, args, { cwd: layout.server, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   if (child.pid !== undefined) onSpawn?.(child);
   const exited = new Promise<number | null>((resolve) => {
     child.once("exit", (code) => resolve(code));
@@ -272,22 +301,39 @@ export interface ProcessProbe {
 export async function endLeftover(saved: Saved["server"], probe: ProcessProbe = { command: processCommand, started: processStart }): Promise<boolean> {
   if (saved === null) return false;
   const line = await probe.command(saved.pid);
-  if (line === null || !line.startsWith(saved.bun) || !line.includes(join("server", "index.ts"))) return false;
+  // Windows writes the program's path in quotes when it has a space in it: `"C:\…\bun.exe" …`
+  if (line === null) return false;
+  const command = line.startsWith('"') ? line.slice(1) : line;
+  if (!command.startsWith(saved.bun) || !command.includes(join("server", "index.ts"))) return false;
   // without a start time it cannot be told from another process that got the pid since: left alone
   if (saved.started === null || await probe.started(saved.pid) !== saved.started) return false;
   try { process.kill(saved.pid, "SIGTERM"); } catch { return false; }
   return true;
 }
 
+/**
+ * Windows has no ps: a process's command line and start time come from CIM (Win32_Process), its
+ * start as a UTC timestamp, which stays the same for one process and differs for a pid given out again.
+ */
+export function windowsProcessQuery(pid: number, field: "command" | "started"): [string, string[]] {
+  const value = field === "command" ? "$p.CommandLine" : "$p.CreationDate.ToUniversalTime().ToString('o')";
+  return ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = Get-CimInstance Win32_Process -Filter 'ProcessId=${Math.trunc(pid)}'; if ($p) { ${value} }`]];
+}
+
+const WINDOWS = process.platform === "win32";
+const psCommand = (pid: number): [string, string[]] => WINDOWS ? windowsProcessQuery(pid, "command") : ["ps", ["-o", "command=", "-p", String(pid)]];
+const psStart = (pid: number): [string, string[]] => WINDOWS ? windowsProcessQuery(pid, "started") : ["ps", ["-o", "lstart=", "-p", String(pid)]];
+
 export async function processCommand(pid: number): Promise<string | null> {
-  const { code, output } = await run("ps", ["-o", "command=", "-p", String(pid)], process.env, null, 5_000);
+  const { code, output } = await run(...psCommand(pid), process.env, null, WINDOWS ? 15_000 : 5_000);
   return code === 0 && output.trim() !== "" ? output.trim() : null;
 }
 
 /** processStart, waited for: a record written with it never lacks the start time */
 export function processStartSync(pid: number): string | null {
   try {
-    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C" }, encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const [command, args] = psStart(pid);
+    const output = execFileSync(command, args, { env: { ...process.env, LC_ALL: "C" }, encoding: "utf8", timeout: WINDOWS ? 15_000 : 5_000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).trim();
     return output === "" ? null : output;
   } catch {
     return null;
@@ -295,15 +341,15 @@ export function processStartSync(pid: number): string | null {
 }
 
 export async function processStart(pid: number): Promise<string | null> {
-  const { code, output } = await run("ps", ["-o", "lstart=", "-p", String(pid)], { ...process.env, LC_ALL: "C" }, null, 5_000);
+  const { code, output } = await run(...psStart(pid), { ...process.env, LC_ALL: "C" }, null, WINDOWS ? 15_000 : 5_000);
   return code === 0 && output.trim() !== "" ? output.trim() : null;
 }
 
-async function run(command: string, args: string[], env: Env, log: WriteStream | null, timeoutMs: number): Promise<{ code: number | null; output: string }> {
+async function run(command: string, args: string[], env: Env, log: WriteStream | null, timeoutMs: number, cwd?: string): Promise<{ code: number | null; output: string }> {
   return new Promise((resolve) => {
     let output = "";
     const [program, argv] = withoutInherited(command, args);
-    const child = spawn(program, argv, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, argv, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     const take = (chunk: Buffer) => {
       log?.write(chunk);
       output += chunk.toString("utf8");
@@ -324,4 +370,8 @@ async function run(command: string, args: string[], env: Env, log: WriteStream |
 
 export function isFile(path: string): boolean {
   try { return statSync(path).isFile(); } catch { return false; }
+}
+
+function isDirectory(path: string): boolean {
+  try { return statSync(path).isDirectory(); } catch { return false; }
 }

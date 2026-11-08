@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { paneSendKeys, paneSendText } from "../server/herdr/client.ts";
 import { chromePath } from "./chrome-path.ts";
+import { shownRows } from "./shown-rows.ts";
 
 /** how long a send that should not happen gets to show up */
 const NO_SEND_WAIT_MS = 300;
@@ -62,7 +63,7 @@ process.stdin.on("data", (data) => {
     running = join(fixture, `${++runs}.done`);
     await paneSendText(paneId, `node '${script.replaceAll("'", "'\\''")}' ${mode} '${running}'`);
     await paneSendKeys(paneId, ["Enter"]);
-    await page.locator(".pane-terminal .xterm-rows", { hasText: `Owned Alt+Enter test: ${mode} keys` }).waitFor();
+    await page.locator(shownRows(), { hasText: `Owned Alt+Enter test: ${mode} keys` }).waitFor();
   };
   const stop = async () => {
     if (running === null) return;

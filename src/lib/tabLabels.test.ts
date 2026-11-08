@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 
 import type { Machine } from "../../shared/machines.ts";
 import { MAX_TAB_LABEL_LENGTH } from "../../shared/preferences.ts";
+import { setPasteFolder } from "./pasteFolders.ts";
 import { autoTabLabel } from "./tabName.ts";
 import { forgetTabLabelsForTests, currentTabLabels, shownTabLabels, firstPromptOf, learnFromConversation, learnFromSend, learnTabLabel, setTabLabelLearning, setTabLabels, settleTabLabels, shortTabLabel } from "./tabLabels.ts";
 
@@ -21,6 +22,55 @@ describe("tab labels from the first message", () => {
     expect(shortTabLabel("~/dev/api/main.ts\n```ts\nconst x = 1")).toBe("const x = 1");
     expect(shortTabLabel("/compact")).toBeNull();
     for (const text of ["a".repeat(500), "👩‍💻".repeat(30), "로그인".repeat(40)]) expect(shortTabLabel(text)!.length).toBeLessThanOrEqual(MAX_TAB_LABEL_LENGTH);
+  });
+
+  it("leaves attached files' mentions out, an upload's path with spaces included (#2637)", () => {
+    const upload = "@/Users/example/Library/Mobile Documents/com~apple~CloudDocs/app/.ovis/paste-20261104-101500-0a1b2c3d.png";
+    expect(shortTabLabel(`${upload} Why does the login button overlap?`)).toBe("Why does the login\u2026");
+    expect(shortTabLabel(`${upload} @/tmp/shots/b.png @C:\\shots\\c.png Fix the footer`)).toBe("Fix the footer");
+    expect(shortTabLabel(`/review ${upload} the footer`)).toBeNull();
+    expect(shortTabLabel(`${upload}\nCheck the footer`)).toBe("Check the footer");
+    expect(shortTabLabel(upload)).toBeNull();
+    // a file named in the message, not attached, says something
+    expect(shortTabLabel("Fix @src/app.ts")).toBe("Fix @src/app.ts");
+    // an upload's name in the words after another mention is the user's, not the path's
+    expect(shortTabLabel("@/tmp/a.png Why paste-20261104-101500-0a1b2c3d.png")).toBe("Why paste-20261104-10150\u2026");
+    expect(shortTabLabel("@/tmp/a.png Please inspect /tmp/paste-20261104-101500-0a1b2c3d.png first")).toBe("Please inspect\u2026");
+    // nor in a relative path shaped like an upload's (#2682)
+    expect(shortTabLabel("@/tmp/a.png Please review docs/paste-20261104-101500-0a1b2c3d.png for me")).toBe("Please review\u2026");
+    // a folder whose name holds " @" or " ~" is still the upload's path
+    for (const folder of ["Company @ Work", "Company ~ Work"]) expect(shortTabLabel(`@/Users/me/${folder}/.ovis/paste-20261104-101500-0a1b2c3d.png Fix footer`)).toBe("Fix footer");
+    // an OVIS_PASTE_DIR with spaces too, and the words before another mention stay
+    for (const upload of ["@/My Uploads/paste-20261104-101500-0a1b2c3d.png", "@C:\\My Uploads\\paste-20261104-101500-0a1b2c3d.png", "@/Users/me/John.Doe Files/paste-20261104-101500-0a1b2c3d.png", "@/tmp/v1.2 build/paste-20261104-101500-0a1b2c3d.png"]) expect(shortTabLabel(`${upload} Fix footer`)).toBe("Fix footer");
+    expect(shortTabLabel("@/tmp/a.png check @other docs/.ovis/paste-20261104-101500-0a1b2c3d.png now")).toBe("check @other\u2026");
+  });
+
+  it("leaves out an upload's path through its PC's OVIS_PASTE_DIR named like an image file (#2771)", () => {
+    const message = "@/tmp/shots.png backup/paste-20261104-101500-0a1b2c3d.png Fix footer";
+    expect(shortTabLabel(message, "/tmp/shots.png backup")).toBe("Fix footer");
+    expect(shortTabLabel("@C:\\Shots\\v2.webp old\\paste-20261104-101500-0a1b2c3d.png Fix footer", "C:\\Shots\\v2.webp old")).toBe("Fix footer");
+    // only that folder: the words after another mention stay the user's (#2682)
+    expect(shortTabLabel("@/tmp/a.png Please review docs/paste-20261104-101500-0a1b2c3d.png for me", "/tmp/shots.png backup")).toBe("Please review\u2026");
+    // the folder as its server wrote it: another case is another folder
+    expect(shortTabLabel("@/tmp/a.png Please review docs/paste-20261104-101500-0a1b2c3d.png now", "/tmp/A.png Please review docs")).toBe("Please review\u2026");
+    // the label a message teaches the PC that named the folder, and only that PC
+    setPasteFolder("local", "/tmp/shots.png backup");
+    try {
+      learnTabLabel("local", "w1:p1", message);
+      learnTabLabel("other", "w1:p1", message);
+      settleTabLabels([pc("local", [{ pane_id: "w1:p1", terminal_id: "term_a" }]), pc("other", [{ pane_id: "w1:p1", terminal_id: "term_b" }])]);
+      expect(currentTabLabels()).toEqual({ "w1:p1|term_a": "Fix footer", "remote:other:w1%3Ap1|term_b": "backup/paste-20261104-10\u2026" });
+    } finally {
+      setPasteFolder("local", undefined);
+    }
+  });
+
+  it("drops a label an earlier version learned from an attachment, and learns the pane's again", () => {
+    const panes = [{ pane_id: "w1:p1", terminal_id: "term_a" }];
+    setTabLabels({ "w1:p1|term_a": "See @/Users/example/Library/\u2026" });
+    learnTabLabel("local", "w1:p1", "@/Users/example/Library/Mobile Documents/.ovis/paste-20261104-101500-0a1b2c3d.png Fix footer");
+    settleTabLabels([pc("local", panes)]);
+    expect(currentTabLabels()).toEqual({ "w1:p1|term_a": "Fix footer" });
   });
 
   it("counts a wide character as two columns, and never splits one", () => {

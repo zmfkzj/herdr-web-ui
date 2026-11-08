@@ -36,6 +36,7 @@ import { paneSendKeys, paneSendText, workspaceClose, workspaceCreate } from "../
 import { socketPath } from "../server/bridge.ts";
 import { SshConnection } from "../server/ssh.ts";
 import { chromePath } from "./chrome-path.ts";
+import { shownRows } from "./shown-rows.ts";
 
 if (process.env["HERDR_TEST_LIVE"] === "1") throw new Error("This regression refuses HERDR_TEST_LIVE=1");
 
@@ -202,7 +203,7 @@ try {
     });
   });
   const input = page.locator(".xterm-helper-textarea");
-  const screenText = () => page.locator(".pane-terminal .xterm-rows").first().innerText();
+  const screenText = () => page.locator(shownRows()).first().innerText();
   const shows = (text: string, what: string, ms?: number) => until(async () => (await screenText()).includes(text), what, ms);
 
   // pi starts fresh in the pane, then the browser opens its terminal

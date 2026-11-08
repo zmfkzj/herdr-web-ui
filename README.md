@@ -5,7 +5,7 @@
 <h1 align="center">Ovis</h1>
 
 <p align="center">
-  <strong>Every coding agent, on every screen.</strong>
+  <strong>Your coding agents, on desktop, phone and browser.</strong>
 </p>
 
 <p align="center">
@@ -26,7 +26,7 @@
   <a href="#docs">docs</a>
 </p>
 
-Ovis shows the coding agents on your computer as chats you answer with a click or a tap, in any browser, the Mac app or your phone. A client for [herdr](https://github.com/herdrdev/herdr), formerly herdr web UI.
+Chat with the coding agents on your computer from a desktop app, your phone or any browser, and answer their prompts with a tap. A client for [herdr](https://github.com/herdrdev/herdr) and the [Herdr desktop app's terminals](docs/guide.md#herdr-app-terminals).
 
 <p align="center">
   <a href="https://ovis.sh/demo/"><img src="docs/media/readme/hero.webp" alt="Screen recording of Ovis on the demo: in a desktop browser, a follow-up is sent to Claude Code and its turn streams in step by step; then the desktop and a phone side by side, where Codex asks Allow command? for git push origin feat/export-guard, Yes is tapped on the phone and the card closes on both screens; then a click on the release tab opens a shell pane as a live terminal running git log and bun test."></a>
@@ -38,14 +38,23 @@ Ovis shows the coding agents on your computer as chats you answer with a click o
 
 **On your computer**
 
-- **Mac:** download [Ovis.dmg](https://ovis.sh/Ovis.dmg), open it and click **Install**.
-- **Windows:** download [Ovis.exe](https://ovis.sh/Ovis.exe), run it and click **Install**.
-- **Linux:** run this in a terminal.
-  ```bash
-  curl -fsSL https://ovis.sh/install.sh | sh
-  ```
+- **Mac:** the desktop app for [Apple silicon](https://ovis.sh/Ovis-mac-arm64.dmg) or [Intel](https://ovis.sh/Ovis-mac-x64.dmg); drag it to **Applications**.
+- **Windows:** the desktop app, [Ovis-win-x64.exe](https://ovis.sh/Ovis-win-x64.exe); run it. If Windows shows **Windows protected your PC**, choose **More info** → **Run anyway**.
+- **Linux:** the desktop app for Debian or Ubuntu, [x64](https://ovis.sh/Ovis-linux-x64.deb) or [arm64](https://ovis.sh/Ovis-linux-arm64.deb) (`sudo apt install ./Ovis-linux-*.deb`); elsewhere the AppImage, [x64](https://ovis.sh/Ovis-linux-x64.AppImage) or [arm64](https://ovis.sh/Ovis-linux-arm64.AppImage) (`chmod +x Ovis-linux-*.AppImage`).
 
-Each one adds herdr and Bun if they are missing; Node is not needed. Other ways to install, step by step: [INSTALL.md](INSTALL.md).
+The desktop app needs nothing else and runs its own terminals. To use your herdr sessions instead, on Linux or macOS:
+
+```bash
+curl -fsSL https://ovis.sh/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://ovis.sh/install.ps1 | iex
+```
+
+Other ways, step by step: [INSTALL.md](INSTALL.md).
 
 **On your phone**
 
@@ -53,22 +62,21 @@ Each one adds herdr and Bun if they are missing; Node is not needed. Other ways 
 - **Android:** the Google Play beta, from [ovis.sh/beta](https://ovis.sh/beta/).
 - **Browser:** no app needed; add the page to the home screen.
 
-With Tailscale on in both, scan the QR code your computer shows to connect. No Tailscale? Turn on the end-to-end encrypted **Ovis relay** under **Settings → Phone & devices** and scan its QR code with the phone's camera: it opens Ovis in the phone's browser. [How it works →](docs/guide.md#through-the-ovis-relay)
+To connect a phone, turn on the end-to-end encrypted **Ovis relay** in **Settings → Phone & devices** and scan its QR code. [How it works →](docs/guide.md#through-the-ovis-relay)
 
 ## what you get
 
-- **Any agent herdr runs.** Claude Code, Codex, OpenCode, pi, omp, Gajae Code, Hermes, Grok and more, most as a chat. [Supported agents →](docs/guide.md#supported-agents)
-- **Prompts as cards.** Checked as still current before your answer is sent.
-- **The live terminal, one click away.** The same pane herdr shows, with a key bar on phones.
-- **Every workspace in one list.** Tabs, splits and other PCs over SSH, with the ones waiting on you marked.
-- **Push alerts.** When an agent asks something or finishes, even with the app closed.
-- **Free and MIT.** Runs on your own computer, with no account to sign up for.
+- **Agents as a chat.** Claude Code, Codex, OpenCode and more. [Supported agents →](docs/guide.md#supported-agents)
+- **Prompts and approvals as cards.** Answer with a tap.
+- **Push alerts.** Even with the app closed.
+- **The live terminal, one click away.** With a key bar on phones.
+- **Every workspace in one list.** Other PCs over SSH too.
 
 [All features →](docs/guide.md#features)
 
-**Limits:** Ovis needs [herdr](https://github.com/herdrdev/herdr) and your own computer, switched on, and your phone has to reach it (Tailscale, a VPN, an SSH tunnel or the Ovis relay).
+**Limits:** your computer has to be on and reachable (the Ovis relay, Tailscale, a VPN or an SSH tunnel). The Herdr desktop app's terminals work on Linux and macOS only.
 
-**Privacy:** sessions stay on the computer that runs each agent, and Ovis has no account. Its optional relay, off until you turn it on, sees which phone connects to which PC, from which address, when and how much, but can't read what is sent ([trust model](docs/relay.md#trust-model)). Anonymous usage counts are on by default; **Settings → About → Anonymous usage counts** shows what is sent and turns them off, as does `OVIS_TELEMETRY=0`. [What is sent →](docs/guide.md#anonymous-usage-counts)
+**Privacy:** sessions stay on your computer, with no account. The optional relay can't read what is sent ([trust model](docs/relay.md#trust-model)). Anonymous usage counts are on by default; **Settings → About** or `OVIS_TELEMETRY=0` turns them off ([what is sent](docs/guide.md#anonymous-usage-counts)).
 
 ## docs
 

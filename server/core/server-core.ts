@@ -15,14 +15,17 @@ import type { DeviceStore } from "../devices.ts";
 import { ping } from "../herdr/client.ts";
 import { servingCore } from "../herdr-core/runtime.ts";
 import type { PreferenceStore } from "../preferences.ts";
+import { type OmpLookups, OpenCodePromptState, shownPromptText } from "../prompt.ts";
 import { attachableIdentity, sidecarAvailable } from "../pty/sidecar.ts";
 import type { UsageLoginService } from "../usage-login.ts";
 import type { UsageService } from "../usage.ts";
-import { createSubmitText } from "./composer.ts";
+import { claudeBoxReads, createSubmitText } from "./composer.ts";
+import { claudeInputEmpty } from "../claude-input.ts";
 import { type Client, createConnections, type SocketData } from "./connections.ts";
 import { createInputLane } from "./input.ts";
 import { createGuiViews, type GuiViewOptions } from "./gui-view.ts";
 import { createPendingDelivery } from "./pending.ts";
+import { createPromptWatch } from "./prompt-watch.ts";
 import { createSocket } from "./socket.ts";
 import { createStatusHub } from "./status.ts";
 import { ATTACH_HELD_RETRY_MS, ATTACH_HOLD_MS, ATTACH_RELOOKUP_FOR_MS, ATTACH_RETRY_FOR_MS } from "./terminal-process.ts";
@@ -76,18 +79,28 @@ export function createCore({ options, devices, preferences, usage, usageLogin, b
   const present = new Set<Client>();
   let stopped = false;
   const gui = createGuiViews({ clients, visual });
-  const { attachments, conversations, reconcileOutput, closeAttachment, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames } = createTerminalRegistry({ options, clients, stopped: () => stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending: (owner, paneId) => holdPending(owner, paneId), holdPendingPane: (paneId, fault) => holdPendingPane(paneId, fault), attached: (client, paneId) => attached(client, paneId), transcriptChanged: (paneId) => reconcilePiDeliveries(paneId), inputReady: (paneId) => drainPending(paneId), end: (client, reason) => end(client, reason) });
+  const { attachments, conversations, reconcileOutput, closeAttachment, paneMoved, detachClaimed, dropClaims, sight, poke, drainOutput, terminalFrames } = createTerminalRegistry({ options, clients, stopped: () => stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending: (owner, paneId) => holdPending(owner, paneId), holdPendingPane: (paneId, fault) => holdPendingPane(paneId, fault), attached: (client, paneId) => attached(client, paneId), transcriptChanged: (paneId) => reconcilePiDeliveries(paneId), inputReady: (paneId) => drainPending(paneId), end: (client, reason) => end(client, reason) });
 
-  const { serialize, lastTyped, inputFrames } = createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight, poke, terminalAttach, terminalAttachKnown: () => terminalAttachKnown, mayType: (client) => mayType(client), authorizeSocket: (client) => authorizeSocket(client), gui });
+  const { serialize, settleAfterTyping, lastTyped, inputFrames } = createInputLane({ TYPED_SETTLE_MS, KEY_SETTLE_MS, clients, sight, poke, terminalAttach, terminalAttachKnown: () => terminalAttachKnown, mayType: (client) => mayType(client), authorizeSocket: (client) => authorizeSocket(client), gui });
 
   const submitText = createSubmitText({ options, lastTyped, attachments, terminalAttach, SUBMIT_DEADLINE_MS, TYPED_SETTLE_MS, DRAFT_CLEAR_WAIT_MS, DRAFT_CLEAR_POLL_MS, SUBMIT_DELAY_MS });
 
-  const { pending, holdPending, holdPendingPane, drainPending, pendingFrames, queueFirstMessage, attached, closeConnection, reconcilePiDeliveries } = createPendingDelivery({ options, clients, attachments, sight, serialize, lastTyped, submitText, authorizeSocket: (client) => authorizeSocket(client), clientSnapshot: () => clientSnapshot(), omo: { sessionOf: (paneId) => omo.sessionOf(paneId) }, gui, queueHeld: (paneId) => queueHeld(paneId), SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, TYPED_SETTLE_MS });
+  const { pending, holdPending, holdPendingPane, movePendingPane, drainPending, pendingFrames, queueFirstMessage, attached, closeConnection, reconcilePiDeliveries } = createPendingDelivery({ options, clients, attachments, sight, serialize, lastTyped, submitText, authorizeSocket: (client) => authorizeSocket(client), clientSnapshot: () => clientSnapshot(), omo: { sessionOf: (paneId) => omo.sessionOf(paneId) }, gui, queueHeld: (paneId) => queueHeld(paneId), SUBMIT_DEADLINE_MS, SUBMIT_DELAY_MS, TYPED_SETTLE_MS });
 
-  const { mayType, authorizeSocket, admit, setRole, watchPane, unwatchPane, killWatches, end } = createConnections({ clients, present, pending: { close: closeConnection }, devices, detachClaimed, dropClaims, gui });
-  const { push, omo, gjc, claudeAgents, opencodeAgents, plans, clientSnapshot, currentHerdrLifetime, queueHeld, countVisit, machines, broadcastAll, logPushError, collector, waitTimer } = createStatusHub({ options, devices, preferences, clients, present, pending, drainPending, holdPendingPane, usage, usageLogin, ...(visual ? { paneEnded: visual.paneEnded } : {}) });
+  // the watches read OpenCode's forms and omp's sessions into a state of their own: the route's entries, drafts and
+  // lookups are its answers' (the route's drafts are only read, for the step an answer moved its card to)
+  const watchedOpenCode = new OpenCodePromptState();
+  const watchedOmp: OmpLookups = new Map();
+  const promptWatch = createPromptWatch({ clients, read: (pane, panes) => shownPromptText(pane, panes, { codexHome: options.codexHome, openCodeStateDir: options.openCodeStateDir, openCodeState: watchedOpenCode, ompLookups: watchedOmp, answers: options.openCodeState }) });
+
+  const { mayType, authorizeSocket, admit, setRole, watchPane, unwatchPane, killWatches, end } = createConnections({ clients, present, pending: { close: closeConnection }, devices, detachClaimed,
+    dropClaims: (client) => { dropClaims(client); promptWatch.drop(client); }, gui });
+  const { push, alertWebhook, omo, gjc, claudeAgents, opencodeAgents, plans, clientSnapshot, currentHerdrLifetime, queueHeld, countVisit, machines, broadcastAll, logPushError, collector, waitTimer } = createStatusHub({ options, devices, preferences, clients, present, pending, drainPending, holdPendingPane, usage, usageLogin,
+    // the messages first: the old ID's terminal closing holds what it still leases
+    paneMoved: (from, to) => { movePendingPane(from, to); paneMoved(from, to); },
+    ...(visual ? { paneEnded: visual.paneEnded } : {}) });
   const socketHandlers = createSocket({
-    clients, present, stopped: () => stopped, admit, setRole, watchable: () => !servingCore(), watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, herdrLifetime: currentHerdrLifetime, browserSnapshot, countVisit, drainOutput,
+    clients, present, stopped: () => stopped, admit, setRole, watchable: () => !servingCore(), terminalHistory: () => servingCore(), watchPane, unwatchPane, end, holdPending, attachments, clientSnapshot, herdrLifetime: currentHerdrLifetime, browserSnapshot, countVisit, drainOutput,
     // each frame type by name, with the handler of the module that owns it: anything else on a frame object never
     // becomes a frame a client can send, and a type named twice fails the build instead of replacing a handler
     frames: {
@@ -95,6 +108,7 @@ export function createCore({ options, devices, preferences, usage, usageLogin, b
       "take-over": terminalFrames["take-over"],
       detach: terminalFrames.detach,
       "conversation-watch": terminalFrames["conversation-watch"],
+      "prompt-watch": promptWatch.frames["prompt-watch"],
       "pty-ack": terminalFrames["pty-ack"],
       resize: terminalFrames.resize,
       "release-size": terminalFrames["release-size"],
@@ -116,7 +130,14 @@ export function createCore({ options, devices, preferences, usage, usageLogin, b
   let outputTimer: ReturnType<typeof setInterval> | undefined;
 
   return {
-    sidecar, serialize, push, logPushError, omo, claudeAgents, opencodeAgents, plans, clientSnapshot, machines, broadcastAll, collector, websocket, queueFirstMessage,
+    sidecar, serialize, settleAfterTyping, push, alertWebhook, logPushError, omo, claudeAgents, opencodeAgents, plans, clientSnapshot, machines, broadcastAll, collector, websocket, queueFirstMessage,
+    /** a message someone sent through Ovis still waits for the pane (runtime-move.ts) */
+    holdsPending: (paneId: string): boolean => pending.holds(paneId),
+    /** true: Claude Code's input box reads empty; false: text is in it or it cannot be read whole; null: an agent whose box Ovis cannot read */
+    inputEmpty: async (paneId: string, agent: string): Promise<boolean | null> => {
+      if (agent !== "claude") return null;
+      try { return claudeInputEmpty(...await claudeBoxReads(paneId)); } catch { return false; }
+    },
     // The relay uses these same handlers with a SocketLike; websocket above remains Bun's boundary.
     socketHandlers,
     /** once the server listens */
@@ -133,6 +154,7 @@ export function createCore({ options, devices, preferences, usage, usageLogin, b
       stopped = true;
       gui.close();
       conversations.stop();
+      promptWatch.stop();
       clearInterval(outputTimer);
       collector.stop();
       omo.stop();

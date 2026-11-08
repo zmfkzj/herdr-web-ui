@@ -1,9 +1,16 @@
 import { apiFetch } from "./api-request-id.ts";
 import type { PreferencesChange, SharedPreferences } from "../../shared/preferences.ts";
-import type { SeenFinish } from "../../shared/seen.ts";
+import type { AlertWebhookSave, AlertWebhookView } from "../../shared/alert-webhook.ts";
+import type { SeenFinish, SeenPresentation } from "../../shared/seen.ts";
 import type { AgentCatalogResponse, AgentTabStarted } from "../../shared/agent-catalog.ts";
+import type { ConversationSearchResponse } from "../../shared/conversation-search.ts";
 import { resumeConnectionTraces } from "./connectionTrace.ts";
-import { machinePath, type BridgeHealth, type HerdrCoreFacts, type HerdrIdentity, type Machine, type MachineRoster, type SetupAction, type SetupJob, type SetupRequest } from "../../shared/machines.ts";
+import type { PullRequestCheckLog, PullRequestMergeRequest, PullRequestView } from "../../shared/pull-request.ts";
+import type { SystemReport } from "../../shared/system.ts";
+import type { MovePlanResponse, MoveStartRequest, MoveStopAllOffer, MoveStopAllRequest, MoveStopRequest } from "../../shared/runtime-move.ts";
+import type { EditableText, PaneDocuments, TextSaved, TextSaveRequest } from "../../shared/files.ts";
+import { parseSystemReport } from "./systemReport.ts";
+import { machinePath, type BridgeHealth, type HerdrCoreFacts, type HerdrIdentity, type HerdrRuntimeFacts, type Machine, type MachineRoster, type SetupAction, type SetupJob, type SetupRequest } from "../../shared/machines.ts";
 import type {
   WorkspaceMoved,
   HerdrPane,
@@ -22,6 +29,7 @@ import type {
   HealthAuth,
   IntegrationsResponse,
   LanExposure,
+  DirectExposure,
   SecuritySummary,
   InteractivePrompt,
   MoveTabRequest,
@@ -30,6 +38,7 @@ import type {
   TabMovedToWorkspace,
   OmoActivity,
   ClaudeArtifact,
+  OmpBtwHistory,
   PaneBackgroundAgentDetail,
   OpenWorktreeRequest,
   PairedDevice,
@@ -72,6 +81,8 @@ import type {
   SplitPaneDirection,
   SplitPaneRequest,
   SwapPaneRequest,
+  MovePaneRequest,
+  PaneMoved,
   TabCreated,
   UpdateInstallRequest,
   StatuslineState, UsageReport,
@@ -80,6 +91,7 @@ import type {
   PluginActionResult,
   PluginActions,
   PluginActionsResponse,
+  WorktreeInventory,
   WorktreeListing,
   WorktreeOpened,
   WorktreeRemoved,
@@ -95,6 +107,7 @@ import { MAX_ATTACHMENT_BYTES } from "../../shared/attachments.ts";
 import { t } from "./i18n.ts";
 import { chatReadDeadlineMs, withChatReadDeadline } from "./chatReadDeadline.ts";
 import { movingHerdrFocus } from "./followFocus.ts";
+import { observeWaitingClock, waitingKey } from "./sentWaiting.ts";
 import type { UsageAccountRemoval, UsageLoginAccounts, UsageLoginCode, UsageLoginFollowed, UsageLoginPrompt, UsageLoginProvider, UsageLoginRequest, UsageLoginStarted } from "../../shared/usage-login.ts";
 
 export function fetchUsageLoginProviders(signal: AbortSignal): Promise<{ providers: readonly UsageLoginProvider[] }> {
@@ -204,6 +217,62 @@ export function fetchHerdrUpdate(): Promise<HerdrUpdateStatus> {
   return getJson<HerdrUpdateStatus>("/api/herdr/update");
 }
 
+/** Settings → About → Terminals: saves `runtime` and has the server start again on it (server/herdr-core/runtime-choice.ts). */
+export async function switchRuntime(runtime: "herdr" | "herdr-core"): Promise<void> {
+  const url = "/api/runtime";
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({ runtime }) });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
+/** Settings → About → Terminals: the move of this PC's whole herdr session to herdr-core, as it stands now (server/runtime-move.ts). */
+export function fetchMovePlan(): Promise<MovePlanResponse> {
+  return getJson<MovePlanResponse>("/api/runtime/move", { cache: "no-store" });
+}
+
+/** Starts the move of the plan shown, by its revision; a busy pane makes it wait, and the server goes by itself once none is. */
+export async function startMove(revision: string): Promise<void> {
+  const url = "/api/runtime/move";
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({ revision } satisfies MoveStartRequest) });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
+/** While the move waits: Ctrl+C to a shell pane running the command shown, or once the wait offers it, `force` (SIGTERM to its command). */
+export async function stopMovePane(paneId: string, command: string | null, force = false): Promise<void> {
+  const url = "/api/runtime/move/stop";
+  const body: MoveStopRequest = { pane_id: paneId, ...(command === null ? {} : { command }), ...(force ? { force: true } : {}) };
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify(body) });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
+/** End all and move now, asked: the running commands it would end, under a token for exactly that list. */
+export async function prepareStopAll(): Promise<MoveStopAllOffer> {
+  const url = "/api/runtime/move/stop-all";
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({} satisfies MoveStopAllRequest) });
+  if (!response.ok) throw await errorFrom(url, response);
+  return (await response.json()) as MoveStopAllOffer;
+}
+
+/** End all and move now, confirmed: refused when the panes changed since the offer, so the person is asked again. */
+export async function confirmStopAll(token: string): Promise<void> {
+  const url = "/api/runtime/move/stop-all";
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({ token } satisfies MoveStopAllRequest) });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
+/** Installs herdr-core where the move offers it (`install` in the plan's answer); the move is offered once it is in. */
+export async function installHerdrCore(): Promise<void> {
+  const url = "/api/runtime/move/install";
+  const response = await apiFetch(url, { method: "POST", headers: { "x-herdr-update": "1" } });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
+/** Ends a wait for busy panes; a move under way is not stopped. */
+export async function cancelMove(): Promise<void> {
+  const url = "/api/runtime/move";
+  const response = await apiFetch(url, { method: "DELETE", headers: { "x-herdr-update": "1" } });
+  if (!response.ok) throw await errorFrom(url, response);
+}
+
 export async function requestHerdrUpdate(): Promise<void> {
   const url = "/api/herdr/update";
   const response = await apiFetch(url, { method: "POST", headers: { "x-herdr-update": "1" } });
@@ -256,8 +325,45 @@ export async function requestRelay(action: "start" | "stop" | "reset-identity"):
   return (await response.json()) as RelayStatus;
 }
 
+/** POST /api/relay/direct: whether paired phones may connect straight to this PC on its networks while the relay is on. */
+export function requestRelayDirect(on: boolean): Promise<RelayStatus> {
+  return getJson<RelayStatus>("/api/relay/direct", { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({ on }) });
+}
+
 export function requestRelayOffer(): Promise<RelayOffer> {
   return getJson<RelayOffer>("/api/relay/offer", { method: "POST", headers: { "x-herdr-update": "1" } });
+}
+
+/** POST /api/relay/code: a code to type on the device being paired, good until `expires_at`; it replaces any showing. */
+export interface RelayCode {
+  readonly code: string;
+  readonly expires_at: string;
+  readonly server_id: string;
+}
+
+export function requestRelayCode(): Promise<RelayCode> {
+  return getJson<RelayCode>("/api/relay/code", { method: "POST", headers: { "x-herdr-update": "1" } });
+}
+
+/** POST /api/relay/code/cancel: takes the code showing off the relay. */
+export function cancelRelayCode(): Promise<{ readonly ok: true }> {
+  return getJson<{ readonly ok: true }>("/api/relay/code/cancel", { method: "POST", headers: { "x-herdr-update": "1" } });
+}
+
+/**
+ * POST /api/relay/link: a pairing link without a code; the phone that opens it compares six digits with this PC.
+ * `localOnly`: this PC's screen waits to be added to an account, so what comes is approved on this PC only.
+ */
+export function requestRelayLink(options: { localOnly?: boolean } = {}): Promise<{ readonly url: string }> {
+  return getJson<{ readonly url: string }>("/api/relay/link", { method: "POST", headers: { "x-herdr-update": "1", ...(options.localOnly ? { "x-ovis-local-only": "1" } : {}) } });
+}
+
+/** POST /api/relay/pairing: the owner's answer to a phone waiting with the same digits (`relay-pairings` events). */
+export async function decideRelayPairing(id: string, decision: "approve" | "decline", digits?: string): Promise<void> {
+  const url = "/api/relay/pairing";
+  // an account member approving through the relay names the digits it picked (docs/account.md, "Who may admit a device")
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1" }, body: JSON.stringify({ id, decision, ...(digits === undefined ? {} : { digits }) }) });
+  if (!response.ok) throw await errorFrom(url, response);
 }
 
 /** Anonymous install and update counts; null from a server that sends none (404). */
@@ -277,11 +383,13 @@ export async function savePreferences(body: PreferencesChange, keepalive = false
 
 /**
  * Tells every browser of this server that this one presented a finish (shared/seen.ts). A server
- * that predates it (404) or a watching device (403) keeps the read to this browser.
+ * that predates it (404) or a watching device (403) keeps the read to this browser; one that
+ * predates `presented` ignores it.
  */
-export async function shareSeen(finish: SeenFinish): Promise<void> {
+export async function shareSeen(finish: SeenFinish, presented?: SeenPresentation): Promise<void> {
   const url = "/api/seen";
-  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(finish) });
+  const response = await apiFetch(url, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(presented === undefined ? finish : { ...finish, presented }) });
   if (response.ok || response.status === 404 || response.status === 403) return;
   throw await errorFrom(url, response);
 }
@@ -358,6 +466,14 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(url, init);
   if (!response.ok) throw await errorFrom(url, response);
   return (await response.json()) as T;
+}
+
+/** GET /api/system on a PC: its load right now. A bridge from before this route answers 404. */
+export async function fetchSystem(machineId = "local", signal?: AbortSignal): Promise<SystemReport> {
+  const report = parseSystemReport(await getJson<unknown>(machinePath(machineId, "system"), { cache: "no-store", ...(signal ? { signal } : {}) }));
+  // another PC's bridge can be of another version: an answer the sidebar cannot draw is an unusable one
+  if (report === null) throw new ApiError(machinePath(machineId, "system"), 502, UNUSABLE_ANSWER["remote_response_invalid"]!(), "remote_response_invalid");
+  return report;
 }
 
 export async function fetchSession(machineId = "local"): Promise<SessionSnapshot> {
@@ -500,6 +616,8 @@ function trimConversationAnswers(keep: string): void {
  * only while the pane is still on it. A pane the roster has not named yet is on `undefined`.
  */
 const paneSessions = new Map<string, string>();
+/** Each pane's session (as paneSessions) and folder as the roster last named them: what its slash commands are read for. */
+const paneCommandScopes = new Map<string, string>();
 /**
  * Per PC, a token its event that panes changed (paneSessionsMoving) gave it until the roster after it
  * names the sessions: a read in between is of a session not known yet, so it stands for none other.
@@ -537,7 +655,7 @@ export function paneSessionKey(pane: Pick<HerdrPane, "agent" | "agent_session">)
  * replaced another reuses its pane IDs, so the session is the herdr's too; a pane the roster no longer
  * lists has none.
  */
-export function observePaneSessions(machines: readonly { id: string; snapshot: { herdr_lifetime?: string; panes: readonly Pick<HerdrPane, "pane_id" | "agent" | "agent_session">[] } | null }[], readAfter?: number): void {
+export function observePaneSessions(machines: readonly { id: string; snapshot: { herdr_lifetime?: string; panes: readonly Pick<HerdrPane, "pane_id" | "agent" | "agent_session" | "cwd" | "foreground_cwd">[] } | null }[], readAfter?: number): void {
   for (const machine of machines) {
     if (machine.snapshot === null) continue;
     // only a roster read after the PC's last event names its panes' sessions now; one read before it (a poll
@@ -548,10 +666,31 @@ export function observePaneSessions(machines: readonly { id: string; snapshot: {
     for (const pane of machine.snapshot.panes) {
       const key = paneKey(pane.pane_id, machine.id);
       listed.add(key);
-      paneSessions.set(key, `${machine.snapshot.herdr_lifetime ?? ""}\u0000${paneSessionKey(pane)}`);
+      const session = `${machine.snapshot.herdr_lifetime ?? ""}\u0000${paneSessionKey(pane)}`;
+      paneSessions.set(key, session);
+      // the folder the server lists the pane's commands for (pane-context.ts)
+      paneCommandScopes.set(key, `${session}\u0000${pane.foreground_cwd ?? pane.cwd ?? ""}`);
     }
     for (const key of paneSessions.keys()) if (key.startsWith(paneKey("", machine.id)) && !listed.has(key)) paneSessions.delete(key);
+    for (const key of paneCommandScopes.keys()) if (key.startsWith(paneKey("", machine.id)) && !listed.has(key)) paneCommandScopes.delete(key);
   }
+}
+
+/**
+ * What a pane's slash commands are read for now: its session and folder as the roster last named them
+ * (empty before it names the pane). The same pane running its agent in another project lists other skills.
+ */
+export function paneCommandScope(paneId: string, machineId: string): string {
+  return paneCommandScopes.get(paneKey(paneId, machineId)) ?? "";
+}
+
+/**
+ * The PC's token from its last event that panes changed, until the roster after it names them; undefined
+ * otherwise. A commands read in that gap may be of a session not named yet: it joins no read begun before
+ * and is not kept, while the lists already kept stay drawn.
+ */
+export function paneScopesMoving(machineId: string): string | undefined {
+  return movingSessions.get(machineId)?.token;
 }
 
 /**
@@ -634,10 +773,22 @@ export function prefetchPaneConversation(paneId: string, machineId: string, prom
   const historyId = cached?.source === "scrollback" ? undefined : cached?.history_id;
   const controller = new AbortController();
   const pressed: PressRead = { controller, at: performance.now(), pane, session: sessionNow(pane), read: fetchPaneConversation(paneId, machineId, { prompts, history_id: historyId, fresh: true, signal: controller.signal }) };
-  // a press that was a scroll leaves it untaken; a read that takes it still gets its failure
-  pressed.read.then((answer) => { pressed.answer = answer; }, () => undefined);
+  // a press that was a scroll leaves it untaken; a read that takes it on its way still gets its failure,
+  // and a read that comes after the failure asks the server again (the bridge may be back by then)
+  pressed.read.then((answer) => { pressed.answer = answer; }, () => { if (pressReads.get(url) === pressed) pressReads.delete(url); });
   pressReads.set(url, pressed);
   setTimeout(() => { if (pressReads.get(url) === pressed) pressReads.delete(url); }, PRESS_READ_MS);
+}
+
+/**
+ * GET /api/pane/conversation/search: the messages and answers that hold `query`, newest first, a
+ * few pages per answer; `before` and `historyId` go on from an answer's cursor and history.
+ */
+export async function searchPaneConversation(paneId: string, query: string, machineId = "local", page: { before?: string; historyId?: string; signal?: AbortSignal } = {}): Promise<ConversationSearchResponse> {
+  const params = new URLSearchParams({ pane_id: paneId, q: query });
+  if (page.before !== undefined) params.set("before", page.before);
+  if (page.historyId !== undefined) params.set("history_id", page.historyId);
+  return getJson<ConversationSearchResponse>(machinePath(machineId, `pane/conversation/search?${params.toString()}`), page.signal ? { signal: page.signal } : undefined);
 }
 
 /** GET /api/pane/conversation: structured turns, or scrollback fallback; `page` as ConversationResponse.cursor describes. */
@@ -680,9 +831,16 @@ async function readPaneConversation(paneId: string, machineId: string, page: Con
   const requestUrl = page.history_id === undefined ? url : `${url}&history_id=${encodeURIComponent(page.history_id)}`;
   const { response, body } = await withChatReadDeadline(async (signal) => {
     const response = await apiFetch(requestUrl, { cache: "no-store", signal, ...(known && !page.fresh ? { headers: { "if-none-match": known.etag } } : {}) });
-    if (response.status === 304 && known) return { response, body: known.body };
+    // as it arrived, whatever becomes of its body: its time bounds this browser's clock against the PC's
+    const received = performance.now(), receivedWall = Date.now();
+    if (response.status === 304 && known) {
+      observeWaitingClock(waitingKey(machineId, paneId), response.headers.get("x-server-time"), received, receivedWall);
+      return { response, body: known.body };
+    }
     if (!response.ok) throw await errorFrom(url, response);
-    return { response, body: (await response.json()) as ConversationResponse };
+    const body = (await response.json()) as ConversationResponse;
+    observeWaitingClock(waitingKey(machineId, paneId), response.headers.get("x-server-time") ?? body.server_time, received, receivedWall);
+    return { response, body };
   }, chatReadDeadlineMs(machineId), page.signal).catch((cause: unknown) => {
     // a failed read gives up what it held of the pages' order: a later read is the newest again
     if (polled && lastNewestRead.get(url) === read) lastNewestRead.delete(url);
@@ -713,7 +871,8 @@ async function readPaneConversation(paneId: string, machineId: string, page: Con
     return body;
   }
   const etag = response.headers.get("etag");
-  if (!polled) return body;
+  // a wait for the reader's proof keeps the conversation it would return to
+  if (!polled || body.recovery === "waiting") return body;
   conversationAnswers.delete(url);
   if (etag !== null) {
     const bytes = conversationAnswerBytes(body, response.headers.get("content-length"), response.headers.get("content-encoding"));
@@ -742,10 +901,14 @@ export interface HealthInfo {
   auth?: HealthAuth;
   /** present only while this server is reachable beyond this PC with no token and nothing paired */
   lan_exposure?: LanExposure;
+  /** present only while lan_exposure is not: the relay's direct carrier listens on this PC's network, for relay-paired devices only */
+  direct_exposure?: DirectExposure;
   /** authenticated only; absent from an older server, which the summary shows as unavailable */
   security?: SecuritySummary;
   /** authenticated only; absent from an older server and until the server's first look for hc has ended */
   herdr_core?: HerdrCoreFacts;
+  /** a driving owner only; absent from an older server */
+  herdr_runtime?: HerdrRuntimeFacts;
 }
 
 export async function fetchHealth(): Promise<HealthInfo> {
@@ -774,8 +937,9 @@ export async function pairDevice(code: string, label: string): Promise<void> {
   resumeConnectionTraces();
 }
 
-export async function fetchDevices(): Promise<PairedDevice[]> {
-  return (await getJson<{ devices: PairedDevice[] }>("/api/devices")).devices;
+/** `check`: the PC measures every connected device's round trip first (Check now), within a few seconds */
+export async function fetchDevices(check = false): Promise<PairedDevice[]> {
+  return (await getJson<{ devices: PairedDevice[] }>(check ? "/api/devices?check=1" : "/api/devices")).devices;
 }
 
 export async function startPairing(): Promise<PairingCode> {
@@ -861,7 +1025,7 @@ export async function uploadPaneImage(paneId: string, image: Blob, machineId = "
   return ((await response.json()) as { path: string }).path;
 }
 
-async function sendJson(url: string, method: "POST" | "PATCH" | "DELETE", body: unknown): Promise<Response> {
+async function sendJson(url: string, method: "POST" | "PATCH" | "PUT" | "DELETE", body: unknown): Promise<Response> {
   const response = await apiFetch(url, {
     method,
     headers: { "content-type": "application/json", "x-herdr-machine": "1" },
@@ -970,6 +1134,13 @@ export async function swapPaneWith(paneId: string, targetPaneId: string, machine
   return movingHerdrFocus(machineId, request);
 }
 
+/** POST /api/pane/move: the pane goes to that side of another pane of its tab; herdr's focus moves on the way and back, so its events wait as a swap's do. */
+export async function movePaneBeside(paneId: string, targetPaneId: string, side: PaneDirection, machineId = "local"): Promise<PaneMoved> {
+  const request = sendJson(machinePath(machineId, "pane/move"), "POST", { pane_id: paneId, target_pane_id: targetPaneId, side } satisfies MovePaneRequest)
+    .then(async (response) => (await response.json()) as PaneMoved);
+  return movingHerdrFocus(machineId, request);
+}
+
 /** POST /api/layout/ratio: set the split identified by its binary path to the dragged ratio. */
 export async function setSplitRatio(tabId: string, path: boolean[], ratio: number, machineId = "local"): Promise<void> {
   await sendJson(machinePath(machineId, "layout/ratio"), "POST", { tab_id: tabId, path, ratio } satisfies SetSplitRatioRequest);
@@ -1045,6 +1216,16 @@ export async function fetchFileInfo(path: string, paneId: string | null, machine
   return (await response.json()) as FileInfo;
 }
 
+/** GET /api/fs/text: a text file under the pane's folder, read to edit it (shared/files.ts). */
+export async function fetchEditableText(path: string, paneId: string, machineId = "local"): Promise<EditableText> {
+  return getJson<EditableText>(machinePath(machineId, `fs/text?${fileQuery(path, paneId)}`), { cache: "no-store" });
+}
+
+/** PUT /api/fs/text: saves the text over the file read with `revision`; a file changed since is an ApiError `stale_revision`. */
+export async function saveEditableText(request: TextSaveRequest, machineId = "local"): Promise<TextSaved> {
+  return (await (await sendJson(machinePath(machineId, "fs/text"), "PUT", request)).json()) as TextSaved;
+}
+
 /** GET /api/fs/favicon: the icon the project in folder `root` keeps, or null, in one request. */
 export async function fetchProjectFavicon(root: string, machineId = "local"): Promise<FileInfo | null> {
   return (await getJson<ProjectFavicon>(projectFaviconUrl(root, machineId))).icon;
@@ -1106,6 +1287,31 @@ export async function fetchRepoDiffFile(query: RepoDiffQuery, path: string, oldP
   return getJson<RepoDiffFilePatch>(machinePath(machineId, `workspace/diff/file?${params.toString()}`));
 }
 
+/** The folder whose branch's pull request is read: the pane's own, or `directory` when the pane is gone. */
+export interface PullRequestTarget { paneId: string | null; directory: string | null }
+
+function pullRequestParams(target: PullRequestTarget): URLSearchParams {
+  return new URLSearchParams({ ...(target.paneId ? { pane_id: target.paneId } : {}), ...(target.directory ? { directory: target.directory } : {}) });
+}
+
+/** GET /api/workspace/pr: the branch's pull request, its checks and open review threads, read through the PC's gh. */
+export async function fetchPullRequest(target: PullRequestTarget, machineId = "local"): Promise<PullRequestView> {
+  return getJson<PullRequestView>(machinePath(machineId, `workspace/pr?${pullRequestParams(target).toString()}`));
+}
+
+/** GET /api/workspace/pr/log: the last lines of a check's Actions job log. */
+export async function fetchPullRequestLog(target: PullRequestTarget, jobId: string, host: string, machineId = "local"): Promise<PullRequestCheckLog> {
+  const params = pullRequestParams(target);
+  params.set("job_id", jobId);
+  params.set("host", host);
+  return getJson<PullRequestCheckLog>(machinePath(machineId, `workspace/pr/log?${params.toString()}`));
+}
+
+/** POST /api/workspace/pr/merge: merges the pull request at the head it was read at, with the method shown. */
+export async function mergePullRequest(target: PullRequestTarget, merge: Pick<PullRequestMergeRequest, "number" | "head_oid" | "base_ref" | "method">, machineId = "local"): Promise<void> {
+  await sendJson(machinePath(machineId, "workspace/pr/merge"), "POST", { ...(target.paneId ? { pane_id: target.paneId } : {}), ...(target.directory ? { directory: target.directory } : {}), ...merge } satisfies PullRequestMergeRequest);
+}
+
 export type { CreateTabRequest, CreateWorkspaceRequest } from "../../shared/protocol.ts";
 
 /**
@@ -1127,6 +1333,14 @@ export async function createWorktree(request: CreateWorktreeRequest, machineId =
 /** GET /api/worktree/list: every checkout of the workspace's repository, with the workspace each is open in. */
 export function listWorktrees(workspaceId: string, machineId = "local"): Promise<WorktreeListing> {
   return getJson<WorktreeListing>(`${machinePath(machineId, "worktree/list")}?workspace_id=${encodeURIComponent(workspaceId)}`);
+}
+
+/**
+ * GET /api/worktree/inventory: what listWorktrees answers for each workspace, in one read (at most
+ * MAX_INVENTORY_WORKSPACES). A PC whose bridge is from before it answers 404 not_found (routeMissing).
+ */
+export function readWorktreeInventory(workspaceIds: readonly string[], machineId = "local"): Promise<WorktreeInventory> {
+  return getJson<WorktreeInventory>(`${machinePath(machineId, "worktree/inventory")}?${workspaceIds.map((id) => `workspace_id=${encodeURIComponent(id)}`).join("&")}`);
 }
 
 /** POST /api/worktree/open: an existing checkout as a workspace; the one it already has when it is open. */
@@ -1222,7 +1436,9 @@ export async function removeWorktree(request: RemoveWorktreeRequest, machineId =
 
 /** GET /api/pane/commands: the slash commands the pane's agent understands (built-in + custom). */
 export async function fetchPaneCommands(paneId: string, machineId = "local"): Promise<SlashCommand[]> {
-  return (await getJson<{ commands: SlashCommand[] }>(machinePath(machineId, `pane/commands?pane_id=${encodeURIComponent(paneId)}`))).commands;
+  // a read that never answers would be shared by every later caller for good: it fails at a deadline instead,
+  // past the 45 s the server waits for a scan before it answers 503 (server/commands.ts COMMANDS_WAIT_MS)
+  return (await withChatReadDeadline((signal) => getJson<{ commands: SlashCommand[] }>(machinePath(machineId, `pane/commands?pane_id=${encodeURIComponent(paneId)}`), { signal }), 4 * chatReadDeadlineMs(machineId))).commands;
 }
 
 /**
@@ -1258,6 +1474,12 @@ export async function fetchPaneArtifacts(paneId: string, machineId = "local"): P
   return (await getJson<{ artifacts: ClaudeArtifact[] }>(machinePath(machineId, `pane/artifacts?pane_id=${encodeURIComponent(paneId)}`))).artifacts;
 }
 
+/** GET /api/pane/btw: the side conversations the pane's OMP session saved with `/btw`, newest first; `more` when the PC left some out. */
+export async function fetchPaneBtw(paneId: string, machineId = "local", signal?: AbortSignal): Promise<OmpBtwHistory> {
+  const answer = await getJson<Partial<OmpBtwHistory>>(machinePath(machineId, `pane/btw?pane_id=${encodeURIComponent(paneId)}`), { signal });
+  return { topics: answer.topics ?? [], more: answer.more === true };
+}
+
 /** GET /api/pane/plan: the plan the pane's Claude Code or Codex session keeps, and that PC's clock. */
 export async function fetchPanePlan(paneId: string, machineId = "local"): Promise<{ steps: PlanStep[] | null; serverTime: string | null }> {
   const answer = await getJson<Partial<PanePlan>>(machinePath(machineId, `pane/plan?pane_id=${encodeURIComponent(paneId)}`));
@@ -1268,6 +1490,11 @@ export async function fetchPanePlan(paneId: string, machineId = "local"): Promis
 export async function fetchPaneFiles(paneId: string, query: string, limit = 20, machineId = "local"): Promise<string[]> {
   const params = new URLSearchParams({ pane_id: paneId, q: query, limit: String(limit) });
   return (await getJson<{ files: string[] }>(machinePath(machineId, `pane/files?${params.toString()}`))).files;
+}
+
+/** GET /api/pane/docs: the Markdown files under the pane's folder, newest first. */
+export async function fetchPaneDocuments(paneId: string, machineId = "local", signal?: AbortSignal): Promise<PaneDocuments> {
+  return getJson<PaneDocuments>(machinePath(machineId, `pane/docs?pane_id=${encodeURIComponent(paneId)}`), { signal });
 }
 
 /** GET /api/pane/prompt: the agent's interactive menu currently on screen, or null. */
@@ -1361,6 +1588,18 @@ export async function machineRequest<T>(path: string, method = "GET", body?: unk
   if (!response.ok) throw await errorFrom("/api/machines", response);
   return response.json();
 }
+/** A PC this PC's server could reach over SSH: a host of its ssh config, or a PC of its Tailscale login (server/ssh-candidates.ts). */
+export interface SshCandidate {
+  readonly name: string; readonly destination: string; readonly detail: string | null; readonly source: "ssh_config" | "tailscale";
+  /** the MagicDNS name of the Tailscale PC it is, when it is one (a config host may name one) */
+  readonly tailnet?: string;
+}
+/** GET /api/machines/ssh-candidates: Add a connection → SSH's list, each added through the Add PC dialog. */
+export const findSshCandidates = () => machineRequest<{ pcs: SshCandidate[] }>("/ssh-candidates");
+/** A PC of this PC's Tailscale login whose Ovis lets this PC in as its owner (server/tailnet-pcs.ts); `outdated`: older than 0.5. */
+export interface TailnetPc { readonly name: string; readonly url: string; readonly relay: string | null; readonly outdated: boolean }
+/** GET /api/machines/tailnet: those PCs, each asked over Tailscale which Ovis it runs. */
+export const findTailnetPcs = () => machineRequest<{ pcs: TailnetPc[] }>("/tailnet");
 export const startMachineSetup = (request: SetupRequest) => machineRequest<SetupJob>("/setup", "POST", request);
 export const fetchMachineSetup = (id: string) => machineRequest<SetupJob>(`/setup/${encodeURIComponent(id)}`);
 export const answerMachineSetup = (id: string, action: SetupAction) => machineRequest<SetupJob>(`/setup/${encodeURIComponent(id)}`, "POST", action);
@@ -1370,6 +1609,29 @@ export async function fetchVoiceStatus(): Promise<VoiceStatus> {
   const response = await apiFetch("/api/voice", { cache: "no-store" });
   if (!response.ok) throw await errorFrom("/api/voice", response);
   return (await response.json()) as VoiceStatus;
+}
+
+/** Settings → Alerts → Also send to: the destination this PC also posts its alerts to, its URL or token masked. */
+export function fetchAlertWebhook(): Promise<AlertWebhookView> {
+  return getJson<AlertWebhookView>("/api/alerts/webhook", { cache: "no-store" });
+}
+
+/** ApiError 400 `invalid_webhook` names what is wrong with the destination. */
+export async function saveAlertWebhook(save: AlertWebhookSave): Promise<AlertWebhookView> {
+  const response = await apiFetch("/api/alerts/webhook", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(save) });
+  if (!response.ok) throw await errorFrom("/api/alerts/webhook", response);
+  return (await response.json()) as AlertWebhookView;
+}
+
+export async function removeAlertWebhook(): Promise<void> {
+  const response = await apiFetch("/api/alerts/webhook", { method: "DELETE" });
+  if (!response.ok) throw await errorFrom("/api/alerts/webhook", response);
+}
+
+/** ApiError 502 `webhook_failed` with what the destination answered. */
+export async function testAlertWebhook(): Promise<void> {
+  const response = await apiFetch("/api/alerts/webhook/test", { method: "POST" });
+  if (!response.ok) throw await errorFrom("/api/alerts/webhook/test", response);
 }
 
 /** PUT /api/voice/config: ApiError 409 `key_from_env` when the key comes from OVIS_OPENAI_API_KEY. */

@@ -27,8 +27,13 @@ concurrency:
 jobs:
   changes:
     name: Detect changes
-    runs-on: ubuntu-24.04
+    # light: same-repository runs take the self-hosted pool, fork pull requests stay GitHub-hosted (scripts/light-runner-workflow.test.ts)
+    runs-on: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || fromJSON(github.ref == 'refs/heads/main' && vars.CI_MAIN_SELF_HOSTED_LABELS || vars.CI_LIGHT_LABELS || vars.CI_SELF_HOSTED_LABELS || '["self-hosted","self-hosted-ovis"]') }}
     timeout-minutes: 5
+    # actions: read lets the route count the self-hosted runners' queued and running jobs
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
       draft: ${{ steps.filter.outputs.draft }}
@@ -49,6 +54,8 @@ jobs:
           REQUESTED_LABELS: ${{ inputs.self_hosted_labels }}
           CONFIGURED_LABELS: ${{ vars.CI_SELF_HOSTED_LABELS }}
           MAIN_LABELS: ${{ vars.CI_MAIN_SELF_HOSTED_LABELS }}
+          SELF_HOSTED_CAPACITY: ${{ vars.CI_SELF_HOSTED_CAPACITY }}
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci-runner-route.sh >> "$GITHUB_OUTPUT"
       - id: filter
         env:
@@ -183,7 +190,8 @@ jobs:
     name: herdr-core live contract
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
+    # light: same-repository runs take the self-hosted pool, fork pull requests stay GitHub-hosted (scripts/light-runner-workflow.test.ts)
+    runs-on: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || fromJSON(github.ref == 'refs/heads/main' && vars.CI_MAIN_SELF_HOSTED_LABELS || vars.CI_LIGHT_LABELS || vars.CI_SELF_HOSTED_LABELS || '["self-hosted","self-hosted-ovis"]') }}
     timeout-minutes: 10
     env:
       HERDR_TEST_MODE: unit
@@ -283,7 +291,7 @@ jobs:
       # The herdr-backed lanes of every runner on the self-hosted PC share check.ts's slots
       # (scripts/self-hosted-runner/run.sh): at most CHECK_MAX_RUNS at once, and a lane that finds
       # them taken waits its turn instead of failing. A hosted runner has the slots to itself.
-      CHECK_MAX_RUNS: 3
+      CHECK_MAX_RUNS: 6
       CHECK_WAIT_SECONDS: 2400
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -330,7 +338,7 @@ jobs:
       # The herdr-backed lanes of every runner on the self-hosted PC share check.ts's slots
       # (scripts/self-hosted-runner/run.sh): at most CHECK_MAX_RUNS at once, and a lane that finds
       # them taken waits its turn instead of failing. A hosted runner has the slots to itself.
-      CHECK_MAX_RUNS: 3
+      CHECK_MAX_RUNS: 6
       CHECK_WAIT_SECONDS: 2400
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -364,7 +372,7 @@ jobs:
       - name: Browser regression (UI suites)
         if: needs.changes.outputs.draft != 'true'
         env:
-          BROWSER_SCRIPTS: scripts/ui-regression.ts,scripts/ui-contexts-regression.ts
+          BROWSER_SCRIPTS: scripts/ui-regression.ts,scripts/ui-contexts-regression.ts,scripts/ui-contexts-layout-regression.ts
           BROWSER_WORKERS: 2
         run: bun run check run -- bun scripts/ci-browser-parallel.ts
       - name: Preserve browser logs and evidence
@@ -399,7 +407,7 @@ jobs:
       # The herdr-backed lanes of every runner on the self-hosted PC share check.ts's slots
       # (scripts/self-hosted-runner/run.sh): at most CHECK_MAX_RUNS at once, and a lane that finds
       # them taken waits its turn instead of failing. A hosted runner has the slots to itself.
-      CHECK_MAX_RUNS: 3
+      CHECK_MAX_RUNS: 6
       CHECK_WAIT_SECONDS: 2400
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -442,8 +450,8 @@ jobs:
       - name: Browser regression (parallel)
         if: needs.changes.outputs.draft != 'true'
         env:
-          # Every script of scripts/ci-browser.sh except the two browser-main runs.
-          BROWSER_EXCLUDE: scripts/ui-regression.ts,scripts/ui-contexts-regression.ts
+          # Every script of scripts/ci-browser.sh except the browser-main runs.
+          BROWSER_EXCLUDE: scripts/ui-regression.ts,scripts/ui-contexts-regression.ts,scripts/ui-contexts-layout-regression.ts
           BROWSER_SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
           BROWSER_WORKERS: ${{ runner.environment == 'self-hosted' && '6' || '3' }}
         run: bun run check run -- bun scripts/ci-browser-parallel.ts
@@ -476,7 +484,8 @@ jobs:
     name: Integration and browser
     needs: [changes, integration, browser-main, browser-other]
     if: always()
-    runs-on: ubuntu-24.04
+    # light: same-repository runs take the self-hosted pool, fork pull requests stay GitHub-hosted (scripts/light-runner-workflow.test.ts)
+    runs-on: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || fromJSON(github.ref == 'refs/heads/main' && vars.CI_MAIN_SELF_HOSTED_LABELS || vars.CI_LIGHT_LABELS || vars.CI_SELF_HOSTED_LABELS || '["self-hosted","self-hosted-ovis"]') }}
     timeout-minutes: 5
     steps:
       - name: Check results

@@ -13,6 +13,9 @@
  * Calls are typed by hc's own schema (hc-api.generated.ts, `bun run generate:types`).
  */
 
+import { homedir } from "node:os";
+import { liveSessionsRefused, sameSocket } from "../herdr/client.ts";
+import { coreSocket } from "./discovery.ts";
 import type { HcMethod, HcMethods } from "./hc-api.generated.ts";
 
 /** The calls that answer with a stream of their own. */
@@ -32,6 +35,15 @@ export const FRAME_CLOSE = 2;
 export const FRAME_RESIZE = 3;
 export const FRAME_FOCUS = 4;
 export const FRAME_FACTS = 5;
+/**
+ * Reply bytes the viewer's terminal made itself (a query's answer), not anyone typing: hc passes
+ * them to the program as DATA but does not count them as the viewer's activity. Only on a stream
+ * both ends confirmed it for (`Channel.automaticInput`): a core that does not know the kind drops
+ * the frame, and the bytes with it.
+ */
+export const FRAME_AUTOMATIC_INPUT = 6;
+/** The hello feature a core names when it takes FRAME_AUTOMATIC_INPUT. */
+export const AUTOMATIC_INPUT_FEATURE = "automatic_input";
 
 export class HcError extends Error {
   /** hc's stable `data.kind` (`not_found`, `blocked`, `unavailable`, …), or this side's own */
@@ -102,7 +114,14 @@ export interface ChannelHandlers {
 
 export interface Channel {
   readonly id: number;
+  /**
+   * Whether hc takes FRAME_AUTOMATIC_INPUT on this stream: its hello named the feature and its
+   * attach answer confirmed it, as hc's protocol requires before a client may send the kind.
+   */
+  readonly automaticInput: boolean;
   write: (payload: Uint8Array | string) => void;
+  /** Reply bytes the viewer's terminal made itself: FRAME_AUTOMATIC_INPUT where confirmed, else plain DATA as before. */
+  writeAutomatic: (payload: Uint8Array | string) => void;
   /** the viewer's grid; hc takes it as the terminal's size, this being the last active viewer */
   resize: (cols: number, rows: number) => void;
   /** bytes of the stream consumed, for a channel opened with manual credit */
@@ -137,11 +156,24 @@ export interface HcTransport {
   kill: () => void;
 }
 
-/** `hc connect` as a child process; a program that cannot be started is an HcError (`closed`). */
-export function spawnHcConnect(bin: string): HcTransport {
+/** Whether hc in `env` would reach the user's default core: the one this process's environment, or its owner's home, names when no HC_SOCKET or HC_SESSION does. */
+function userCore(env: Record<string, string | undefined>): boolean {
+  const unnamed = { ...process.env, HC_SOCKET: undefined, HC_SESSION: undefined };
+  const defaults = [coreSocket({ env: unnamed }).path, coreSocket({ env: unnamed, home: homedir() }).path].map(sameSocket);
+  return defaults.includes(sameSocket(coreSocket({ env }).path));
+}
+
+/** `hc connect` as a child process (in `env`, else this process's); a program that cannot be started is an HcError (`closed`). */
+export function spawnHcConnect(bin: string, env?: Record<string, string | undefined>): HcTransport {
+  // runtime.ts hands out this path that cannot exist while a moved hc is found again
+  if (bin === "/dev/null/herdr-core-moved") throw new HcError("closed", "herdr-core moved (an update?), and Ovis is looking for it again: try again in a moment");
+  // a process that asked for an isolated herdr never reaches the user's default core, however it is named
+  if (liveSessionsRefused(process.env) && userCore(env ?? process.env)) {
+    throw new HcError("live_core_refused", "HERDR_TEST_SESSION is set, but hc would reach the user's own herdr-core: give it HC_SOCKET or an HC_SESSION of its own, or set OVIS_ALLOW_LIVE_HERDR=1");
+  }
   let child: Bun.Subprocess<"pipe", "pipe", "ignore">;
   try {
-    child = Bun.spawn([bin, "connect"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    child = Bun.spawn([bin, "connect"], { stdin: "pipe", stdout: "pipe", stderr: "ignore", ...(env ? { env } : {}) });
   } catch (error) {
     throw new HcError("closed", `hc could not be started (${bin}): ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -163,7 +195,7 @@ export function spawnHcConnect(bin: string): HcTransport {
 
 interface Line {
   transport: HcTransport;
-  /** the hello answer: version and features of the core behind it */
+  /** the hello answer: version, methods and features of the core behind it */
   hello: Promise<HelloInfo>;
   pending: Map<number, PendingCall>;
   channels: Map<number, OpenChannel>;
@@ -176,7 +208,8 @@ interface Line {
   dead: boolean;
 }
 
-export interface HelloInfo { version: string; core: { id: string; name: string } }
+/** What the core answered hello with: what it can do is read from `methods` and `features`, never from `version`. */
+export interface HelloInfo { version: string; core: { id: string; name: string }; methods: string[]; features: string[] }
 
 /**
  * A lazily opened, self-replacing line to hc: the first call starts `hc connect`, and a line that
@@ -192,8 +225,8 @@ export class HcConnection {
     this.spawn = spawn;
   }
 
-  /** The core's identity, from the hello of the current (or a fresh) line. */
-  hello(): Promise<HelloInfo> {
+  /** The core's identity, from the hello of the current (or a fresh) line; a line that cannot be opened rejects it, as it does a call. */
+  async hello(): Promise<HelloInfo> {
     return this.current().hello;
   }
 
@@ -211,12 +244,19 @@ export class HcConnection {
     // framed mode always answers with a channel (only plain mode's subscribe has none)
     const id = result.channel as number;
     const live = () => !line.dead && line.channels.get(id)?.closing === undefined;
+    // the request went out only after hello answered, so this awaits nothing
+    const features = (await line.hello).features;
+    const automaticInput = features.includes(AUTOMATIC_INPUT_FEATURE) && (result as { automatic_input?: unknown }).automatic_input === true;
     return {
       result,
       channel: {
         id,
+        automaticInput,
         write: (payload) => {
           if (live()) line.transport.write(encodeFrame(id, FRAME_DATA, payload));
+        },
+        writeAutomatic: (payload) => {
+          if (live()) line.transport.write(encodeFrame(id, automaticInput ? FRAME_AUTOMATIC_INPUT : FRAME_DATA, payload));
         },
         resize: (cols, rows) => {
           if (!live()) return;
@@ -452,7 +492,7 @@ function parseReason(payload: Uint8Array): Record<string, unknown> | null {
 
 /** The hello's answer, or why it is not one this side can speak to. */
 export function parseHello(text: string): HelloInfo | string {
-  let message: { result?: { generation?: unknown; framed?: unknown; version?: unknown; core?: { id?: unknown; name?: unknown } }; error?: { message?: unknown } };
+  let message: { result?: { generation?: unknown; framed?: unknown; version?: unknown; core?: { id?: unknown; name?: unknown }; methods?: unknown; features?: unknown }; error?: { message?: unknown } };
   try {
     message = JSON.parse(text);
   } catch {
@@ -463,5 +503,6 @@ export function parseHello(text: string): HelloInfo | string {
   if (result?.generation !== HC_GENERATION) return `hc speaks protocol generation ${String(result?.generation)}; Ovis speaks ${HC_GENERATION}`;
   if (result.framed !== true) return "hc did not switch the connection to framed mode";
   if (typeof result.version !== "string" || typeof result.core?.id !== "string" || typeof result.core.name !== "string") return "hc's hello is missing its version or core";
-  return { version: result.version, core: { id: result.core.id, name: result.core.name } };
+  const strings = (list: unknown): string[] => (Array.isArray(list) ? list.filter((item): item is string => typeof item === "string") : []);
+  return { version: result.version, core: { id: result.core.id, name: result.core.name }, methods: strings(result.methods), features: strings(result.features) };
 }

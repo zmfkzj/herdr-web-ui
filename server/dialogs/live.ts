@@ -168,9 +168,27 @@ export function promptTailIsActive(prompt: ParsedPrompt, screen: string): boolea
   if (prompt.responder === "cmd-question") return cmdFooterStart(shown) >= 0;
   // its footer ends the screen, wrapped or not (dialogs/opencode.ts)
   if (prompt.responder === "opencode-v1-question") return openCodeV1QuestionActive(screen);
-  // Claude's plan. A narrow pane wraps its footer, `ctrl+g to edit in VS Code · ~/.claude/plans/x.md`, so the
-  // path or its tail ends the screen alone. Anchored on `.md`: output under an old footer never ends it.
-  return ends(/ctrl\+g to edit|shift\+tab to approve with this feedback/i) || ends(/ctrl\+g to edit in [^·]+· [^·]+\.md$/i);
+  // Claude's plan: its footer, wrapped or not, ends the screen
+  return ends(/ctrl\+g to edit|shift\+tab to approve with this feedback/i) || claudePlanFooterEnds(shown);
+}
+
+const CLAUDE_PLAN_FOOTER_RE = /^ctrl\+g to edit in [^·]+?[ \n]·[ \n]([^]+)$/i;
+
+/**
+ * Whether Claude's plan footer, `ctrl+g to edit in VS Code · ~/.claude/plans/x.md`, ends the screen. A narrow pane
+ * wraps it with nothing marking the breaks: at a space before the path, or anywhere inside the path, even
+ * between `.m` and `d`, and over as many lines as the path needs. So the path's lines are joined as one
+ * word, and `.md` may show only at its very end: output under an answered plan (`⏺ Updated README.md`, a bare
+ * `README.md`, even one written on the footer's last row) comes after a path already complete, so it never
+ * extends it; a plan folder with `.md` in its name goes unread instead. The folder may hold a `·`
+ * (`CLAUDE_CONFIG_DIR`), so only the first `·` after the editor's name separates the path.
+ */
+function claudePlanFooterEnds(shown: string[]): boolean {
+  const at = findLastIndex(shown, (line) => /^ctrl\+g to edit\b/i.test(line));
+  const path = at < 0 ? undefined : CLAUDE_PLAN_FOOTER_RE.exec(shown.slice(at).join("\n"))?.[1];
+  if (path === undefined) return false;
+  const joined = path.replaceAll("\n", "");
+  return joined.indexOf(".md") === joined.length - 3;
 }
 /**
  * The same two hints told from the end of the window. A phone leaves pi a pane barely wide enough
@@ -194,9 +212,10 @@ const PI_FOOTER_LINES = 2;
  * pi's stats line, its second footer line: usage counters (`↑1.2k ↓300 R… W… CH…% $0.012 (sub)`), then
  * the context meter (`3.7%/1.0M`, `?/200k`). The meter comes last, and a narrow pane cuts the line
  * with `...` before it (`↑52 ↓5.3k R460k W33k CH98.9% $0.461 (sub) 3.7...`), so the line is told by how
- * it starts: both counters (`↑52 ↓5.3k`), or the meter alone when pi has no usage yet (pi 1.4.0's footer).
+ * it starts: both counters (`↑52 ↓5.3k`), or the meter when pi has no usage yet, optionally
+ * preceded by the cost (`$0.000 (sub) 0.0%/1.0M` in pi 1.5.0).
  */
-const PI_STATS_LINE_RE = /^(?:↑[\d.]+[kKmMbB]? ↓[\d.]+[kKmMbB]?|(?:\d+(?:\.\d+)?%|\?)\/[\d.]+[kKmMbB]?)(?:\s|\.\.\.|$)/u;
+const PI_STATS_LINE_RE = /^(?:↑[\d.]+[kKmMbB]? ↓[\d.]+[kKmMbB]?|(?:\$\d+\.\d{3}(?: \(sub\))? )?(?:\d+(?:\.\d+)?%|\?)\/[\d.]+[kKmMbB]?)(?:\s|\.\.\.|$)/u;
 
 /** pi's first footer line, the pane's folder: `~/app (main)`, `/tmp/app`, `C:\work\app`. */
 const PI_FOLDER_LINE_RE = /^(?:~(?:[\\/]|\s|$)|\/|[A-Za-z]:[\\/])/u;

@@ -20,6 +20,19 @@ async function relaySignature(key: CryptoKey, nonce: Uint8Array, serverId = "ser
     Buffer.concat([Buffer.from("ovis-relay-auth/1"), nonce, Buffer.from(serverId)]))).toString("base64url");
 }
 
+describe("ending a pairing", () => {
+  it("leaves no six-digit code to redeem and ends a typed code bound to it", () => {
+    const store = new DeviceStore(mkdtempSync(join(dir, "pair-end-")));
+    const { code } = store.startPairing();
+    let ended = 0;
+    store.onPairingStarted(() => { ended++; });
+    store.endPairing();
+    expect(ended).toBe(1);
+    expect(store.activePairing()).toBeNull();
+    expect(store.pair(code, "Too late", "drive")).toBeNull();
+  });
+});
+
 describe("relay device", () => {
   it("loads as kind ok and closes an ungated store with one durable write before announcing", async () => {
     const root = mkdtempSync(join(dir, "relay-first-"));
@@ -710,6 +723,31 @@ it("flushes the last-seen update before it replaces the registry", () => {
     expect(fsync.mock.calls.length).toBeGreaterThan(authorizationSyncs);
   } finally { fsync.mockRestore(); }
   expect(new DeviceStore(root).list(null)[0]?.last_seen_at).toBe(new Date(confirmedAt + 61_000).toISOString());
+});
+
+it("notes when a relay device was last seen, at most once a minute on disk", async () => {
+  const root = mkdtempSync(join(dir, "relay-last-seen-"));
+  const store = new DeviceStore(root);
+  const keys = await relayKeys();
+  const pairedAt = Date.now() - 120_000;
+  const paired = store.pairRelay(store.startPairing().code, "Phone", keys.publicKeySpki, pairedAt)!;
+  expect(new DeviceStore(root).list(null)[0]?.last_seen_at).toBe(new Date(pairedAt).toISOString());
+  const auth = async (now: number) => {
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
+    return store.matchRelay(paired.device.id, nonce, await relaySignature(keys.privateKey, nonce), "server-a", now);
+  };
+  const seenAt = Date.now();
+  expect(await auth(seenAt)).toEqual(paired.device);
+  expect(new DeviceStore(root).list(null)[0]?.last_seen_at).toBe(new Date(seenAt).toISOString());
+  expect(await auth(seenAt + 30_000)).toEqual(paired.device);
+  expect(new DeviceStore(root).list(null)[0]?.last_seen_at).toBe(new Date(seenAt).toISOString());
+  expect(await auth(seenAt + 61_000)).toEqual(paired.device);
+  expect(new DeviceStore(root).list(null)[0]?.last_seen_at).toBe(new Date(seenAt + 61_000).toISOString());
+  const before = readFileSync(join(root, "devices.json"), "utf8");
+  const blocked = new DeviceStore(root, "Sibling registry unreadable");
+  const nonce = crypto.getRandomValues(new Uint8Array(32));
+  expect(await blocked.matchRelay(paired.device.id, nonce, await relaySignature(keys.privateKey, nonce), "server-a", seenAt + 200_000)).toEqual(paired.device);
+  expect(readFileSync(join(root, "devices.json"), "utf8")).toBe(before);
 });
 
 it("keeps the previous registry intact and the credential valid when a last-seen write fails before rename", () => {

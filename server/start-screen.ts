@@ -40,7 +40,8 @@ function codexLayout(lines: string[]): { header: number; visible: string[]; end:
   while (header >= 0 && !/^[\s\u2502|]*>_ OpenAI Codex \(v\d[^)]*\)[\s\u2502|]*$/u.test(lines[header]!)) header--;
   if (header < 0) return null;
   const visible = lines.slice(header + 1);
-  const footer = new RegExp(`^\\s*(GPT-[\\w.-]+) (${EFFORT})(?: \\w+)? · `, "u");
+  // one word: OpenAI's `GPT-6-Luna`, or the name a custom model provider gives it (`gpt-6.1-terra`, `DeepSeek4.1flash(OpenCode)`, #3263)
+  const footer = new RegExp(`^\\s*([^\\s·]+) (${EFFORT})(?: \\w+)? · `, "u");
   let end = visible.length - 1;
   while (end >= 0 && visible[end]!.trim() === "") end--;
   if (end < 1 || !/^\s*[←?].*(?:for agents|shortcuts)/u.test(visible[end]!)) return null;
@@ -50,10 +51,12 @@ function codexLayout(lines: string[]): { header: number; visible: string[]; end:
 }
 
 /** Only the live composer footer owns a Codex model. Text above it (an answer quoting the
- * /model picker, a draft) never does, and while a popup hides the footer the model is unknown. */
+ * /model picker, a draft) never does, and while a popup hides the footer the model is unknown.
+ * OpenAI's `GPT-…` is given as its id; a model another provider names is kept as written. */
 function codexScreen(lines: string[]): Screen {
   const found = codexLayout(lines)?.model;
-  return found ? { model: found[1]!.toLowerCase(), reasoning_effort: found[2]! } : NOTHING;
+  if (!found) return NOTHING;
+  return { model: /^GPT-/u.test(found[1]!) ? found[1]!.toLowerCase() : found[1]!, reasoning_effort: found[2]! };
 }
 
 /** A cell Codex draws for something said or done: an answer or a tool call, a warning, an error. */
@@ -86,10 +89,24 @@ function gjcScreen(lines: string[]): Screen {
   return { model, reasoning_effort: found[2]! };
 }
 
+/**
+ * `0.0%/262k (auto)          (provider) model-id • high`, the stats row of Pi's footer: the context
+ * figure on the left, the model id its transcript records on the right, then its thinking level
+ * when the model reasons (` • thinking off` when that level is off). Pi cuts a right side too wide
+ * to fit down to two columns after the stats, with no marker: a row padded by only two may hold a
+ * cut-off id, so it names none.
+ */
+function piScreen(lines: string[]): Screen {
+  const found = lastMatch(lines, new RegExp(`(?:\\d+(?:\\.\\d)?%|\\?)/\\d+(?:\\.\\d)?[kM]?(?: \\(auto\\))?(?: • xp)? {3,}(?:\\([^()\\s]+\\) )?(\\S+)(?: • (?:thinking (off)|(${EFFORT})))?(?: → \\S+(?: • \\S+)?)?\\s*$`, "u"));
+  if (!found || found[1] === "no-model") return NOTHING;
+  return { model: found[1]!, reasoning_effort: found[2] ?? found[3] ?? null };
+}
+
 const SCREENS: Partial<Record<ConversationResponse["source"], (lines: string[]) => Screen>> = {
   "claude-transcript": claudeScreen,
   "codex-transcript": codexScreen,
   "gjc-transcript": gjcScreen,
+  "pi-transcript": piScreen,
 };
 
 export function readsStartScreen(source: ConversationResponse["source"]): boolean {

@@ -421,6 +421,9 @@ class HerdrBridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(HerdrShellPlugin())
         bridge?.registerPluginInstance(OvisPushPlugin())
+        bridge?.registerPluginInstance(OvisAuthPlugin())
+        bridge?.registerPluginInstance(OvisDirectPlugin())
+        if let handler = (bridge as? CapacitorBridge)?.webViewDelegationHandler { DirectCallGate.install(on: handler) }
     }
 
     override func viewDidLoad() {
@@ -712,6 +715,7 @@ final class NavigationFailureProxy: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         provisional = false
         pageShown = true
+        NotificationCenter.default.post(name: .ovisPageCommitted, object: nil)
         inner?.webView?(webView, didCommit: navigation)
     }
 

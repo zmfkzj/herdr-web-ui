@@ -33,6 +33,17 @@ export interface DocGetResult {
   version: number;
 }
 
+export interface DocSetParams {
+  name: string;
+  on?: string | null;
+  value: unknown;
+  version: number;
+}
+
+export interface DocSetResult {
+  version: number;
+}
+
 export interface EventsSubscribeParams {
   children_of?: string | null;
   labels?: Record<string, string>;
@@ -87,6 +98,12 @@ export interface ListResult {
   hidden_finished: number;
   machines: MachineView[];
   terminals: Terminal[];
+}
+
+export type MachineListParams = Record<string, never>;
+
+export interface MachineListResult {
+  machines: MachineView[];
 }
 
 export interface MachineView {
@@ -250,6 +267,11 @@ export interface TerminalKillParams {
   terminal: string;
 }
 
+export interface TerminalLabelParams {
+  labels: Record<string, string>;
+  terminal: string;
+}
+
 export interface TerminalListParams {
   all?: boolean;
   labels?: Record<string, string>;
@@ -311,13 +333,16 @@ export interface WaitResult {
 /** Every hc method Ovis calls, with its params and its result. */
 export interface HcMethods {
   "doc.get": { params: DocGetParams; result: DocGetResult };
+  "doc.set": { params: DocSetParams; result: DocSetResult };
   "events.subscribe": { params: EventsSubscribeParams; result: SubscribeResult };
   "hello": { params: HelloParams; result: HelloResult };
+  "machine.list": { params: MachineListParams; result: MachineListResult };
   "server.status": { params: ServerStatusParams; result: StatusResult };
   "terminal.attach": { params: TerminalAttachParams; result: AttachResult };
   "terminal.get": { params: TerminalGetParams; result: Terminal };
   "terminal.keys": { params: TerminalKeysParams; result: KeysResult };
   "terminal.kill": { params: TerminalKillParams; result: Terminal };
+  "terminal.label": { params: TerminalLabelParams; result: Terminal };
   "terminal.list": { params: TerminalListParams; result: ListResult };
   "terminal.read": { params: TerminalReadParams; result: ReadResult };
   "terminal.rm": { params: TerminalRmParams; result: RemoveResult };

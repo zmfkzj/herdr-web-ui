@@ -98,7 +98,7 @@ function isFile(path: string): boolean {
 }
 
 /** `0.1.17` when `bin --version` exits 0 and its output starts `hc 0.1.17`; null for anything else. The only hc command run here. */
-async function hcVersion(bin: string, env: Env, timeoutMs: number): Promise<string | null> {
+export async function hcVersion(bin: string, env: Env, timeoutMs: number): Promise<string | null> {
   const text = await probe([bin, "--version"], env, timeoutMs);
   const match = text === null ? null : /^hc (\d+\.\d+\.\d+[0-9A-Za-z.+-]*)(?:\s|$)/.exec(text);
   return match ? match[1]! : null;
@@ -214,8 +214,9 @@ function configuredSocket(config: string): string | null {
   return typeof socket === "string" && socket !== "" ? socket : null;
 }
 
+/** hc's Windows pipe answers a stat with EBUSY while each of its instances is taken (live-seen with a core running): it is there */
 function exists(path: string): boolean {
-  try { statSync(path); return true; } catch { return false; }
+  try { statSync(path); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EBUSY"; }
 }
 
 /** how long one look for hc stands: it runs a login shell and each candidate's --version */
@@ -236,10 +237,10 @@ export function discoverHc(options: Omit<FindHcOptions, "loginShellPath"> = {}):
   return finding;
 }
 
-/** the hc the last look found, when it is still there */
-export function lastFoundHc(): string | null {
-  const bin = found?.hc?.bin ?? null;
-  return bin !== null && isFile(bin) ? bin : null;
+/** Looks for hc afresh once any look under way has ended: one started before an install would miss it. */
+export async function rediscoverHc(options: Omit<FindHcOptions, "loginShellPath"> = {}): Promise<FoundHc | null> {
+  await finding?.catch(() => null);
+  return discoverHc(options);
 }
 
 /**

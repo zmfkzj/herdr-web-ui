@@ -1,5 +1,5 @@
 import type { AgentStatus, HerdrPane } from "../shared/protocol.ts";
-import { HerdrError, sessionSnapshot, subscribeEvents, type EventFrame, type Subscription } from "./herdr/client.ts";
+import { focusFromMove, HerdrError, sessionSnapshot, subscribeEvents, type EventFrame, type Subscription } from "./herdr/client.ts";
 
 /**
  * Collects agent status for EVERY pane in the session, not just the attached ones.
@@ -91,6 +91,11 @@ export interface StatusCollectorHandlers {
    * program that ended and whose pane then closed.
    */
   onPaneClosed?: (paneId: string) => void;
+  /**
+   * herdr moved a pane under a new ID (`pane_moved` to another workspace, from anywhere): told before the
+   * structure change it is part of, so what is kept under the old ID can follow it first.
+   */
+  onPaneMoved?: (previousPaneId: string, paneId: string) => void;
   onStructureChange: () => void;
   /**
    * Which herdr answers on the lifecycle subscription while it is open: `onChange` gets herdr's identity
@@ -100,7 +105,8 @@ export interface StatusCollectorHandlers {
    */
   herdrLive?: { identity: () => string | null; onChange: (identity: string | null) => void };
   /** herdr's focus moved onto this pane: whoever is at its terminal has it in front */
-  onFocus?: (paneId: string) => void;
+  /** `passing`: herdr's focus passed over the pane while a move took the focused one out and back (`focusFromMove`). */
+  onFocus?: (paneId: string, passing: boolean) => void;
 }
 
 /** What the collector talks to, and how long it waits: tests swap both. */
@@ -564,6 +570,7 @@ export function startStatusCollector(handlers: StatusCollectorHandlers, override
           // restore that baseline nor prune the one just carried to the new ID.
           actedOn.set(previousPaneId, ++statusEvents);
           lastEventOf.set(paneId, statusEvents);
+          handlers.onPaneMoved?.(previousPaneId, paneId);
         }
         // closed with no exit frame: a snapshot on its way that still holds the pane is no news of it either
         if (parsed.closed !== undefined) {
@@ -604,12 +611,16 @@ export function startStatusCollector(handlers: StatusCollectorHandlers, override
       (frame) => {
         const paneId = parseFocusFrame(frame);
         if (paneId === null) return;
-        focusedAt.set(paneId, ++statusEvents);
-        // a finish seen at herdr's terminal is no measure for a later snapshot. Work still going on is:
-        // its finish in a gap after this is news
-        const told = heard.get(paneId);
-        if (told !== undefined && told.status !== "working" && told.status !== "blocked") heard.delete(paneId);
-        onFocus(paneId);
+        // nobody looked at a pane herdr's focus only passed over: its finishes stay news
+        const passing = focusFromMove(paneId);
+        if (!passing) {
+          focusedAt.set(paneId, ++statusEvents);
+          // a finish seen at herdr's terminal is no measure for a later snapshot. Work still going on is:
+          // its finish in a gap after this is news
+          const told = heard.get(paneId);
+          if (told !== undefined && told.status !== "working" && told.status !== "blocked") heard.delete(paneId);
+        }
+        onFocus(paneId, passing);
       },
       // a focus change missed meanwhile is gone for good: the next one is heard again
       () => focusStarted.resolve(),

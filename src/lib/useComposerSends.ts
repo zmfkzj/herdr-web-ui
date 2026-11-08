@@ -1,11 +1,11 @@
-import { useCallback, useMemo, type MutableRefObject } from "react";
+import { useCallback, useMemo, useRef, type MutableRefObject } from "react";
 import { ApiError } from "./api.ts";
 import { answerFromText, answerRefusal, needsConfirmation, type TypedAnswer } from "./promptAnswer.ts";
 import { composerDelivery, pendingActionUncertain, submitNote, submitNotTyped, submitRefusal, type DraftRefusal } from "./compose.ts";
 import type { PaneSubmitRetention } from "./paneSubmitRetention.ts";
 import { pendingMessages, UNCONFIRMED_SEND } from "./pendingMessages.ts";
 import { paneStorageId } from "../../shared/machines.ts";
-import { rememberWaitingSend, waitingBaseline, waitingKey } from "./sentWaiting.ts";
+import { rememberWaitingSend, stampedBaseline, waitingBaseline, waitingKey } from "./sentWaiting.ts";
 import { composerDrafts } from "./composerDraft.ts";
 import type { AgentStatus, InteractivePrompt, PromptAnswer } from "../../shared/protocol.ts";
 import type { HerdrSocket, SubmitDelivery, SubmitResult } from "./ws.ts";
@@ -85,8 +85,11 @@ export function useComposerSends(deps: ComposerSendsDeps) {
     };
   }, [answering, answerPending, paneId, pendingAnswer, sendAnswer, setPendingAnswer]);
 
+  // the latest Send now, for a Ctrl+Enter send whose receipt comes after a render
+  const sendNowRef = useRef<(id: string) => Promise<void>>(async () => {});
+
   const composerSend = useCallback(
-    (text: string, clearDraft?: string, sendAnyway = false, agentOnly = false): boolean | string | DraftRefusal | Promise<boolean | string | DraftRefusal> => {
+    (text: string, clearDraft?: string, sendAnyway = false, agentOnly = false, now = false): boolean | string | DraftRefusal | Promise<boolean | string | DraftRefusal> => {
       const pane = paneRef.current;
       // A refused send keeps the draft; no second choice goes to the card waiting on its read.
       if (pane !== null && answerPending) return false;
@@ -153,9 +156,13 @@ export function useComposerSends(deps: ComposerSendsDeps) {
           if (paneRef.current === pane && socketRef.current === socket && sessionRef.current === session) {
             setChatLocalSend((current) => ({ key: current.key + 1, navigationGeneration: navigation }));
           }
-          if (pane !== null) rememberWaitingSend(waitingKey(machineId, pane), text, sentAt, sentAfter);
+          // the PC's stamp before it typed bounds the send's turn on its clock alone (lib/sentWaiting.ts)
+          if (pane !== null) rememberWaitingSend(waitingKey(machineId, pane), text, sentAt, stampedBaseline(sentAfter, answer.sendingAt, sentAt));
         }
         if (pane !== null && typedNow) showSentCommand(pane, text, known, seen);
+        // Ctrl+Enter: the row it was queued as goes now, by the same steer as its Send now. A refused steer
+        // leaves that row with its reason, as a refused Send now does (#2596)
+        if (now && answer.pending !== undefined) void sendNowRef.current(answer.pending.id);
         return true;
       });
     },
@@ -246,7 +253,7 @@ export function useComposerSends(deps: ComposerSendsDeps) {
             pendingMessages.removeCopy(owner, id);
             if (answer.pending === undefined) {
               // typed by this resend: a replay of a send another connection made has its own turn already
-              if (answer.typedNow === true) rememberWaitingSend(waitingKey(machineId, pane), message.text, sentAt, sentAfter);
+              if (answer.typedNow === true) rememberWaitingSend(waitingKey(machineId, pane), message.text, sentAt, stampedBaseline(sentAfter, answer.sendingAt, sentAt));
               showSentCommand(pane, message.text, known, seen);
             }
           }
@@ -264,6 +271,8 @@ export function useComposerSends(deps: ComposerSendsDeps) {
     if (navigator.locks) await navigator.locks.request(`pending:${queueOwner}:${id}`, perform);
     else await perform();
   }, [answering, ended, heldByOpenQueue, paneId, queueOwner, submitComposerMessage, submitRetention, showSentCommand, inputRowNow, stillOpenNote]);
+
+  sendNowRef.current = (id) => actOnPending(id, "steer");
 
   return { composerSend, actOnPending, waitingAnswer };
 }

@@ -15,14 +15,15 @@
 
 import { createHash } from "node:crypto";
 import { constants, type Dirent } from "node:fs";
-import { open, readFile, readdir, readlink, stat } from "node:fs/promises";
+import { lstat, open, readFile, readdir, readlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import nodePath, { basename, dirname, isAbsolute, join, type PlatformPath } from "node:path";
 import { directoryKey, withoutVerbatimPrefix } from "./codex.ts";
 import { darwinStartTime, sysctlCall } from "./darwin-process.ts";
 import { recentProcessTable } from "./gjc-runtime.ts";
 import { processAlive, processStartUpperBoundAsync } from "./process-start.ts";
-import type { ProcessRow } from "./windows-processes.ts";
+import { jobProcessesBelow, type JobProcess } from "./foreground-job.ts";
+import { descendantProcesses, type ProcessRow } from "./windows-processes.ts";
 import { userHome } from "./user-home.ts";
 
 const MAX_PROJECT_NAME = 200;
@@ -40,6 +41,67 @@ export function isClaudeProcess(entry: { name?: string; argv0?: string; argv?: r
   // the native build runs under its version as the name and titles itself "Claude": both its
   // argv0 and its argv[0] say so, which one field alone does not prove
   return /^\d+\.\d+\.\d+$/.test(entry.name ?? "") && entry.argv0 === "Claude" && entry.argv?.[0] === "Claude";
+}
+
+/**
+ * The Claude processes under a Windows pane's shell, from the process table: herdr and herdr-core
+ * name only the shell in front there (windows-processes.ts). The nearest one, and any other not
+ * started by it (two of them: which one a session belongs to cannot be told). The native claude.exe
+ * the shell started can run the session in a child claude.exe, and only that child writes the PID
+ * record: a Claude with no record file in any store hands over to the nearest Claudes below it that
+ * have one (windowsLaunchedClaude). Null when the table says nothing, which is no proof that no
+ * Claude runs there.
+ */
+export async function windowsShellClaude(shellPid: number, table: () => Promise<ProcessRow[]> = recentProcessTable, home = userHome()): Promise<{ pid: number; argv: string[] }[] | null> {
+  const rows = await table();
+  if (rows.length === 0) return null;
+  const claude = nearestOf(rows, descendantProcesses(rows, shellPid).filter(isClaudeProcess));
+  return (await Promise.all(claude.map((entry) => windowsLaunchedClaude(entry, rows, home)))).flat();
+}
+
+/** The first of `claude` (nearest first) and any other it did not start. */
+function nearestOf<T extends { pid: number }>(rows: readonly ProcessRow[], claude: T[]): T[] {
+  const first = claude[0];
+  if (first === undefined) return [];
+  const below = new Set(descendantProcesses(rows, first.pid).map((entry) => entry.pid));
+  return claude.filter((entry) => entry === first || !below.has(entry.pid));
+}
+
+/**
+ * The Claude that runs the session `entry` started: `entry` itself, unless it has no PID record file
+ * in any store and a Claude below it has one: then the nearest such Claude and any other that one
+ * did not start, whatever their records say (the callers check them, and refuse a store that cannot
+ * be told). Only a file's presence counts: a torn or leftover record still marks the Claude that
+ * runs the session, so a Claude that one started (`claude -p`) never takes its place, and a Claude
+ * beside it with no record is still told apart from none. A `claude attach` client writes no record
+ * and names its session by its job: it counts as one that has a record, so it never hands over and
+ * is never passed over.
+ */
+async function windowsLaunchedClaude(entry: { pid: number; argv: string[] }, rows: readonly ProcessRow[], home: string): Promise<{ pid: number; argv: string[] }[]> {
+  const inner = descendantProcesses(rows, entry.pid).filter(isClaudeProcess);
+  const named = (claude: { pid: number; argv: string[] }) => claudeAttachArgs(claude.argv) !== null || hasRecordFile(home, claude.pid);
+  if (inner.length === 0 || await named(entry)) return [entry];
+  const recorded = await Promise.all(inner.map(named));
+  const holders = inner.filter((_, index) => recorded[index]);
+  return holders.length > 0 ? nearestOf(rows, holders) : [entry];
+}
+
+/** Whether any store Claude may use has a PID record file of `pid`, readable or not; one that cannot be looked at counts as there. */
+async function hasRecordFile(home: string, pid: number): Promise<boolean> {
+  const found = await Promise.all((await knownClaudeStores(home)).map((store) => lstat(join(store, "sessions", `${pid}.json`)).then(() => true, (error: unknown) => !absent(error))));
+  return found.includes(true);
+}
+
+/**
+ * The Claude below a herdr-core terminal's foreground process, in its job (foreground-job.ts): a
+ * launcher or script that runs Claude as its child (#3009). Only one Claude there is taken: with two,
+ * which one the terminal shows cannot be told, and none is. Null when the job cannot be read.
+ */
+export async function jobClaude(pid: number): Promise<JobProcess[] | null> {
+  const job = await jobProcessesBelow(pid);
+  if (job === null) return null;
+  const claude = job.filter((entry) => isClaudeProcess({ name: entry.name, argv: entry.argv, ...(entry.argv[0] === undefined ? {} : { argv0: entry.argv[0] }) }));
+  return claude.length === 1 ? claude : [];
 }
 
 /** Java's String.hashCode, which Claude Code uses for the suffix of a long name. */
@@ -486,9 +548,12 @@ const CONTINUED_TAIL_BYTES = 64 * 1024;
  */
 async function transcriptTail(path: string): Promise<string | null> {
   try {
-    const file = await open(path, constants.O_RDONLY);
+    // no links and no blocking: a FIFO in its place must not hold the lookup (as branchedFrom)
+    const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
     try {
-      const size = (await file.stat()).size;
+      const info = await file.stat();
+      if (!info.isFile()) return null;
+      const size = info.size;
       const start = Math.max(0, size - CONTINUED_TAIL_BYTES);
       const buffer = Buffer.alloc(size - start);
       const { bytesRead } = await file.read(buffer, 0, buffer.length, start);
@@ -1180,6 +1245,14 @@ export async function claudeTranscriptFile(
 
   const seen = new Set<string>();
   const path = await follow(session, seen);
+  // a Claude started inside the pane inherits HERDR_PANE_ID and can take Herdr's report of the pane: a session
+  // with no transcript, or one print mode wrote, is no conversation of the pane's own Claude (#3260)
+  // the live session is looked for only where the pane's conversation can be: beside the report, or with no
+  // report in the folders of the pane's own cwds, never in another project
+  const folders = path !== null ? [dirname(path)]
+    : cwds.flatMap((cwd) => cwd ? [join(projects, claudeProjectDir(cwd))] : []);
+  const own = await ownSessionInstead(path, live, seen, folders, follow);
+  if (own !== null) return own;
   if (path === null || live === null || !SESSION_ID.test(live) || seen.has(live)) return path;
   // a branch stays in its project: only that folder is looked in, and what cannot be read there is no evidence of one
   const inProject = async (id: string): Promise<string | null> => {
@@ -1198,6 +1271,76 @@ export async function claudeTranscriptFile(
     branch = await inProject(parent);
   }
   return path;
+}
+
+/** How much of a transcript's end `lastEntrypoint` reads. */
+const ENTRYPOINT_TAIL_BYTES = 256 * 1024;
+
+/**
+ * The `entrypoint` the newest record within a transcript's last ENTRYPOINT_TAIL_BYTES names ("cli", "sdk-cli"),
+ * or null when none does or the file cannot be read. Whole records only, read as JSON reads them (#2130).
+ * Non-blocking and no symlinks, as branchedFrom.
+ */
+async function lastEntrypoint(path: string): Promise<string | null> {
+  let file;
+  try { file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW); } catch { return null; }
+  try {
+    const info = await file.stat();
+    if (!info.isFile()) return null;
+    const length = Math.min(info.size, ENTRYPOINT_TAIL_BYTES);
+    const bytes = Buffer.alloc(length);
+    let read = 0;
+    while (read < length) {
+      const { bytesRead } = await file.read(bytes, read, length - read, info.size - length + read);
+      if (bytesRead === 0) break;
+      read += bytesRead;
+    }
+    const lines = bytes.subarray(0, read).toString("utf8").split("\n");
+    // the first line may be cut by the read, the last one may still be being written: neither parses, and is passed by
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const line = lines[index]!.trim();
+      if (line === "") continue;
+      let entry: { entrypoint?: unknown };
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (typeof entry?.entrypoint === "string") return entry.entrypoint;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally { await file.close(); }
+}
+
+/** Whether print mode or the SDK (`claude -p`) wrote a transcript's newest records: an `sdk-…` entrypoint, as claude-transcript.ts tells an SDK prompt. */
+async function printModeTranscript(path: string): Promise<boolean> {
+  return (await lastEntrypoint(path))?.startsWith("sdk") === true;
+}
+
+/**
+ * The transcript of the session the pane's Claude process names in its PID record (`live`), in place of the one
+ * Herdr reports, when that report cannot be the pane's conversation: no project holds its transcript, or print
+ * mode or the SDK wrote its newest records. A Claude started inside the pane (`claude -p` from a hook, a script or
+ * the agent itself) inherits HERDR_PANE_ID, and its SessionStart can take the pane's report (#3260). Null keeps
+ * the answer as it was: no PID record, a live session the report's chain already holds, a live session with no
+ * transcript either or, beside a print-mode report, one print mode wrote too; an interactive report always stands,
+ * as after a /resume back (#2020).
+ */
+async function ownSessionInstead(
+  reported: string | null, live: string | null, seen: ReadonlySet<string>, folders: readonly string[],
+  follow: (start: string, seen: Set<string>, from?: string) => Promise<string | null>,
+): Promise<string | null> {
+  if (live === null || !SESSION_ID.test(live) || seen.has(live)) return null;
+  if (reported !== null && !await printModeTranscript(reported)) return null;
+  let found: string | null = null;
+  for (const folder of folders) {
+    const candidate = join(folder, `${live}.jsonl`);
+    // a regular file of its own, not a link to something else
+    try { if ((await lstat(candidate)).isFile()) { found = candidate; break; } } catch { /* not there */ }
+  }
+  if (found === null) return null;
+  const path = await follow(live, new Set<string>(), found);
+  if (path === null || reported === null) return path;
+  // beside a print-mode report, a live session print mode wrote too tells neither apart
+  return await printModeTranscript(path) ? null : path;
 }
 
 /** Where `claudeSessionTempDir` looks for this user's `claude-<uid>` folder. */

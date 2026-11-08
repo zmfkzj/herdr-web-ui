@@ -1,3 +1,4 @@
+import type { SystemReport } from "../shared/system.ts";
 import { describe, expect, it, beforeAll, afterAll, spyOn } from "bun:test";
 import { CLEAR_LEGACY_DEVICE_COOKIE, DEVICE_COOKIE_CLEARED } from "./auth.ts";
 import { Database } from "bun:sqlite";
@@ -34,7 +35,8 @@ import { testShellEnv } from "../scripts/test-shell.ts";
 import { PendingInputError, PendingInputs } from "./pending-input.ts";
 import { loginPathProbe, ShellAgentLocator, type LoginPathProbe } from "./shell-agent.ts";
 import { DeviceStore } from "./devices.ts";
-import type { HerdrCoreFacts, MachineEvent, MachineSettings } from "../shared/machines.ts";
+import type { HerdrCoreFacts, HerdrRuntimeFacts, MachineEvent, MachineSettings } from "../shared/machines.ts";
+import type { RuntimeService, SwitchAnswer } from "./herdr-core/runtime-choice.ts";
 import { MAX_MUTED_PANES, type SharedPreferences } from "../shared/preferences.ts";
 import { OmoStatus } from "./omo-status.ts";
 import { omoJobTasks } from "./omo-jobs.ts";
@@ -525,6 +527,58 @@ describe("a Claude bash-mode command on GET /api/pane/conversation", () => {
   }, 20_000);
 });
 
+describe("GET /api/pane/conversation/search", () => {
+  it("finds a Claude pane's messages and answers on every page, never a tool's output, and goes on from its cursor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-web-ui-search-contract-"));
+    const cwd = realpathSync(root);
+    const originalHome = process.env["HOME"];
+    const id = "5c1d7e3f-2a48-4b96-8e05-9f3a6c2d1b74";
+    const file = join(cwd, ".claude", "projects", claudeProjectDir(cwd), `${id}.jsonl`);
+    mkdirSync(join(file, ".."), { recursive: true });
+    // 120 prompts: three pages of 50; the user's words on the first page, the answer on the last
+    const at = (n: number, step: number) => new Date(Date.parse("2026-10-27T03:00:00.000Z") + (n * 4 + step) * 1000).toISOString();
+    writeFileSync(file, Array.from({ length: 120 }, (_, n) => [
+      { type: "user", timestamp: at(n, 0), uuid: `u${n}`, message: { role: "user", content: n === 5 ? "Why does the deploy script fail?" : `prompt ${n}` } },
+      { type: "assistant", timestamp: at(n, 1), uuid: `c${n}`, message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${n}`, name: "Bash", input: { command: "make" } }] } },
+      { type: "user", timestamp: at(n, 2), uuid: `r${n}`, message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${n}`, content: "the deploy script printed this" }] } },
+      { type: "assistant", timestamp: at(n, 3), uuid: `a${n}`, message: { role: "assistant", content: [{ type: "text", text: n === 110 ? "The deploy script needs its token." : `answer ${n}` }] } },
+    ].map((line) => JSON.stringify(line)).join("\n")).join("\n") + "\n");
+    let app: ReturnType<typeof createServer> | undefined;
+    let workspace: string | undefined;
+    try {
+      process.env["HOME"] = cwd;
+      forgetTranscriptState();
+      const created = await workspaceCreate({ cwd, label: "herdr-web-ui-test-conversation-search" });
+      workspace = created.workspace.workspace_id;
+      const paneId = created.root_pane.pane_id;
+      await herdrRpc("pane.report_agent", { pane_id: paneId, source: "manual", agent: "claude", state: "idle" });
+      await herdrRpc("pane.report_agent_session", { pane_id: paneId, source: "herdr:claude", agent: "claude", seq: Date.now() * 1000, agent_session_id: id });
+      app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(cwd, "state") });
+      const ask = (query: Record<string, string>) => fetch(`http://127.0.0.1:${app!.port}/api/pane/conversation/search?${new URLSearchParams({ pane_id: paneId, ...query })}`);
+      const found: { role: string; before: string; match: string; after: string }[] = [];
+      let answer = await (await ask({ q: "Deploy  Script" })).json() as { history_id: string; cursor: string | null; matches: typeof found };
+      for (let asked = 1; ; asked++) {
+        found.push(...answer.matches.map(({ role, before, match, after }) => ({ role, before, match, after })));
+        if (answer.cursor === null) break;
+        expect(asked).toBeLessThan(5);
+        answer = await (await ask({ q: "Deploy  Script", before: answer.cursor, history_id: answer.history_id })).json() as typeof answer;
+      }
+      expect(found).toEqual([
+        { role: "assistant", before: "The ", match: "deploy script", after: " needs its token." },
+        { role: "user", before: "Why does the ", match: "deploy script", after: " fail?" },
+      ]);
+      // a cursor from another history, and a query it cannot search
+      expect((await ask({ q: "deploy", before: "0", history_id: "another" })).status).toBe(409);
+      expect((await ask({ q: " " })).status).toBe(400);
+    } finally {
+      app?.stop();
+      if (workspace !== undefined) await workspaceClose(workspace);
+      if (originalHome === undefined) delete process.env["HOME"]; else process.env["HOME"] = originalHome;
+      forgetTranscriptState(); rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("usage API", () => {
   it.each([false, true])("serializes missing_commands when Linux secret-tool availability is %s", async (installed) => {
     // Given: no Antigravity credentials and an isolated command lookup.
@@ -596,6 +650,34 @@ describe("usage API", () => {
       const withToken = await fetch(`http://localhost:${gated.port}/api/usage`, { headers: { authorization: "Bearer test-usage-token" } });
       expect(withToken.status).toBe(200);
     } finally { open.stop(); gated.stop(); rmSync(usageState, { recursive: true, force: true }); }
+  });
+});
+
+describe("system API", () => {
+  const report: SystemReport = { sampled_at: 1, platform: "linux", uptime_s: 5, cpu_count: 2, cpu_percent: 10, memory: null, load: null, disks: [] };
+  const sampler = { read: async () => report };
+
+  it("answers GET without caching, keeps it behind the token gate, and takes the bridge token too", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdr-system-contract-"));
+    const open = createServer({ port: 0, stateDir: dir, system: sampler });
+    const bridge = "b".repeat(64);
+    const gated = createServer({ port: 0, stateDir: dir, system: sampler, token: "system-test-token", bridgeToken: bridge });
+    const machineServer = createServer({ port: 0, stateDir: dir, system: null });
+    try {
+      const answered = await fetch(`http://localhost:${open.port}/api/system`);
+      expect(answered.status).toBe(200);
+      expect(answered.headers.get("cache-control")).toBe("no-store");
+      expect(await answered.json()).toEqual(report);
+      expect((await fetch(`http://localhost:${gated.port}/api/system`)).status).toBe(401);
+      const withToken = await fetch(`http://localhost:${gated.port}/api/system`, { headers: { authorization: "Bearer system-test-token" } });
+      expect(withToken.status).toBe(200);
+      // another PC's app reads it through its bridge token, by GET only
+      expect((await fetch(`http://localhost:${gated.port}/api/system`, { headers: { authorization: `Bearer ${bridge}` } })).status).toBe(200);
+      expect((await fetch(`http://localhost:${gated.port}/api/system`, { method: "POST", headers: { authorization: `Bearer ${bridge}` } })).status).toBe(401);
+      expect((await fetch(`http://localhost:${open.port}/api/system`, { method: "POST", headers: { origin: `http://localhost:${open.port}` } })).status).toBe(405);
+      // a server without a load of its own to tell answers as one without the route
+      expect((await fetch(`http://localhost:${machineServer.port}/api/system`)).status).toBe(404);
+    } finally { open.stop(); gated.stop(); machineServer.stop(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -1027,9 +1109,9 @@ describe("herdr's selection preference", () => {
       const response = await fetch(url, { headers });
       expect(response.status).toBe(200);
       expect(response.headers.get("cache-control")).toBe("no-store");
-      expect(await response.json()).toEqual({ copy_on_select: false });
-      writeFileSync(configPath, "[ui]\ncopy_on_select = true\n");
-      expect(await (await fetch(url, { headers })).json()).toEqual({ copy_on_select: true });
+      expect(await response.json()).toMatchObject({ copy_on_select: false, keys: { prefix: "ctrl+b" } });
+      writeFileSync(configPath, "[ui]\ncopy_on_select = true\n[keys]\nprefix = \"ctrl+a\"\n");
+      expect(await (await fetch(url, { headers })).json()).toMatchObject({ copy_on_select: true, keys: { prefix: "ctrl+a", prefixes: ["ctrl+a"] } });
       expect((await fetch(url, { method: "POST", headers: { ...headers, origin: `http://localhost:${gated.port}` } })).status).toBe(400);
     } finally { gated.stop(); rmSync(state, { recursive: true, force: true }); }
   });
@@ -2258,6 +2340,10 @@ describe("workspace and discovery endpoints", () => {
       ["/api/pane/focus", {}, "missing_pane_id"],
       ["/api/pane/swap", { pane_id: "x", direction: "right", target_pane_id: "y" }, "invalid_pane_swap"],
       ["/api/pane/swap", { pane_id: "x", target_pane_id: "" }, "invalid_target_pane_id"],
+      ["/api/pane/move", { target_pane_id: "y", side: "left" }, "missing_pane_id"],
+      ["/api/pane/move", { pane_id: "x", side: "left" }, "invalid_target_pane_id"],
+      ["/api/pane/move", { pane_id: "x", target_pane_id: "y" }, "invalid_side"],
+      ["/api/pane/move", { pane_id: "x", target_pane_id: "y", side: "middle" }, "invalid_side"],
       ["/api/layout/ratio", {}, "missing_tab_id"],
       ["/api/layout/ratio", { tab_id: "x", path: [0], ratio: 0.5 }, "invalid_path"],
       ["/api/layout/ratio", { tab_id: "x", path: [], ratio: 1 }, "invalid_ratio"],
@@ -4210,6 +4296,40 @@ describe("pairing and identity", () => {
     }
   });
 
+  it("regression: lets the owner's login in as soon as Tailscale finishes starting, not five minutes after a boot", async () => {
+    const state = mkdtempSync(join(tmpdir(), "herdr-boot-identity-"));
+    const savedOwner = process.env["OVIS_TAILSCALE_OWNER"];
+    delete process.env["OVIS_TAILSCALE_OWNER"];
+    // a PC that paired a device before: the gate is closed to strangers
+    writeFileSync(join(state, "devices.json"), JSON.stringify({ gate_closed_at: new Date().toISOString(), devices: [] }));
+    // at boot the server asks before tailscaled has logged in: no user yet; every later read is Running
+    const starting = JSON.stringify({ BackendState: "NoState", Self: { DNSName: "" } });
+    const running = JSON.stringify({ BackendState: "Running", Self: { DNSName: "pc.example.ts.net.", UserID: 7, TailscaleIPs: ["100.101.102.103"] }, User: { "7": { LoginName: OWNER } } });
+    let reads = 0;
+    const tailnet = new TailnetIdentitySource(async () => reads++ === 0 ? starting : running);
+    await tailnet.freshIdentity(null);
+    const booted = createServer({ port: 0, stateDir: state, tailnet });
+    const at = async (headers: Record<string, string>) => ((await (await fetch(`http://127.0.0.1:${booted.port}/api/health?scope=bridge`, { headers })).json()) as { auth: HealthAuth }).auth;
+    // the owner's phone asks a few seconds after the boot read, once tailscaled is up
+    const start = Date.now();
+    const clock = spyOn(Date, "now").mockImplementation(() => start + 3_000);
+    try {
+      expect(await at(proxied(OWNER))).toMatchObject({ authenticated: true, via: "tailscale" });
+      // once the login is known it is kept for the cache's life: later polls read nothing
+      const settled = reads;
+      expect(await at(proxied(OWNER))).toMatchObject({ authenticated: true, via: "tailscale" });
+      expect(reads).toBe(settled);
+      // a stranger still pairs
+      expect(await at(proxied("someone@example.com"))).toMatchObject({ authenticated: false, reason: "other_user" });
+      expect(await at(proxied())).toMatchObject({ authenticated: false, reason: "pairing_required" });
+    } finally {
+      clock.mockRestore();
+      booted.stop();
+      if (savedOwner === undefined) delete process.env["OVIS_TAILSCALE_OWNER"]; else process.env["OVIS_TAILSCALE_OWNER"] = savedOwner;
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+
   it("takes the login named in OVIS_TAILSCALE_OWNER for the PC's own, as a tagged node needs", async () => {
     const state = mkdtempSync(join(tmpdir(), "herdr-named-owner-"));
     const before = process.env["OVIS_TAILSCALE_OWNER"];
@@ -5524,6 +5644,9 @@ setInterval(() => {}, 1 << 30);
 // The shared preferences (shared/preferences.ts) over HTTP and the event stream: the muted panes
 // are always in the document, the first mute is a change of the empty list, a watching device
 // reads and cannot write, and two tabs' changes land as two revisions with both kept.
+/** a preferences document saved at least once, which names its state folder */
+const namedPreferences = <T extends object>(doc: T) => ({ ...doc, state_id: expect.stringMatching(/^[0-9a-f]{32}$/) });
+
 describe("shared preferences API", () => {
   const guard = { "x-herdr-machine": "1", "content-type": "application/json" };
   /** the event stream as a page reads it: each `preferences` document, and a bounded wait for the next one that matches */
@@ -5573,8 +5696,8 @@ describe("shared preferences API", () => {
       // the first mute: saved, answered whole, and told to every stream
       const first = await put({ settings: {}, muted_panes: ["w1:p1"] });
       expect(first.status).toBe(200);
-      expect(await first.json()).toEqual({ revision: 1, settings: {}, muted_panes: ["w1:p1"] });
-      expect(await events.next("the first mute", (document) => document.revision === 1)).toEqual({ revision: 1, settings: {}, muted_panes: ["w1:p1"] });
+      expect(await first.json()).toEqual(namedPreferences({ revision: 1, settings: {}, muted_panes: ["w1:p1"] }));
+      expect(await events.next("the first mute", (document) => document.revision === 1)).toEqual(namedPreferences({ revision: 1, settings: {}, muted_panes: ["w1:p1"] }));
       // malformed and oversized lists: refused unread into the document, which keeps its revision
       for (const muted of ["w1:p1", [1], [""], [null], ["x".repeat(301)], Array.from({ length: MAX_MUTED_PANES + 1 }, (_, i) => `w1:p${i}`)]) {
         const refused = await put({ settings: {}, muted_panes: muted });
@@ -5582,10 +5705,10 @@ describe("shared preferences API", () => {
       }
       const huge = await put({ settings: {}, muted_panes: Array.from({ length: 300 }, (_, i) => `${"k".repeat(290)}${i}`) });
       expect([huge.status, ((await huge.json()) as ApiError).error.code]).toEqual([413, "too_large"]);
-      expect(await (await fetch(`${base}/api/preferences`, { headers })).json()).toEqual({ revision: 1, settings: {}, muted_panes: ["w1:p1"] });
+      expect(await (await fetch(`${base}/api/preferences`, { headers })).json()).toEqual(namedPreferences({ revision: 1, settings: {}, muted_panes: ["w1:p1"] }));
       // a change that names no list leaves it; an empty list clears it
-      expect(await (await put({ settings: { theme: "light" } })).json()).toEqual({ revision: 2, settings: { theme: "light" }, muted_panes: ["w1:p1"] });
-      expect(await (await put({ settings: {}, muted_panes: [] })).json()).toEqual({ revision: 3, settings: { theme: "light" }, muted_panes: [] });
+      expect(await (await put({ settings: { theme: "light" } })).json()).toEqual(namedPreferences({ revision: 2, settings: { theme: "light" }, muted_panes: ["w1:p1"] }));
+      expect(await (await put({ settings: {}, muted_panes: [] })).json()).toEqual(namedPreferences({ revision: 3, settings: { theme: "light" }, muted_panes: [] }));
       await events.next("the cleared list", (document) => document.revision === 3);
       expect(events.documents.map((document) => document.revision)).toEqual([0, 1, 2, 3]);
     } finally {
@@ -5609,7 +5732,7 @@ describe("shared preferences API", () => {
       const events = await openEvents(base, headers, abort);
       expect(await events.next("the opening document", (document) => document.revision === 4)).toEqual({ ...stored, muted_panes: [] });
       const first = await fetch(`${base}/api/preferences`, { method: "PUT", headers, body: JSON.stringify({ settings: {}, muted_panes: ["w1:p1"] }) });
-      expect(await first.json()).toEqual({ revision: 5, settings: { theme: "dark" }, pins: ["local:w1:p1"], muted_panes: ["w1:p1"] });
+      expect(await first.json()).toEqual(namedPreferences({ revision: 5, settings: { theme: "dark" }, pins: ["local:w1:p1"], muted_panes: ["w1:p1"] }));
       // the list has a document of its own, which an older release's whole rewrite of preferences.json cannot erase
       expect(JSON.parse(readFileSync(join(root, "preferences.json"), "utf8"))).toEqual({ revision: 5, settings: { theme: "dark" }, pins: ["local:w1:p1"] });
       expect(JSON.parse(readFileSync(join(root, "muted-panes.json"), "utf8"))).toEqual({ muted_panes: ["w1:p1"] });
@@ -5642,14 +5765,14 @@ describe("shared preferences API", () => {
       const revisions = [((await a.json()) as SharedPreferences).revision, ((await b.json()) as SharedPreferences).revision].sort();
       expect(revisions).toEqual([1, 2]);
       const merged = await events.next("both changes", (document) => document.revision === 2);
-      expect(merged).toEqual({ revision: 2, settings: { theme: "light" }, muted_panes: ["w1:p1"] });
+      expect(merged).toEqual(namedPreferences({ revision: 2, settings: { theme: "light" }, muted_panes: ["w1:p1"] }));
       // tab B then clears the list tab A set: the last write wins, as for every field
       const cleared = await fetch(`${base}/api/preferences`, { method: "PUT", headers: driving, body: JSON.stringify({ settings: {}, muted_panes: [] }) });
-      expect(await cleared.json()).toEqual({ revision: 3, settings: { theme: "light" }, muted_panes: [] });
+      expect(await cleared.json()).toEqual(namedPreferences({ revision: 3, settings: { theme: "light" }, muted_panes: [] }));
       // the watching device heard every document, and cannot write one: the revision stays
       await events.next("the cleared list", (document) => document.revision === 3);
       expect(events.documents.map((document) => document.revision)).toEqual([0, 1, 2, 3]);
-      expect(await (await fetch(`${base}/api/preferences`, { headers: watching })).json()).toEqual({ revision: 3, settings: { theme: "light" }, muted_panes: [] });
+      expect(await (await fetch(`${base}/api/preferences`, { headers: watching })).json()).toEqual(namedPreferences({ revision: 3, settings: { theme: "light" }, muted_panes: [] }));
       const refused = await fetch(`${base}/api/preferences`, { method: "PUT", headers: watching, body: JSON.stringify({ settings: {}, muted_panes: ["w1:p1"] }) });
       expect([refused.status, ((await refused.json()) as ApiError).error.code]).toEqual([403, "read_only"]);
       expect(await (await fetch(`${base}/api/preferences`, { headers: driving })).json()).toMatchObject({ revision: 3, muted_panes: [] });
@@ -5662,15 +5785,15 @@ describe("shared preferences API", () => {
 });
 
 describe("access facts on /api/health", () => {
-  type Body = { auth: HealthAuth; lan_exposure?: LanExposure; security?: SecuritySummary; herdr_core?: HerdrCoreFacts };
+  type Body = { auth: HealthAuth; lan_exposure?: LanExposure; security?: SecuritySummary; herdr_core?: HerdrCoreFacts; herdr_runtime?: HerdrRuntimeFacts };
   const SECRET = "fictional-t0k3n-value";
   const guard = { "content-type": "application/json", "x-herdr-machine": "1" };
   /** a server of its own: a temp state dir, an empty token unless one is given, nothing from the runner's environment */
   const CORE_FACTS: HerdrCoreFacts = { version: "0.1.17", session: "default", running: false };
-  const serve = (options: { hostname?: string; token?: string; serveOnly?: boolean; owner?: string | null; seed?: (stateDir: string) => void } = {}) => {
+  const serve = (options: { hostname?: string; token?: string; serveOnly?: boolean; owner?: string | null; seed?: (stateDir: string) => void; runtime?: RuntimeService; accepted?: () => boolean } = {}) => {
     const stateDir = mkdtempSync(join(tmpdir(), "herdr-security-summary-"));
     options.seed?.(stateDir);
-    const instance = createServer({ port: 0, hostname: options.hostname ?? "127.0.0.1", token: options.token ?? "", stateDir, tailscaleOwner: options.owner ?? null, tailscaleServeOnly: options.serveOnly ?? false, herdrCoreFacts: () => CORE_FACTS });
+    const instance = createServer({ port: 0, hostname: options.hostname ?? "127.0.0.1", token: options.token ?? "", stateDir, tailscaleOwner: options.owner ?? null, tailscaleServeOnly: options.serveOnly ?? false, herdrCoreFacts: () => CORE_FACTS, ...(options.runtime ? { runtimeService: options.runtime } : {}), ...(options.accepted ? { launchAccepted: options.accepted } : {}) });
     const read = async (headers: Record<string, string> = {}, scope = "") => {
       const response = await fetch(`http://127.0.0.1:${instance.port}/api/health${scope}`, { headers });
       const text = await response.text();
@@ -5756,6 +5879,65 @@ describe("access facts on /api/health", () => {
       expect(stranger.body.auth).toMatchObject({ authenticated: true, via: "open" });
       expect(stranger.body.herdr_core).toBeUndefined();
       expect((await open.read({})).body.herdr_core).toEqual(CORE_FACTS);
+    } finally { open.stop(); }
+  });
+
+  it("says in the bridge's own answer which runtime it serves and whether its launcher took it", async () => {
+    let taken = false;
+    const server = serve({ accepted: () => taken });
+    try {
+      const first = (await server.read({}, "?scope=bridge")).body as unknown as { runtime?: string; accepted?: boolean; web_ui?: { boot_id?: string } };
+      expect([first.runtime, first.accepted, typeof first.web_ui?.boot_id]).toEqual(["herdr", false, "string"]);
+      taken = true;
+      expect(((await server.read({}, "?scope=bridge")).body as unknown as { accepted?: boolean }).accepted).toBe(true);
+    } finally { server.stop(); }
+  });
+
+  it("tells the runtime facts to a driving owner only, and takes a switch from that owner's own page only", async () => {
+    const facts: HerdrRuntimeFacts = { serving: "herdr", source: "detected", tui: { installed: true, running: true }, app_installed: true, switch_to: "herdr-core", locked: null };
+    const asked: unknown[] = [];
+    let answer: SwitchAnswer = { ok: true };
+    const runtime: RuntimeService = { facts: () => facts, request: (target) => { asked.push(target); return answer; } };
+    let token = "";
+    const secured = serve({ token: SECRET, runtime, seed: (stateDir) => {
+      const store = new DeviceStore(stateDir);
+      token = store.pair(store.startPairing().code, "Watch", "watch")!.token;
+      store.match(token);
+    } });
+    const bearer = { authorization: `Bearer ${SECRET}` };
+    const post = (headers: Record<string, string>, body: unknown = { runtime: "herdr-core" }) =>
+      fetch(`http://127.0.0.1:${secured.port}/api/runtime`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+    try {
+      expect((await secured.read(bearer)).body.herdr_runtime).toEqual(facts);
+      expect((await secured.read({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20" })).body.herdr_runtime).toBeUndefined();
+      expect((await secured.read({})).body.herdr_runtime).toBeUndefined();
+      // the bridge's own answer, which needs no herdr, tells the same owner the same, so a stopped TUI keeps the way back
+      expect((await secured.read(bearer, "?scope=bridge")).body.herdr_runtime).toEqual(facts);
+      expect((await secured.read({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20" }, "?scope=bridge")).body.herdr_runtime).toBeUndefined();
+      expect((await secured.read({}, "?scope=bridge")).body.herdr_runtime).toBeUndefined();
+      // nobody but a driving owner, and only through the app's own request header
+      expect((await post({})).status).toBe(401);
+      expect((await post({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20", "x-herdr-update": "1" })).status).toBe(403);
+      expect((await post(bearer)).status).toBe(403);
+      expect(asked).toEqual([]);
+      const accepted = await post({ ...bearer, "x-herdr-update": "1" });
+      expect([accepted.status, await accepted.json()]).toEqual([202, { accepted: true }]);
+      expect(asked).toEqual(["herdr-core"]);
+      // the service's refusal reaches the page as it is
+      answer = { ok: false, status: 409, code: "runtime_locked", message: "OVIS_RUNTIME decides" };
+      const refused = await post({ ...bearer, "x-herdr-update": "1" }, { runtime: "herdr" });
+      expect([refused.status, ((await refused.json()) as { error: { code: string } }).error.code]).toEqual([409, "runtime_locked"]);
+      expect((await fetch(`http://127.0.0.1:${secured.port}/api/runtime`, { headers: bearer })).status).toBe(400);
+    } finally { secured.stop(); }
+    // an open install lets a stranger on the network in as a driver: still no switch for them
+    asked.length = 0;
+    answer = { ok: true };
+    const open = serve({ hostname: "0.0.0.0", runtime });
+    try {
+      const stranger = await fetch(`http://127.0.0.1:${open.port}/api/runtime`, { method: "POST", headers: { "content-type": "application/json", "x-herdr-update": "1", "x-forwarded-for": "192.168.0.20" }, body: JSON.stringify({ runtime: "herdr-core" }) });
+      expect(stranger.status).toBe(403);
+      expect((await open.read({ "x-forwarded-for": "192.168.0.20" })).body.herdr_runtime).toBeUndefined();
+      expect(asked).toEqual([]);
     } finally { open.stop(); }
   });
 
