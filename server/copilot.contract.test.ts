@@ -35,7 +35,10 @@ async function startFixture(pane: string, session: string, flags = "") {
   await herdrRpc("pane.send_text", { pane_id: pane, text: `COPILOT_HOME=${home} node ${executable} ${session}${flags ? ` ${flags}` : ""}\n` });
   for (const deadline = Date.now() + 10_000;;) {
     if ((await sessionSnapshot()).panes.find((p) => p.pane_id === pane)?.agent === "copilot" && await fixtureInFront(pane, session) !== undefined) return;
-    if (Date.now() > deadline) throw new Error(`isolated Copilot stand-in not detected in ${pane}`);
+    if (Date.now() > deadline) {
+      const agent = (await sessionSnapshot()).panes.find((p) => p.pane_id === pane)?.agent;
+      throw new Error(`isolated Copilot stand-in not detected in ${pane}: agent ${JSON.stringify(agent)}, in front ${JSON.stringify((await paneProcessInfo(pane))?.foreground_processes)}`);
+    }
     await Bun.sleep(50);
   }
 }
@@ -47,6 +50,10 @@ beforeAll(async () => {
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
+// Node 24 names its main thread "MainThread", the process name herdr reads (/proc/<pid>/comm) to see which runtime runs
+// which agent: the name back to the runtime's, as Node 22 (CI's) and every earlier one leave it. Only the name: the
+// arguments (fixtureInFront, the handoff checks) stay as they were
+if (process.platform === "linux") writeFileSync("/proc/self/comm", "node");
 const home = process.env.COPILOT_HOME;
 const hold = (id) => { const dir = join(home, "session-state", id); mkdirSync(dir, { recursive: true }); openSync(join(dir, \`inuse.\${process.pid}.hold\`), "w"); };
 const lifecycle = process.argv.includes("--lifecycle");
@@ -146,7 +153,7 @@ console.log("fixture ready");`);
   pane = created.root_pane.pane_id;
   await startFixture(pane, id);
   app = createServer({ hostname: "127.0.0.1", port: 0, token: "", stateDir: join(root, "state"), tailscaleOwner: null });
-});
+}, 20_000);
 
 afterAll(async () => {
   app?.stop();
