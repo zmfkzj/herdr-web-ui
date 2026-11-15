@@ -169,7 +169,7 @@ try {
     proxies.push(proxy);
   };
   const base = `http://127.0.0.1:${server.port}`;
-  const api = (path: string, init: RequestInit = {}) => fetch(`${base}${path}`, { ...init, headers: { "content-type": "application/json", "x-herdr-machine": "1", origin: base, ...init.headers } });
+  const api = (path: string, init: RequestInit = {}) => fetch(`${base}${path}`, { ...init, headers: { "content-type": "application/json", "x-herdr-machine": "1", "x-herdr-update": "1", origin: base, ...init.headers } });
   const job = await (await api("/api/machines/setup", { method: "POST", body: JSON.stringify({ destination: "fixture-remote-pc", name: "Fixture remote PC" }) })).json() as { machine_id: string };
   const remoteId = job.machine_id;
   await until(async () => ((await (await api("/api/machines")).json()) as { machines: Machine[] }).machines.find((machine) => machine.id === remoteId)?.state === "connected", "the remote PC connects through the fake SSH");

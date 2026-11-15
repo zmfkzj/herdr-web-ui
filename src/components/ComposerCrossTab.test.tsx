@@ -204,3 +204,32 @@ it("sends a draft no other tab sent, once (control)", async () => {
   await tab.press();
   expect(tab.sent).toEqual(["deploy"]);
 });
+
+it("lets no dictation write into a watch-only composer", async () => {
+  const props: ComposerProps = { paneId: pane, agent: "claude", agentStatus: "idle", connected: true, autoFocus: false, active: true, role: "observe", onSend: () => true, onAbort() {}, onUploadImage: async () => "" };
+  const dictation = voiceModule.useDictation as unknown as { mock: { calls: [{ active?: boolean }][] } };
+  await act(async () => { renderer = create(<Composer {...props} />); });
+  expect(dictation.mock.calls.at(-1)![0].active).toBe(false);
+  await act(async () => { renderer!.update(<Composer {...props} role={undefined} />); });
+  expect(dictation.mock.calls.at(-1)![0].active).toBe(true);
+});
+
+it("disables the quick replies in a watch-only view", async () => {
+  const props: ComposerProps = { paneId: pane, agent: "claude", agentStatus: "idle", connected: true, autoFocus: false, role: "observe", onSend: () => true, onAbort() {}, onUploadImage: async () => "" };
+  await act(async () => { renderer = create(<Composer {...props} />); });
+  const quick = renderer!.root.findAll((node) => node.type === "button" && node.props.className === "composer-quick-reply");
+  expect(quick.length).toBeGreaterThan(0);
+  expect(quick.map((button) => button.props.disabled)).toEqual(quick.map(() => true));
+  await act(async () => { renderer!.update(<Composer {...props} role={undefined} />); });
+  expect(renderer!.root.findAll((node) => node.type === "button" && node.props.className === "composer-quick-reply").map((button) => button.props.disabled)).toEqual(quick.map(() => false));
+});
+
+// the composer's own render is the only lock a watch-only view has: nothing outside it disables its controls
+it("locks what writes in a watch-only view, keeps the background tasks chip, and unlocks when the view takes input again", async () => {
+  const props: ComposerProps = { paneId: pane, agent: "claude", agentStatus: "working", backgroundTasks: 1, connected: true, autoFocus: false, role: "observe", onSend: () => true, onAbort() {}, onUploadImage: async () => "" };
+  await act(async () => { renderer = create(<Composer {...props} />); });
+  const disabled = (name: string): boolean[] => renderer!.root.findAll((node) => typeof node.type === "string" && String(node.props.className ?? "").split(" ").includes(name)).map((node) => node.props.disabled === true);
+  expect({ text: disabled("composer-text"), attach: disabled("composer-attach"), stop: disabled("composer-stop"), chip: disabled("bg-tasks-toggle") }).toEqual({ text: [true], attach: [true], stop: [true], chip: [false] });
+  await act(async () => { renderer!.update(<Composer {...props} role={undefined} />); });
+  expect({ text: disabled("composer-text"), attach: disabled("composer-attach"), stop: disabled("composer-stop"), chip: disabled("bg-tasks-toggle") }).toEqual({ text: [false], attach: [false], stop: [false], chip: [false] });
+});

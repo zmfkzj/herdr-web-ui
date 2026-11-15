@@ -12,8 +12,43 @@ import { t as inCurrentLanguage, type Translate } from "./i18n.ts";
  */
 export function optionName(prompt: InteractivePrompt, label: string): { text: string; recommended: boolean; words: string } {
   if (prompt.text_format === "markdown") return { text: label, recommended: false, words: shownText(parseInline(label, false)) ?? label };
-  const text = label.replace(/\s*\(recommended\)$/i, "");
+  const text = label.replace(/^\(recommended\)\s+|\s*\(recommended\)$/i, "");
   return { text, recommended: text !== label, words: text };
+}
+
+/** What an approval's option grants: this one call, every call like it from now on, or nothing. */
+export type ApprovalScope = "once" | "always" | "deny";
+
+/** a key the agent's menu names after the option: "(y)", "(esc)", "[shift+tab]"; a trailing "(Recommended)" is read off the same way */
+const TRAILING_HINT = /\s*[([][^)\]]*[)\]]\s*$/u;
+
+/**
+ * The scope an approval option's own words state, or `yes` for a bare consent whose scope they
+ * leave unsaid: "No…", "Deny", "Reject" and pi's "Block" deny; a consent that says "don't ask
+ * again", "always", "allow all" or "this session" keeps allowing; one that says "once" or "this
+ * time" allows this once. Any other wording ("Modify with external editor") states no scope.
+ */
+function statedScope(label: string): ApprovalScope | "yes" | null {
+  const words = label.replace(TRAILING_HINT, "").trim().toLowerCase();
+  if (/^(?:no|deny|reject|block)\b/u.test(words)) return "deny";
+  if (!/^(?:yes|allow|approve|always)\b/u.test(words)) return null;
+  if (/\balways\b|\b(?:don'?t|do not|never) ask(?: me)? again\b|\ballow all\b|\b(?:for|during) (?:the rest of )?this (?:session|project)\b|\bfrom now on\b/u.test(words)) return "always";
+  if (/\bonce\b|\bone time\b|\bthis time\b|\bjust this\b/u.test(words)) return "once";
+  return /^(?:yes|allow|approve)(?:,?\s+(?:proceed|allow|approve|run it))?$/u.test(words) ? "yes" : null;
+}
+
+/**
+ * What an approval option grants, read off the agent's own words and never guessed (G-071): the
+ * scope its label states, or, for a bare "Yes" beside an option that keeps allowing (Codex's
+ * "Yes, and don't ask again…", Claude's "Yes, allow all edits this session"), this once. A bare
+ * "Yes" with no such neighbour, any other wording, and every other kind of card get no scope.
+ */
+export function approvalScope(prompt: InteractivePrompt, index: number): ApprovalScope | null {
+  if (prompt.kind !== "approval") return null;
+  const stated = prompt.options.map((option) => statedScope(option.label));
+  const own = stated[index] ?? null;
+  if (own !== "yes") return own;
+  return stated.includes("always") ? "once" : null;
 }
 
 /** Card text the bridge wrote itself (shared/card-text.ts), in the user's language: its key translated, its values filled in. */
@@ -74,7 +109,7 @@ export function polledPrompt(current: InteractivePrompt | null, next: Interactiv
 }
 
 /** At most `limit` UTF-16 units of `text`, never ending on half of a character (a lone high surrogate). */
-function capped(text: string, limit: number): string {
+export function capped(text: string, limit: number): string {
   const cut = text.slice(0, limit);
   const last = cut.charCodeAt(cut.length - 1);
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;

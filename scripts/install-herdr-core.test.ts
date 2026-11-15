@@ -18,7 +18,7 @@ function fn(name: string): string {
   if (!match) throw new Error(`install.sh defines no ${name}()`);
   return match[0];
 }
-const CONSTANTS = ["PLUGIN", "LEGACY_PLUGIN", "APP_DIR", "SERVICE", "AGENT_LABEL"].map((name) => {
+const CONSTANTS = ["PLUGIN", "LEGACY_PLUGIN", "APP_DIR", "OVIS_HOME", "SERVICE", "AGENT_LABEL"].map((name) => {
   const line = new RegExp(`^${name}=.*$`, "m").exec(INSTALLER)?.[0];
   if (!line) throw new Error(`install.sh sets no ${name}`);
   return line;
@@ -283,17 +283,24 @@ describe("core_service", () => {
     expect(plist).toContain("<key>AbandonProcessGroup</key><true/>");
     expect(readFileSync(join(home, "calls"), "utf8")).toBe(`launchctl bootout gui/501/sh.ovis.server\nlaunchctl bootstrap gui/501 ${agent}\n`);
     expect(result.out).toContain("starts at login (launchd");
-    if (Bun.which("plutil")) expect(Bun.spawnSync(["plutil", "-lint", agent]).exitCode).toBe(0);
+    // GNUstep's plutil (Linux) fails every file with "non-NSData data argument passed to method",
+    // so elsewhere Python's plistlib parses the file instead:
+    // https://github.com/gnustep/libs-base/blob/6307e474dd39e36eb2c5f6ee15ade8b51e337970/Source/NSPropertyList.m#L2648-L2650
+    const lint = process.platform === "darwin"
+      ? ["plutil", "-lint", agent]
+      : ["python3", "-c", "import plistlib, sys; plistlib.load(open(sys.argv[1], 'rb'))", agent];
+    if (Bun.which(lint[0]!)) expect(Bun.spawnSync(lint).exitCode).toBe(0);
   });
 });
 
 describe("install_core", () => {
-  it("builds the app with herdr-plugin.toml's Linux/macOS build steps, the Rust PTY host aside", () => {
+  it("builds the checkout from source after herdr-plugin.toml's pre-flight step, the Rust PTY host aside", () => {
     const manifest = readFileSync(join(ROOT, "herdr-plugin.toml"), "utf8");
-    const steps = [...manifest.matchAll(/\[\[build\]\]\ncommand = (\[.*\])\nplatforms = \["linux", "macos"\]/g)]
+    const preflight = [...manifest.matchAll(/\[\[build\]\]\ncommand = (\[.*\])\nplatforms = \["linux", "macos"\]/g)]
       .map((match) => (JSON.parse(match[1]!) as string[]).join(" "))
-      .filter((step) => !step.includes("pty-sidecar"));
-    expect(steps.length).toBeGreaterThan(0);
-    expect(fn("install_core")).toContain(`(cd "$APP_DIR.new" && ${steps.join(" && ")})`);
+      .filter((step) => step.includes("preflight"));
+    expect(preflight).toEqual(["sh scripts/preflight.sh"]);
+    // what scripts/plugin-launch.ts install runs under OVIS_FROM_SOURCE=1, without its Rust PTY host step
+    expect(fn("install_core")).toContain(`(cd "$APP_DIR.new" && ${preflight[0]} && sh scripts/with-bun.sh install && sh scripts/with-bun.sh run build)`);
   });
 });

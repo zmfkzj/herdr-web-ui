@@ -6,7 +6,9 @@ import { DirectoryBrowser } from "./DirectoryBrowser.tsx";
 import { FileGlyph } from "./FileGlyph.tsx";
 import { useHighlightedLines } from "./HighlightedCode.tsx";
 import { RenderBoundary } from "./RenderBoundary.tsx";
+import { flushSync } from "react-dom";
 import { RelayRenderedPage } from "./RelayRenderedPage.tsx";
+import { usePageFocusGuard } from "../lib/usePageFocusGuard.ts";
 import { hasDraft, TextFileEditor } from "./TextFileEditor.tsx";
 import { TextFileView } from "./TextFileView.tsx";
 import { MarkdownImageContext } from "./Markdown.tsx";
@@ -14,7 +16,7 @@ import { MarkdownOutline, OUTLINE_COLUMN_MIN_PX, useWideEnough } from "./Markdow
 
 import type { FileInfo } from "../../shared/protocol.ts";
 import { MAX_EDITABLE_TEXT_BYTES } from "../../shared/files.ts";
-import { ApiError } from "../lib/api.ts";
+import { ApiError, errorFrom } from "../lib/api.ts";
 import { formatBytes } from "../lib/bridgeProgress.ts";
 import { LOCAL_MACHINE, paneStorageId } from "../../shared/machines.ts";
 import { useOpeningPaneLane } from "../lib/chatLane.ts";
@@ -33,6 +35,7 @@ import { knownPreview, parsePreviewOffThread } from "../lib/markdownPreview.ts";
 import { outlineOf } from "../lib/markdownOutline.ts";
 import { hasPreview, type TextViewMode } from "../lib/textPreview.ts";
 import { useSheetSwipe } from "../lib/sheets.ts";
+import { usePhoneSheetBack } from "../lib/sheetHistory.ts";
 import { useSettings } from "../lib/settings.ts";
 import { readFilePreviewText, SOURCE_PREVIEW_LINES, type FilePreviewText } from "../lib/filePreviewText.ts";
 import { readerHref } from "../lib/fileReader.ts";
@@ -40,6 +43,7 @@ import type { FilePresentation } from "../lib/filePresentation.ts";
 import { getTransport } from "../lib/transport.ts";
 import { useResourceUrl, useResourceUrlState } from "../lib/useResourceUrl.ts";
 import { RelayResourceTooLargeError } from "../lib/relay/resources.ts";
+import { fileFailure, fileFailureText, type FileFailure } from "../lib/fileFailure.ts";
 
 type Preview = { status: "none" | "pending" | "failed" } | { status: "ready"; blocks: MarkdownBlock[] };
 
@@ -178,9 +182,17 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
   const [candidates, setCandidates] = useState<string[] | null>(null);
   // an HTML page shows as the page, or as its source when asked
   const [source, setSource] = useState(false);
+  // A page is drawn without its scripts until the person asks for them: for the file named here, and for as long
+  // as this viewer stays open (another file, a close or a reload starts without them again). `stopped`: the file
+  // whose scripts were taken away again because its frame took the keyboard (lib/usePageFocusGuard.ts).
+  const [scriptsFor, setScriptsFor] = useState<string | null>(null);
+  const [stopped, setStopped] = useState<string | null>(null);
+  const pageFrame = useRef<HTMLIFrameElement | null>(null);
   // a phone's one-row header keeps new tab, raw and download in a "More" menu of its own
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
+  // Back closes the menu, as Escape does, and the next one the file (its own entry, lib/useFileViewer.ts)
+  usePhoneSheetBack(() => setMoreOpen(false), moreOpen);
   // Escape closes it, Tab stays in it, and the focus goes back to the row that opened it
   // (docked beside the pane, the rest of the page stays reachable: no trap)
   // the popup opens with the focus on its content, not its first button: Space then plays a video or
@@ -192,7 +204,7 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
   // Settings → Chat width, Default: the Preview is as wide as the chat of the pane that opened it
   useOpeningPaneLane(surface, paneId === null ? null : paneStorageId(machineId, paneId));
   // a kind, not a message: it is said in the language of the moment it shows
-  const [error, setError] = useState<"missing" | "unreadable" | null>(null);
+  const [error, setError] = useState<FileFailure | null>(null);
   const [loaded, setLoaded] = useState<FilePreviewText | null>(null);
   // a line reference defaults to Code; otherwise Preview. A new path never paints the old choice.
   const [chosen, setChosen] = useState<{ path: string; mode: TextViewMode } | null>(null);
@@ -242,6 +254,12 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
       deadline = setTimeout(() => abort.abort(), budget.timeoutMs);
       try {
         const response = await getTransport().fetch(fileUrl(next.path, paneId), { signal: abort.signal, headers: { range: `bytes=0-${budget.bytes - 1}` } });
+        if (!response.ok && !(response.status === 416 && response.headers.get("content-range")?.trim() === "bytes */0")) {
+          // a JSON answer is the bridge's own small error (a PC gone away keeps its code); any other body is never read
+          if (response.headers.get("content-type")?.includes("application/json")) throw await errorFrom(fileUrl(next.path, paneId), response);
+          await response.body?.cancel();
+          throw new ApiError(fileUrl(next.path, paneId), response.status, response.statusText, null);
+        }
         clearTimeout(deadline);
         const timeoutMs = Math.max(1, budget.timeoutMs - (Date.now() - started));
         const body = await readFilePreviewText(response, budget.bytes, { signal: abort.signal, maxLines: budget.lines, timeoutMs, partialOnTimeout: true });
@@ -258,7 +276,7 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
         } catch { /* retain the file error when the target is not a readable directory */ }
       }
       if (cancelled) return;
-      setError(reason instanceof ApiError && reason.status === 404 ? "missing" : "unreadable");
+      setError(fileFailure(reason));
     });
     return () => { cancelled = true; clearTimeout(deadline); abort.abort(); };
   }, [target.path, paneId, fetchFileInfo, fileUrl, fetchDirectories, remote, saves]);
@@ -346,6 +364,12 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
   // whose bridge predates `render` answers with the source, which the frame shows as text
   const htmlPage = info !== null && info.kind === "text" && info.mime === "text/html";
   const pageUrl = `${url}&render=1`;
+  const pageScripts = htmlPage && !source && scriptsFor === info.path;
+  // beside the pane the app stays in reach, so a page with scripts must not take its keys; the popup holds the focus itself
+  const guard = usePageFocusGuard(pageFrame, docked && pageScripts, () => {
+    // at once, not at the next render: only taking the frame away gives the keys back
+    flushSync(() => { setScriptsFor(null); setStopped(info?.path ?? null); });
+  });
   const relay = getTransport().kind === "relay";
   const resource = useResourceUrlState(info !== null && info.kind !== "text" && info.kind !== "image" ? url : null);
   const urlSrc = relay ? resource.url : url;
@@ -457,7 +481,11 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
   const openingNote = <p className={openingWords === null ? "visually-hidden" : "file-viewer-note"} role="status">{openingWords}</p>;
   const body = (() => {
     if (directory !== null) return <DirectoryBrowser key={directory} start={directory} onOpenFile={onOpen ?? setPath} />;
-    if (error !== null) return <p className="file-viewer-note" role="alert">{error === "missing" ? t("No readable file at this path.") : t("The file could not be opened.")}</p>;
+    // the alert says what happened; the line under it, the way on (the PC away, or the file by another route)
+    if (error !== null) return <>
+      <p className="file-viewer-note" role="alert">{fileFailureText(error, t)}</p>
+      {error === "unreadable" && <p className="file-viewer-note file-viewer-note-hint">{t("Download it or open the raw file.")}</p>}
+    </>;
     if (candidates !== null) return <div className="file-viewer-choices">
       <p className="file-viewer-note">{t("Several files are named {name}:", { name: target.path.split("/").pop() ?? target.path })}</p>
       <ul>{candidates.map((candidate) => <li key={candidate}><button type="button" className="btn btn-ghost" onClick={() => setPath(candidate + path.slice(target.path.length))}>{candidate}</button></li>)}</ul>
@@ -465,8 +493,13 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
     if (info === null) return null;
     // the download link's own request never replaces a body that loaded (a ranged text preview, an image)
     const resourceError = resource.error ?? image.error;
-    if (resourceError) return <p className="file-viewer-note" role="alert">{resourceError instanceof RelayResourceTooLargeError
-      ? t("Too large to open on the phone - download on the PC") : t("The file could not be opened.")}</p>;
+    if (resourceError) return resourceError instanceof RelayResourceTooLargeError
+      ? <p className="file-viewer-note" role="alert">{t("Too large to open on the phone - download on the PC")}</p>
+      : <>
+        <p className="file-viewer-note" role="alert">{fileFailureText(fileFailure(resourceError), t)}</p>
+        {/* a relay video or PDF shares its one transfer with the download link: failed, that link has no address to offer */}
+        {fileFailure(resourceError) === "unreadable" && downloadHref !== null && <p className="file-viewer-note file-viewer-note-hint">{t("Download it or open the raw file.")}</p>}
+      </>;
     switch (info.kind) {
       case "image":
         return info.size > MAX_INLINE_IMAGE_BYTES
@@ -483,8 +516,22 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
           onDone={(saved) => { setEditing(false); setEditChanged(false); if (saved) setSaves((count) => count + 1); }} />;
         if (htmlPage && !source) return <>
           {!docked && modes}
-          {relay ? <RelayRenderedPage path={pageUrl} title={info.name} />
-            : <iframe className="file-viewer-page" src={pageSrc ?? undefined} sandbox="allow-scripts" title={info.name} />}
+          {/* The line stays in the document while the scripts run, clipped and without words: a status line that
+              appears together with its words is not announced, and "took the keyboard" has to be. */}
+          <div className={pageScripts ? "visually-hidden" : "file-viewer-scripts"}>
+            <span role="status">{pageScripts ? null : stopped === info.path ? t("This page took the keyboard, so its scripts are off again.") : t("Scripts in this page are off.")}</span>
+            {!pageScripts && <button type="button" className="btn btn-ghost" onClick={() => { setStopped(null); setScriptsFor(info.path); }}>{t("Run scripts")}</button>}
+          </div>
+          {/* The frame is a new one when the scripts come or go: a frame's sandbox is read as it loads. Without
+              `allow-scripts` the page's HTML and CSS still draw, and nothing in it runs. */}
+          {/* A press inside a frame is not seen from here. While the page with scripts does not have the focus by the
+              person's doing, its frame takes no pointer (`data-page-shield`), so the press comes to this box instead and
+              puts the focus in the page (usePageFocusGuard); the next press is the page's. */}
+          <div className="file-viewer-page-frame" data-page-shield={guard.shield ? "" : undefined} onClick={guard.shield ? guard.enter : undefined}>
+            {relay ? <RelayRenderedPage key={pageScripts ? "scripts" : "static"} path={pageUrl} title={info.name} scripts={pageScripts} frame={pageFrame} />
+              : <iframe key={pageScripts ? "scripts" : "static"} ref={pageFrame} className="file-viewer-page" src={pageSrc ?? undefined} sandbox={pageScripts ? "allow-scripts" : ""}
+                data-page-scripts={pageScripts ? "on" : "off"} title={info.name} />}
+          </div>
         </>;
         return <>
           {htmlPage && !docked && modes}
@@ -507,8 +554,9 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
   })();
 
   const Heading = page ? "h1" : "h2";
+  const locationTitle = remote ? `${machineId} · ${shownPath}` : shownPath;
   // where the file is and how much of it shows: under the name in a dialog, in the docked panel's toolbar
-  const meta = <p className="file-viewer-meta" title={shownPath}>
+  const meta = <p className="file-viewer-meta" title={locationTitle}>
     {/* a partial view is told by the size ("256 KB of 1.3 MB") in the warning color, beside an
         icon so the color is not the only sign; what it means is the tooltip (and read out) */}
     {info && (noticed
@@ -519,7 +567,7 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
       </span>
       : <span className="file-viewer-size">{formatBytes(info.size)}</span>)}
     {/* the dot is the folder's, so where the folder has no room left no dot dangles */}
-    {folder !== "" && <span className="file-viewer-path"><span dir="ltr">{info && <span className="file-viewer-dot" aria-hidden="true">·</span>}{folder}</span></span>}
+    {folder !== "" && <span className="file-viewer-path"><span dir="ltr">{info && <span className="file-viewer-dot" aria-hidden="true">·</span>}{remote ? `${machineId}:${folder}` : folder}</span></span>}
   </p>;
   // the file itself: a Markdown tab is the reader; raw and download keep the original bytes
   // A saved shell link opens the reader, which can establish its own channel after a reload.
@@ -542,6 +590,7 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
     {!docked && <div className="file-viewer-more" ref={moreRef}>
       <button type="button" className="icon-button file-viewer-action" aria-label={t("More")} title={t("More")} aria-haspopup="menu" aria-expanded={moreOpen} onClick={() => setMoreOpen((open) => !open)}><Ellipsis aria-hidden="true" /></button>
       {moreOpen && <div className="file-viewer-more-menu" role="menu" aria-label={t("More")} onKeyDown={moveInMore}>
+        <p className="file-viewer-more-path" title={locationTitle}><span dir="ltr">{locationTitle}</span></p>
         {!page && !appWindow && <a role="menuitem" className="file-viewer-more-item" href={newTabSrc ?? undefined} target="_blank" rel="noopener" onClick={() => closeMore(true)}><ExternalLink aria-hidden="true" />{t("Open in a new tab")}</a>}
         {(page || markdown) && !appWindow && <a role="menuitem" className="file-viewer-more-item" href={rawSrc ?? undefined} target="_blank" rel="noopener" onClick={() => closeMore(true)}><Code aria-hidden="true" />{t("Open raw file")}</a>}
         {!page && appWindow && <CopyLinkButton href={newTabHref} menuItem onDone={() => closeMore(true)} />}
@@ -557,14 +606,14 @@ export function FileViewer({ path: asked, paneId, onClose, onOpen, keyboardActiv
     ? <header className="file-viewer-header file-viewer-header-docked">
       <FileGlyph name={info?.name ?? shownPath} className="file-viewer-glyph" />
       {/* a long name is cut inside its stem, so its type stays in view */}
-      <h2 className="file-viewer-name"><span className="file-viewer-stem">{stem}</span>{extension}</h2>
+      <h2 className="file-viewer-name" title={locationTitle}><span className="file-viewer-stem">{stem}</span>{extension}</h2>
       <div className="file-viewer-actions">{fileActions}</div>
       {closeButton}
     </header>
     : <header className={"modal-header file-viewer-header file-viewer-header-stacked" + (page ? " file-reader-header" : "")}>
-      <div className="file-viewer-title">
+      <div className="file-viewer-title" title={locationTitle}>
         {/* a long name is cut inside its stem, so its type stays in view */}
-        <Heading className="modal-title"><span className="file-viewer-stem">{stem}</span>{extension}</Heading>
+        <Heading className="modal-title" title={locationTitle}><span className="file-viewer-stem">{stem}</span>{extension}</Heading>
         {meta}
       </div>
       <div className="file-viewer-actions">

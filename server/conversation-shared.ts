@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { closeSync, constants, fstatSync, openSync } from "node:fs";
 
-import type { ConversationMetadata, ConversationTurn } from "../shared/protocol.ts";
+import type { ConversationMetadata, ConversationResponse, ConversationTurn } from "../shared/protocol.ts";
 
 /**
  * A transcript is read a page at a time, the newest page re-read on every append
@@ -47,12 +48,100 @@ export class ConversationUnavailable extends Error {
   }
 }
 
+/** Why a pane's conversation could not be read, as the chat can say it (ConversationResponse.unavailable); undefined where it has no words for it. */
+export function unavailableReason(error: ConversationUnavailable): ConversationResponse["unavailable"] {
+  if (error.diagnostic === "agent_cwd_missing") return "no_folder";
+  // Copilot's own stages (a log cut or rewritten, a peer, an API refusal) are no "not recorded yet"
+  if (error.diagnostic !== undefined) return undefined;
+  switch (error.message) {
+    case "no_session_id": case "no_session_path": return "not_found";
+    case "no_recognized_transcript": return "no_reader";
+    // a file gone, and a file whose records no reader could take (Muse, Grok, Letta, Agy), alike
+    case "transcript_missing": case "transcript_unreadable": case "branch_unreadable": return "unreadable";
+    default: return undefined;
+  }
+}
+
 /** A read failed, but the pane still proves the same current conversation: retain the view and retry. */
 export class ConversationReadPending extends Error {
   constructor() {
     super("The conversation could not be read; try again shortly.");
     this.name = "ConversationReadPending";
   }
+}
+
+/**
+ * A file as it was authorized: its device and inode, exact (bigint, as a bigint stat gives them) or as numbers,
+ * which round 64-bit file indexes (Windows') and so tell only as much as a number stat does.
+ */
+export interface FileIdentity { dev: number | bigint; ino: number | bigint }
+
+/** Whether `opened` is the file `identity` names: exactly where both are bigint, else as numbers. */
+function sameFile(identity: FileIdentity, opened: FileIdentity): boolean {
+  const same = (a: number | bigint, b: number | bigint) => typeof a === "bigint" && typeof b === "bigint" ? a === b : Number(a) === Number(b);
+  return same(identity.dev, opened.dev) && same(identity.ino, opened.ino);
+}
+
+/**
+ * The files the synchronous read in progress is bound to, by path, each as it was authorized. An open of
+ * one that finds another file there (a folder swapped in around that open alone) is refused, so no bytes
+ * behind an answer come from a file nobody authorized (#3382). Null outside readBound.
+ */
+let boundFiles: Map<string, FileIdentity> | null = null;
+
+/** `read` with `files` bound (boundFiles) until it returns; a path an enclosing read bound keeps its binding. */
+export function readBound<T>(files: readonly (readonly [string, FileIdentity])[], read: () => T): T {
+  const outer = boundFiles;
+  boundFiles = new Map(outer ?? []);
+  for (const [path, identity] of files) bindFile(path, identity);
+  try { return read(); } finally { boundFiles = outer; }
+}
+
+/**
+ * `steps`, a reader that awaits between its steps, with `files` bound as readBound binds them through every
+ * step, after each await too; a file one step binds (bindFile) stays bound for the steps after it.
+ */
+export function* boundSteps<T>(files: readonly (readonly [string, FileIdentity])[], steps: Generator<void | Promise<void>, T, void>): Generator<void | Promise<void>, T, void> {
+  // the map readBound builds: the enclosing bindings and `files`
+  const bound = readBound(files, () => boundFiles!);
+  let failed: { error: unknown } | undefined;
+  for (;;) {
+    const outer = boundFiles;
+    boundFiles = bound;
+    let step: IteratorResult<void | Promise<void>, T>;
+    try { step = failed === undefined ? steps.next() : steps.throw(failed.error); }
+    finally { boundFiles = outer; }
+    failed = undefined;
+    if (step.done) return step.value;
+    // a read that fails fails where the steps wait for it, so their own cleanup runs
+    try { yield step.value; } catch (error) { failed = { error }; }
+  }
+}
+
+/** Binds `path` for the rest of the enclosing readBound, unless it is bound already; nothing outside one. */
+export function bindFile(path: string, identity: FileIdentity): void {
+  if (boundFiles !== null && !boundFiles.has(path)) boundFiles.set(path, { dev: identity.dev, ino: identity.ino });
+}
+
+/** Refuses `fd`, opened from `path`, when `path` is bound to another file: the read is pending. */
+export function checkBound(path: string, fd: number): void {
+  if (boundFiles?.has(path) === true) checkBoundFile(path, fstatSync(fd, { bigint: true }));
+}
+
+/** Refuses `opened`, a file opened from `path` (its stats), when `path` is bound to another file: the read is pending. */
+export function checkBoundFile(path: string, opened: FileIdentity): void {
+  const identity = boundFiles?.get(path);
+  if (identity !== undefined && !sameFile(identity, opened)) throw new ConversationReadPending();
+}
+
+/**
+ * openSync of `path`, closed and refused where it is bound to another file (checkBound). O_NONBLOCK: a FIFO
+ * put there is opened at once, for the check to refuse, never waited on.
+ */
+export function openBound(path: string, flags: number | string = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)): number {
+  const fd = openSync(path, flags);
+  try { checkBound(path, fd); } catch (error) { closeSync(fd); throw error; }
+  return fd;
 }
 
 /** The pane's agent holds a session it has not written yet: a conversation with no turns, not a missing one. */

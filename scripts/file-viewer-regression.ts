@@ -11,6 +11,16 @@ import { forgetPageMedia, PAGE_MEDIA_LIFETIME_MS, pageFileHooks, pageMediaRespon
 import { herdrRpc, workspaceClose, workspaceCreate } from "../server/herdr/client.ts";
 import { openSettingsPage } from "./settings-page.ts";
 
+/**
+ * Opens Settings from the keyboard with no pointer resting where it draws a row. A mouse left by an earlier click on a
+ * spot Settings comes to cover would open that row's sentence (SettingsControls' useRowSentence), which takes the next
+ * Escape for itself, as it should, and a check that Escape closes Settings would wait on it.
+ */
+async function openSettingsByKeys(page: Page): Promise<void> {
+  await page.mouse.move(0, 0);
+  await page.keyboard.press("ControlOrMeta+Shift+Comma");
+}
+
 /** a file action: its button in the header, or up to 600px the item in the header's More menu */
 async function fileAction(scope: Locator | Page, name: string): Promise<Locator> {
   const link = scope.getByRole("link", { name, exact: true });
@@ -20,7 +30,7 @@ async function fileAction(scope: Locator | Page, name: string): Promise<Locator>
   await item.waitFor();
   return item;
 }
-import { sheetsSettled } from "./sheets-settled.ts";
+import { sheetEntryLeft, sheetsSettled } from "./sheets-settled.ts";
 import { runMoreItem } from "./header-more.ts";
 import type { Machine } from "../shared/protocol.ts";
 import { chromePath } from "./chrome-path.ts";
@@ -41,6 +51,14 @@ const openFiles = async (page: import("playwright-core").Page) => {
 // read back first holds still: the follow undid one in looped runs. Steps that check history and
 // presentation, not pointer targeting, wait for the chat and activate the link where it is.
 const transcriptSettled = (page: Page) => page.locator(".chat-frame[data-pane-content]").waitFor({ state: "attached" });
+// A reload opens the chat where the reader left it (chatScrollMemory): one who clicked a link above the
+// end comes back there, and the chat presents nothing away from the end. The reloads before a step that
+// waits for the chat are a following reader's: the end, once the chat remembers it.
+const reloadFollowingEnd = async (page: Page): Promise<void> => {
+  await page.evaluate(() => { for (const node of document.querySelectorAll(".chat-view")) node.scrollTop = node.scrollHeight; });
+  await page.waitForFunction(() => (JSON.parse(sessionStorage.getItem("ovis:chat-positions") ?? "[]") as [string, { atEnd: boolean }][]).every(([, place]) => place.atEnd));
+  await page.reload();
+};
 const activateInTranscript = async (page: Page, link: Locator): Promise<void> => {
   await transcriptSettled(page);
   await link.dispatchEvent("click");
@@ -188,6 +206,17 @@ let otherWorkspace: string | undefined;
 let sideWorkspace: string | undefined;
 let server: ReturnType<typeof createServer> | undefined;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+
+/**
+ * A history state without the marks of a dialog's own entry (lib/sheetHistory.ts). This page is
+ * worked by touch, where a dialog holds an entry while it is up: the entry it opened over reads
+ * the same as the dialog's own once these are left out.
+ */
+const unmarked = (state: unknown): unknown => {
+  if (state === null || typeof state !== "object") return state;
+  const { "ovis:sheet": _sheet, "ovis:sheet-under": _under, ...rest } = state as Record<string, unknown>;
+  return rest;
+};
 
 try {
   // An unborn repository is enough for Changes to show the untracked file; no fixture commit.
@@ -390,6 +419,8 @@ try {
   assert.equal(await narrowGuide.count(), 1, "Escape closes the More menu, not the file");
   assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("aria-label")), "More", "and gives the focus back to More");
   if (process.env.UI_EVIDENCE_DIR) await page.screenshot({ path: join(process.env.UI_EVIDENCE_DIR, "mobile-markdown-320.png") });
+  // the menu's own entry goes first: a Back pressed before that would leave it, with the file still up
+  await sheetEntryLeft(page);
   await page.goBack();
   await narrowGuide.waitFor({ state: "hidden" });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -402,7 +433,7 @@ try {
     await videoLink.click();
     await preview.waitFor();
     const previewEntry = await page.evaluate(() => history.state["ovis:file-preview"]);
-    await page.keyboard.press("ControlOrMeta+Shift+Comma");
+    await openSettingsByKeys(page);
     const settings = page.getByRole("dialog", { name: "Settings", exact: true });
     await settings.waitFor();
     await page.waitForFunction(() => history.state?.["ovis:settings"] !== undefined);
@@ -428,6 +459,16 @@ try {
     // Settings has two stops on a phone (Close, and the one focusable tab of its roving list): Tab
     // moves between them; the trap beneath held it on the first
     assert.ok(new Set(focused).size >= 2 && focused[0] !== focused[1], `Tab moves through Settings at ${width}px: ${focused.join(" | ")}`);
+    // a desktop's walk ends on the open page's first setting, and the keyboard on a setting shows its row's
+    // sentence (#3275): Escape closes that sentence alone, then the next one closes Settings. A phone's walk stays
+    // on the list of pages, where no sentence shows
+    const sentence = page.locator(".settings-help");
+    assert.equal(await sentence.count(), width === 390 ? 0 : 1, `a setting's sentence shows only where the walk reached a setting, at ${width}px`);
+    if (width !== 390) {
+      await page.keyboard.press("Escape");
+      await sentence.waitFor({ state: "detached" });
+      assert.equal(await settings.isVisible(), true, `the first Escape closes the sentence, not Settings, at ${width}px`);
+    }
     await page.keyboard.press("Escape");
     await settings.waitFor({ state: "hidden" });
     await page.waitForFunction(() => history.state?.["ovis:settings"] === undefined);
@@ -441,7 +482,7 @@ try {
     // System Back follows the same order, preserving the document instead of closing the file.
     await videoLink.click();
     await preview.waitFor();
-    await page.keyboard.press("ControlOrMeta+Shift+Comma");
+    await openSettingsByKeys(page);
     await settings.waitFor();
     await page.waitForFunction(() => history.state?.["ovis:settings"] !== undefined);
     await page.goBack();
@@ -459,7 +500,7 @@ try {
   await page.setViewportSize({ width: 1280, height: 800 });
   await videoLink.click();
   await preview.waitFor();
-  await page.keyboard.press("ControlOrMeta+Shift+Comma");
+  await openSettingsByKeys(page);
   const settingsOverPreview = page.getByRole("dialog", { name: "Settings", exact: true });
   await settingsOverPreview.waitFor();
   await openSettingsPage(page, "Devices and PCs");
@@ -497,7 +538,7 @@ try {
   // With no preview beneath it, Settings stays on the layer every dialog shares, so the palette
   // its shortcut opens is drawn above Settings instead of taking focus and Escape unseen.
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.keyboard.press("ControlOrMeta+Shift+Comma");
+  await openSettingsByKeys(page);
   const settingsAlone = page.getByRole("dialog", { name: "Settings", exact: true });
   await settingsAlone.waitFor();
   await page.waitForFunction(() => history.state?.["ovis:settings"] !== undefined);
@@ -522,7 +563,7 @@ try {
   // focus and Escape, so it must not be drawn beneath either of them.
   await videoLink.click();
   await preview.waitFor();
-  await page.keyboard.press("ControlOrMeta+Shift+Comma");
+  await openSettingsByKeys(page);
   await settingsAlone.waitFor();
   await page.waitForFunction(() => history.state?.["ovis:settings"] !== undefined);
   await page.keyboard.press("ControlOrMeta+Shift+K");
@@ -558,7 +599,7 @@ try {
       const { fileOpen: _, ...settings } = JSON.parse(localStorage.getItem("ovis:settings") ?? "{}") as Record<string, unknown>;
       localStorage.setItem("ovis:settings", JSON.stringify(fileOpen === null ? settings : { ...settings, fileOpen }));
     }, fileOpen);
-    await page.reload();
+    await reloadFollowingEnd(page);
   };
   // with Open files at its default, even text opens in the popup; Beside the pane is a choice
   await setFileOpen(null);
@@ -644,7 +685,7 @@ try {
   assert.ok(Math.abs(stored - (before + 100)) <= 2, `dragging the edge 100px widens the panel 100px: ${before} -> ${stored}`);
   await page.waitForFunction((want) => Math.abs((document.querySelector("aside.file-panel")?.getBoundingClientRect().width ?? 0) - want) <= 1, stored);
   // a reload restores the file from its entry, at the stored width
-  await page.reload();
+  await reloadFollowingEnd(page);
   await panel.getByText("File preview history regression", { exact: true }).waitFor();
   assert.ok(Math.abs(await panelWidth() - stored) <= 1, `a reload keeps the dragged width: ${await panelWidth()} vs ${stored}`);
   // a double-click on the edge puts the default width back and forgets the stored one, so the
@@ -664,6 +705,8 @@ try {
   for (const close of ["Close file", "Escape"]) {
     await activateInTranscript(page, contentsLink);
     const framed = page.frameLocator(".file-viewer-page");
+    // a page's scripts wait for the person: the panel says so, and the press runs them
+    await panel.getByRole("button", { name: "Run scripts", exact: true }).click();
     await framed.getByText("contents ran", { exact: true }).waitFor();
     const opened = await page.evaluate(() => history.length);
     // the frame's own navigation is under test, not where the panel lays the frame out: a pointer
@@ -822,7 +865,8 @@ try {
   await filesDialog.waitFor({ state: "detached" });
   await panel.getByRole("button", { name: "Close file", exact: true }).click();
   await panel.waitFor({ state: "detached" });
-  assert.deepEqual(await page.evaluate(() => history.state), beforeMediaDiff, "moving a stacked popup to the panel hands off the diff entry; one Close returns to its opener");
+  // Files, the diff's opener, closed as the file docked: the history is on the entry Files opened over
+  assert.deepEqual(unmarked(await page.evaluate(() => history.state)), unmarked(beforeMediaDiff), "moving a stacked popup to the panel hands off the diff entry; one Close returns to its opener");
   // two clicks on Show beside the pane before the first has landed (or a text file's automatic
   // move in the same moment) collapse the stack once, not twice: a second pair of steps would
   // land on the pane moves above and open the file a second time
@@ -838,7 +882,7 @@ try {
   await mediaDiff.waitFor({ state: "detached" });
   await panel.getByRole("button", { name: "Close file", exact: true }).click();
   await panel.waitFor({ state: "detached" });
-  assert.deepEqual(await page.evaluate(() => ({ state: history.state, pane: new URLSearchParams(location.search).get("pane") })), { state: beforeMediaDiff, pane }, "two clicks collapse once: one Close returns to the diff's opener, on the same pane");
+  assert.deepEqual(await page.evaluate(() => ({ state: history.state, pane: new URLSearchParams(location.search).get("pane") })).then(({ state, pane }) => ({ state: unmarked(state), pane })), { state: unmarked(beforeMediaDiff), pane }, "two clicks collapse once: one Close returns to the diff's opener, on the same pane");
   await openFiles(page);
   await filesDialog.getByRole("button", { name: "Changes", exact: true }).click();
   await filesDialog.locator(".repo-change").filter({ hasText: "preview.webm" }).click();
@@ -848,7 +892,9 @@ try {
   await filesDialog.getByRole("button", { name: "Close files", exact: true }).click();
   await filesDialog.waitFor({ state: "detached" });
   console.log("PASS a wide video handoff stacks above the diff and Close file returns to the diff, also after two clicks");
-  // back over the two pane moves, so the steps after this one start from the pane's own entry
+  // back over the two pane moves, so the steps after this one start from the pane's own entry,
+  // once Files, closed by its button, is off its own
+  await sheetEntryLeft(page);
   await page.goBack();
   await page.waitForFunction((paneId) => new URLSearchParams(location.search).get("pane") === paneId, otherPane);
   await page.goBack();
@@ -862,7 +908,7 @@ try {
       const { reopenFileOnReturn: _, ...settings } = JSON.parse(localStorage.getItem("ovis:settings") ?? "{}") as Record<string, unknown>;
       localStorage.setItem("ovis:settings", JSON.stringify(on ? { ...settings, reopenFileOnReturn: true } : settings));
     }, on);
-    await page.reload();
+    await reloadFollowingEnd(page);
     await videoLink.waitFor();
     if (await showSidebar.count()) await showSidebar.click();
     await rowOf(otherPane).waitFor();
@@ -994,7 +1040,12 @@ try {
     await page.setViewportSize({ width, height: 800 });
     await openFiles(page);
     await filesDialog.getByRole("button", { name: "Changes", exact: true }).click();
-    const beforeDiff = await page.evaluate(() => ({ state: history.state, url: location.href }));
+    // Files is up, and on this touch screen holds an entry of its own: where the history is, without a dialog's marks
+    const whereNow = async (): Promise<{ state: unknown; url: string }> => {
+      const { state, url } = await page.evaluate(() => ({ state: history.state as unknown, url: location.href }));
+      return { state: unmarked(state), url };
+    };
+    const beforeDiff = await whereNow();
     await filesDialog.locator(".repo-change").filter({ hasText: "notes.txt" }).click();
     const diff = page.locator(".repo-diff-viewer");
     await diff.waitFor();
@@ -1028,7 +1079,8 @@ try {
     await close.click();
     await panel.waitFor({ state: "detached" });
     assert.equal(await diff.count(), 0, "one Close file does not uncover the diff");
-    assert.deepEqual(await page.evaluate(() => ({ state: history.state, url: location.href })), beforeDiff, "one Close file returns to where the diff opened");
+    // Files closed as the file took the diff's place: the history is on the entry Files opened over
+    assert.deepEqual(await whereNow(), beforeDiff, "one Close file returns to where the diff opened");
     await page.goForward();
     await panel.getByText("File preview history regression", { exact: true }).waitFor();
     await page.reload();
@@ -1036,7 +1088,7 @@ try {
     assert.equal(await page.locator(".repo-diff-scrim, .files-dialog").count(), 0, "reload restores only the file panel");
     await page.goBack();
     await panel.waitFor({ state: "detached" });
-    assert.deepEqual(await page.evaluate(() => ({ state: history.state, url: location.href })), beforeDiff, "one Back consumes the handed-off entry after reload");
+    assert.deepEqual(await whereNow(), beforeDiff, "one Back consumes the handed-off entry after reload");
     console.log(`PASS real App ${width}px diff -> readable file closes both dialogs, exposes Close file, replaces history, reloads, and consumes one Close/Back without a stale diff`);
   }
   await page.setViewportSize({ width: 390, height: 844 });
@@ -1044,7 +1096,7 @@ try {
   await page.getByRole("button", { name: "notes", exact: true }).click();
   const notes = page.getByRole("dialog", { name: "notes.txt", exact: true });
   await notes.getByText("File preview history regression", { exact: true }).waitFor();
-  await page.reload();
+  await reloadFollowingEnd(page);
   await notes.getByText("File preview history regression", { exact: true }).waitFor();
   await page.goBack();
   await notes.waitFor({ state: "hidden" });
@@ -1100,13 +1152,13 @@ try {
   });
   const chatText = await textStyle(".chat-transcript .chat-turn-agent .markdown");
   const previewText = await textStyle(".file-viewer-markdown");
-  // --fs-chat (15px), the size of prose read at length, at the chat's scale, 17 / 14
-  assert.ok(Math.abs(Number.parseFloat(chatText.fontSize) - 15 * 17 / 14) < 0.05, `the chat font size is applied in the chat: ${chatText.fontSize}`);
+  // a finger's screen reads the chat's prose one step up, --fs-lg (16px), at the chat's scale, 17 / 14
+  assert.ok(Math.abs(Number.parseFloat(chatText.fontSize) - 16 * 17 / 14) < 0.05, `the chat font size is applied in the chat: ${chatText.fontSize}`);
   assert.match(chatText.fontFamily, /^Georgia,/);
   assert.equal(previewText.fontSize, chatText.fontSize, "the preview's text has the chat's font size");
   assert.equal(previewText.fontFamily, chatText.fontFamily, "the preview's text has the chat's font");
-  // --fs-xl (18px) at the chat's scale, 17 / 14
-  assert.ok(Math.abs(Number.parseFloat(previewText.headingSize ?? "") - 18 * 17 / 14) < 0.05, `its headings scale with it: ${previewText.headingSize}`);
+  // --md-h1-size (30px) at the chat's scale, 17 / 14
+  assert.ok(Math.abs(Number.parseFloat(previewText.headingSize ?? "") - 30 * 17 / 14) < 0.05, `its headings scale with it: ${previewText.headingSize}`);
   assert.equal(await page.locator(".file-viewer-markdown").evaluate((element) => getComputedStyle(element).maxWidth), "820px", "Default is the chat's Default lane");
   // on a wide screen the Default lane follows the pane (71.43% of it, up to 60rem): the preview
   // follows with it, as wide as the chat beside it, not the 820px floor. The file is a panel beside
@@ -1217,7 +1269,7 @@ try {
     const settings = JSON.parse(localStorage.getItem("ovis:settings") ?? "{}") as Record<string, unknown>;
     localStorage.setItem("ovis:settings", JSON.stringify({ ...settings, wrapCode: true }));
   });
-  await page.goto(`${origin}/?pane=${encodeURIComponent(pane)}`);
+  await reloadFollowingEnd(page);
   await page.locator(".conn-live").waitFor();
   // the reloaded chat's follow to its end can take the link from under a pointer
   await activateInTranscript(page, page.getByRole("button", { name: "big code", exact: true }));
@@ -1514,8 +1566,15 @@ try {
       // nor does the document's own tab, for a PC that is not set up here
       const readerPage = await ownerContext.newPage();
       await readerPage.goto(`${origin}/?read=${encodeURIComponent(markdownPath)}&machine=${target}`);
-      await readerPage.locator(".file-reader .file-viewer-note").waitFor();
+      // The settled alert names the offline PC (503 machine_offline), without a generic error above it.
+      await readerPage.locator(".file-reader .file-viewer-note[role=alert]").waitFor();
+      assert.deepEqual(await readerPage.locator(".file-reader .file-viewer-note").allTextContents(), ["That PC is not reachable right now."]);
       assert.equal(fileRequests.some((path) => path.startsWith("/api/fs/")), false, "the reader never reads the local file for another PC");
+      const rawLink = await readerPage.getByRole("link", { name: "Open raw file", exact: true }).getAttribute("href");
+      assert.ok(rawLink, "the offline reader keeps its raw-file recovery route");
+      const rawUrl = new URL(rawLink, origin);
+      assert.equal(rawUrl.pathname, "/api/machines/missing-fixture/fs/file", "recovery stays on the file's PC");
+      assert.equal(rawUrl.searchParams.get("path"), markdownPath, "recovery keeps the requested file");
       await readerPage.close();
     } else {
       await ownerPage.locator(".file-viewer-markdown").getByRole("heading", { name: "Markdown preview", exact: true }).waitFor();
@@ -1632,6 +1691,11 @@ try {
   await page.locator(".work-row-detail .chat-tool-io pre").getByRole("button", { name: "shots/report.html", exact: true }).first().tap();
   const report = page.getByRole("dialog", { name: "report.html", exact: true });
   const frame = page.frameLocator(".file-viewer-page");
+  // the page is drawn without its scripts first: the frame allows none, and the line above it offers them
+  await report.locator(".file-viewer-page").waitFor();
+  assert.equal(await report.locator(".file-viewer-page").getAttribute("sandbox"), "", "a page's scripts do not run by themselves");
+  assert.equal(await report.locator(".file-viewer-scripts").innerText().then((text) => text.replace(/\s+/g, " ").trim()), "Scripts in this page are off. Run scripts");
+  await report.getByRole("button", { name: "Run scripts", exact: true }).click();
   await frame.getByText("script ran", { exact: true }).waitFor();
   await frame.getByText("network blocked", { exact: true }).waitFor();
   await frame.getByText("no storage", { exact: true }).waitFor();
@@ -1670,6 +1734,7 @@ try {
   const contents = page.getByRole("dialog", { name: "toc.html", exact: true });
   for (const close of ["Close file", "scrim"]) {
     await contentsLink.tap();
+    await contents.getByRole("button", { name: "Run scripts", exact: true }).click();
     await frame.getByText("contents ran", { exact: true }).waitFor();
     // the sheet is still rising when the page shows: a click aimed into the frame meanwhile lands beside the anchor
     await sheetsSettled(page);
@@ -1698,7 +1763,8 @@ try {
   await page.getByRole("button", { name: "notes", exact: true }).click();
   const refused = page.getByRole("dialog", { name: "notes.txt", exact: true });
   await refused.getByRole("alert").waitFor();
-  assert.equal(await refused.getByRole("alert").innerText(), "The file could not be opened.");
+  // a PC dropped mid-read keeps its machine code (lib/fileFailure.ts): the alert names the PC as away
+  assert.equal(await refused.getByRole("alert").innerText(), "That PC is not reachable right now.");
   assert.equal(await refused.getByText("machine_unavailable").count(), 0);
   assert.equal(await refused.locator(".file-viewer-text").count(), 0);
   console.log("PASS A file whose body is refused shows an error, not the error's JSON");
@@ -1742,6 +1808,8 @@ try {
     }), query);
     const openPage = async () => {
       await mediaLink.tap();
+      // the recording is read from inside the frame, which takes the page's scripts being on
+      await mediaPage.getByRole("button", { name: "Run scripts", exact: true }).click();
       const address = await recording.getAttribute("src") ?? "";
       assert.match(address, new RegExp(`^${origin}/api/fs/page-media/[A-Za-z0-9_-]{32}$`), "the recording plays from its address");
       assert.equal(await loads(), "loaded");
@@ -1877,7 +1945,7 @@ try {
     await webReportLink.tap();
     const popup = reportPage.locator(".web-panel-popup");
     await popup.waitFor();
-    await reportPage.keyboard.press("ControlOrMeta+Shift+Comma");
+    await openSettingsByKeys(reportPage);
     const settings = reportPage.getByRole("dialog", { name: "Settings", exact: true });
     await settings.waitFor();
     await reportPage.waitForFunction(() => history.state?.["ovis:settings"] !== undefined);
@@ -1908,7 +1976,7 @@ try {
   await reportPage.setViewportSize({ width: 1280, height: 800 });
   await webReportLink.click();
   await reportPage.locator(".web-panel").waitFor();
-  await reportPage.keyboard.press("ControlOrMeta+Shift+Comma");
+  await openSettingsByKeys(reportPage);
   const settingsOverDocked = reportPage.getByRole("dialog", { name: "Settings", exact: true });
   await settingsOverDocked.waitFor();
   await reportPage.setViewportSize({ width: 900, height: 800 });

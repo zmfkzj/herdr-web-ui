@@ -9,6 +9,7 @@ import { chromePath } from "./chrome-path.ts";
 import { contextMenuKey } from "./context-menu-key.ts";
 import type { Machine } from "../shared/machines.ts";
 import type { AgentStatus, ConversationResponse, ServerMessage } from "../shared/protocol.ts";
+import { openLens } from "./header-lens.ts";
 
 declare global {
   interface Window {
@@ -246,6 +247,8 @@ const API = "Idempotent payments";        // claude, working, finishes by itself
 const WEB = "Guard the export button";    // codex, blocked
 const INFRA = "Plan the config file";     // omp, idle: the agent a message is sent from
 const AGENTS_HERDR_ORDER = [API, WEB, "Fix the flaky retry test", INFRA, "Ship the retry flag", "Draft the changelog"];
+// the list on one line (the default): the waiting agent leads, the rest keep herdr's order
+const AGENTS_LIST_ORDER = [WEB, ...AGENTS_HERDR_ORDER.filter((title) => title !== WEB)];
 
 const agents = (page: Page) => page.locator(".agents-sidebar .agent-item");
 const agentTitles = (page: Page) => agents(page).locator(".agent-title").allTextContents();
@@ -269,6 +272,8 @@ async function withPage(browser: Browser, settings: object, run: (page: Page) =>
   try {
     await context.addInitScript((stored) => {
       localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", defaultView: "chat", ...stored }));
+      // idle agents are picked here: the one-line list folds them under its resting line, opened on this device as its toggle keeps it
+      localStorage.setItem("ovis:agents-resting-open", "1");
     }, settings);
     const page = await context.newPage();
     const errors: string[] = [];
@@ -367,7 +372,7 @@ try {
             return window.sidebarFixture.finish(id, "done", 103);
           }, panes.omp);
           await agent(page, INFRA).locator(".agent-select").click();
-          await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+          await openLens(page, "terminal");
           await waitStatus(page, INFRA, "idle");
           await page.locator(".pane-frame.is-current .terminal-stack[data-pane-content]").waitFor();
           assert.equal(await page.locator(".pane-frame.is-current .terminal-stack").evaluate((node, previous) => node === previous, retained), true,
@@ -419,7 +424,7 @@ try {
           }, panes.omp);
           await waitStatus(page, INFRA, "done");
           await agent(page, INFRA).locator(".agent-select").click();
-          await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+          await openLens(page, "terminal");
           const content = page.locator(".pane-frame.is-current .terminal-stack[data-pane-content]");
           await page.locator(".pane-frame.is-current .terminal-stack:not(.is-chat)").waitFor();
           await outputParsed(page, "previous answer\r\n");
@@ -441,7 +446,7 @@ try {
             window.sidebarFixture.block(id, "loading");
           }, panes.omp);
           await agent(page, INFRA).locator(".agent-select").click();
-          await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+          await openLens(page, "terminal");
           const content = page.locator(".pane-frame.is-current .terminal-stack[data-pane-content]");
           await page.locator(".pane-frame.is-current .terminal-stack:not(.is-chat)").waitFor();
           await outputParsed(page, "previous answer\r\n");
@@ -466,7 +471,7 @@ try {
             window.sidebarFixture.block(id, "loading");
           }, panes.omp);
           await agent(page, INFRA).locator(".agent-select").click();
-          await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+          await openLens(page, "terminal");
           const content = page.locator(".pane-frame.is-current .terminal-stack[data-pane-content]");
           await page.locator(".pane-frame.is-current .terminal-stack:not(.is-chat)").waitFor();
           await page.waitForFunction((id) => (window.sidebarFixture.attaches[id] ?? 0) > 0, panes.omp);
@@ -767,12 +772,12 @@ try {
           await page.getByRole("button", { name: "Jump to latest", exact: true }).waitFor();
           if (arrival === "restore") {
             const height = await log.evaluate((node) => node.scrollHeight * 3 + 2000);
-            await page.getByTitle("Live terminal (⌘⇧J)", { exact: true }).click();
+            await openLens(page, "terminal");
             await page.setViewportSize({ width: 390, height });
             await page.evaluate(() => document.addEventListener("scroll", (event) => {
               if (event.target instanceof Element && event.target.matches('[role="log"]')) event.stopImmediatePropagation();
             }, true));
-            await page.getByTitle("Chat transcript (⌘⇧J)", { exact: true }).click();
+            await openLens(page, "chat");
             await page.locator(".chat-turn").first().waitFor();
             await page.evaluate((id) => window.sidebarFixture.finish(id, "done", 101), panes.omp);
             await statusIs("idle");
@@ -865,7 +870,7 @@ try {
       // Workspace menus no longer mix in pane operations; header More keeps pane movement.
       // herdr's order in a flat list, each row naming its own workspace, with its row and its ⋯
       await withPage(browser, {}, async (page) => {
-        assert.deepEqual(await agentTitles(page), AGENTS_HERDR_ORDER);
+        assert.deepEqual(await agentTitles(page), AGENTS_LIST_ORDER);
         assert.match(await agent(page, API).locator(".agent-context").textContent() ?? "", /checkout-api/, "a row names its workspace");
         // a desktop draws no row ⋯: a right-click or the context-menu key opens the menu
         assert.equal(await agent(page, API).getByRole("button").count(), 1, "a desktop row is its selector alone");
@@ -924,7 +929,7 @@ try {
             if (mobile) await page.locator(`.workspace-group[data-workspace="${headId}"] > .workspace-header .row-menu-toggle`).tap();
             else await head.click({ button: "right" });
             const label = pin ? "Pin workspace" : "Unpin workspace";
-            const panel = page.getByRole(mobile ? "dialog" : "menu");
+            const panel = page.locator(mobile ? ".row-sheet" : ".row-menu");
             if (mobile) await panel.getByRole("button", { name: label, exact: true }).tap();
             else await panel.getByRole("menuitem", { name: label, exact: true }).click();
             await panel.waitFor({ state: "detached" });
@@ -972,7 +977,7 @@ try {
         await workspace.click({ button: "right", position: { x: 32, y: bounds.height / 2 } });
         const menu = page.getByRole("menu", { name: "checkout-api", exact: true });
         await menu.waitFor();
-        assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close group", "New worktree", "Open worktree…", "Collapse"], "right-click on a repository uses its group scope");
+        assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "New tab with agent…", "Rename workspace", "Earlier sessions…", "Close group", "New worktree", "Open worktree…", "Collapse"], "right-click on a repository uses its group scope");
         const opened = (await menu.boundingBox())!;
         assert.ok(Math.abs(opened.x - bounds.x - 32) <= 1 && Math.abs(opened.y - bounds.y - bounds.height / 2) <= 1, "the menu opens at the pointer");
         assert.equal(await page.evaluate(() => sessionStorage.getItem("ovis:selection")), selected, "right-click leaves the selected pane alone");
@@ -981,7 +986,7 @@ try {
         await workspace.focus();
         await contextMenuKey(page);
         await menu.waitFor();
-        assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close group", "New worktree", "Open worktree…", "Collapse"], "the context-menu key and right-click have identical items");
+        assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "New tab with agent…", "Rename workspace", "Earlier sessions…", "Close group", "New worktree", "Open worktree…", "Collapse"], "the context-menu key and right-click have identical items");
         await page.keyboard.press("Escape");
         const pins = () => page.evaluate(() => JSON.parse(localStorage.getItem("ovis:sidebar-agent-pins") ?? "[]") as string[]);
         // a pinned workspace leaves its place for a card at the top of its PC's list, and returns unpinned
@@ -1014,7 +1019,7 @@ try {
         assert.deepEqual(await agentMenu.getByRole("menuitem").allTextContents(), ["Pin agent"], "an agent's right-click menu offers its pin");
         await agentMenu.getByRole("menuitem", { name: "Pin agent" }).click();
         await page.waitForFunction((key) => JSON.parse(localStorage.getItem("ovis:sidebar-agent-pins") ?? "[]").includes(key), `local:${panes.omp}`);
-        assert.deepEqual(await agentTitles(page), [INFRA, ...AGENTS_HERDR_ORDER.filter((title) => title !== INFRA)], "a pinned agent moves to the top, the rest keep herdr's order");
+        assert.deepEqual(await agentTitles(page), [INFRA, ...AGENTS_LIST_ORDER.filter((title) => title !== INFRA)], "a pinned agent moves to the top, the rest keep the list's order");
         assert.equal(await page.evaluate(() => sessionStorage.getItem("ovis:selection")), selected, "pinning does not select the agent");
         assert.equal(await page.locator(".header-more-button").evaluate((button) => document.activeElement === button), true, "the menu hands focus back where it was");
         await page.reload();
@@ -1031,7 +1036,7 @@ try {
         await page.keyboard.press("Enter");
         await page.waitForFunction(() => JSON.parse(localStorage.getItem("ovis:sidebar-agent-pins") ?? "[]").length === 0);
         assert.deepEqual(await pins(), []);
-        assert.deepEqual(await agentTitles(page), AGENTS_HERDR_ORDER, "unpin restores the source order");
+        assert.deepEqual(await agentTitles(page), AGENTS_LIST_ORDER, "unpin restores the source order");
         assert.equal(await infraSelect.evaluate((button) => document.activeElement === button), true, "focus returns to the row as it moves back");
         assert.equal(await page.locator(".row-menu, .row-sheet").count(), 0, "the menu closes after its item runs");
         // pinned, an agent stands first, in a list named Pinned under the Agents head alone
@@ -1046,10 +1051,12 @@ try {
         await apiMenu.getByRole("menuitem", { name: "Unpin agent" }).click();
         await page.waitForFunction(() => JSON.parse(localStorage.getItem("ovis:sidebar-agent-pins") ?? "[]").length === 0);
         assert.equal(await page.locator(".agents-sidebar .agent-list-pinned").count(), 0, "the pinned list goes with the last pin");
-        assert.deepEqual(await agentTitles(page), AGENTS_HERDR_ORDER);
+        assert.deepEqual(await agentTitles(page), AGENTS_LIST_ORDER);
         console.log("PASS workspace right-click scope, pointer anchor and focus; the context-menu key opens the same menu; a workspace pins into a card and returns to herdr's order; an agent pins and unpins from its right-click menu and the key");
         await waitStatus(page, API, "done");
-        assert.deepEqual(await agentTitles(page), AGENTS_HERDR_ORDER, "a finish does not move an agent");
+        // the classic style's unread-finish dot stays drawn on the compact rows
+        assert.ok(await agent(page, API).locator('.sidebar-status[data-status="done"] .sidebar-status-dot').isVisible(), "an unread finish keeps its dot");
+        assert.deepEqual(await agentTitles(page), AGENTS_LIST_ORDER, "a finish does not move an agent");
         await agentSelect.click();
         await page.waitForFunction((paneId) => JSON.parse(sessionStorage.getItem("ovis:selection") ?? "{}").pane_id === paneId, panes.api, { timeout: 5_000 });
         assert.equal(await agentSelect.getAttribute("aria-current"), "true", "ordinary click still selects the agent");
@@ -1057,7 +1064,7 @@ try {
         await waitStatus(page, API, "idle");
         const rollUp = () => page.locator(`.workspace-select[data-pane="${panes.api}"] .sidebar-status`).getAttribute("data-status");
         assert.notEqual(await rollUp(), "done", "the workspace row's roll-up drops the opened finish too");
-        assert.deepEqual(await agentTitles(page), AGENTS_HERDR_ORDER, "reading a finish does not move an agent");
+        assert.deepEqual(await agentTitles(page), AGENTS_LIST_ORDER, "reading a finish does not move an agent");
       });
       console.log("PASS the Agents list keeps herdr's order through a finish, and an opened DONE reads as ready");
 
@@ -1098,6 +1105,8 @@ try {
 
         // a message sent from an agent takes it to the top while it runs ...
         await agent(page, INFRA).locator(".agent-select").click();
+        // Rows keep their order while the pointer is over Agents; leave it before checking activity order.
+        await page.locator(".composer-text").click();
         await page.locator(".composer-text").fill("Check the plan again");
         await page.locator(".composer-text").press("Enter");
         await waitStatus(page, INFRA, "working");

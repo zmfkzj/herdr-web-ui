@@ -1,4 +1,286 @@
 {
+  "0.5.4": {
+    "en": {
+      "new": [
+        "An agent inbox lists every agent, the ones that need you first.",
+        "Settings explains each setting where you look: hover, focus or tap.",
+        "Plan limits show Claude accounts used through Oh My Pi or Gajae Code.",
+        "Antigravity's questions show as cards you can answer in Chat.",
+        "Close pane and Close tab can be bound to keys in Settings."
+      ],
+      "improved": [
+        "Installers and remote PCs run one verified, compiled server.",
+        "On a phone, the tabs are a row under the header again.",
+        "On a phone, the + for a new workspace is on each PC's row.",
+        "The Android app is on Google Play and the iPhone app on the App Store.",
+        "Every agent row shows how long its agent has been in its state."
+      ],
+      "fixed": [
+        "Ovis asks to pair when this PC opens it by a name other than localhost",
+        "Files from another PC open with this server's own protections",
+        "A chat message no longer joins text already typed in an agent's box.",
+        "Codex and Claude Code errors show under the message in Chat.",
+        "On a phone, Back closes what is open before it leaves the page."
+      ]
+    },
+    "ko": {
+      "new": [
+        "에이전트 인박스가 모든 에이전트를, 나를 기다리는 것부터 보여 줘요.",
+        "설정의 각 항목이 무엇을 하는지 마우스·포커스·탭으로 바로 알려 줘요.",
+        "Oh My Pi나 Gajae Code로만 쓰는 Claude 계정의 사용 한도도 보여요.",
+        "Antigravity의 질문이 채팅에서 답할 수 있는 카드로 보여요.",
+        "패널 닫기와 탭 닫기를 설정에서 단축키로 지정할 수 있어요."
+      ],
+      "improved": [
+        "설치기와 원격 PC가 검증된 하나의 컴파일된 서버로 돌아가요.",
+        "휴대폰에서 탭이 다시 헤더 아래 한 줄로 보여요.",
+        "휴대폰에서 새 워크스페이스 + 가 각 PC 줄에 있어요.",
+        "Android 앱이 Google Play에, iPhone 앱이 App Store에 나왔어요.",
+        "에이전트 줄마다 지금 상태로 얼마나 있었는지 보여요."
+      ],
+      "fixed": [
+        "이 PC에서 localhost가 아닌 이름으로 열면 먼저 페어링을 요청해요.",
+        "다른 PC의 파일이 이 서버의 보호 설정으로 열려요.",
+        "채팅 메시지가 에이전트 입력창에 이미 쓴 글에 붙어 가지 않아요.",
+        "Codex와 Claude Code의 오류가 채팅의 메시지 아래에 보여요.",
+        "휴대폰에서 뒤로 가기가 열린 것을 먼저 닫고 나서 페이지를 떠나요."
+      ]
+    },
+    "ja": {
+      "new": [
+        "エージェントの受信箱が、対応待ちのものから全エージェントを並べます。",
+        "設定の各項目の説明が、ホバー・フォーカス・タップでその場に出ます。",
+        "Oh My Pi や Gajae Code だけで使う Claude アカウントの上限も出ます。",
+        "Antigravity の質問が、チャットで答えられるカードで出ます。",
+        "ペインを閉じる・タブを閉じるに設定でキーを割り当てられます。"
+      ],
+      "improved": [
+        "インストーラーとリモート PC が、検証済みの 1 つのコンパイル済みサーバーで動きます。",
+        "スマホで、タブが再びヘッダーの下に 1 列で並びます。",
+        "スマホで、新しいワークスペースの + が各 PC の行にあります。",
+        "Android アプリは Google Play、iPhone アプリは App Store で公開されました。",
+        "各エージェントの行に、今の状態がどれだけ続いているかが出ます。"
+      ],
+      "fixed": [
+        "このPCで localhost 以外の名前で開くと、先にペアリングを求めます。",
+        "別のPCのファイルが、このサーバー自身の保護設定で開きます。",
+        "チャットのメッセージが、エージェントの入力欄の書きかけに付かなくなりました。",
+        "Codex と Claude Code のエラーが、チャットのメッセージの下に出ます。",
+        "スマホで、戻るは開いているものを閉じてからページを離れます。"
+      ]
+    },
+    "zh": {
+      "new": [
+        "智能体收件箱列出所有智能体，需要你的排在最前。",
+        "设置中的每一项在悬停、聚焦或轻点时说明它的作用。",
+        "仅通过 Oh My Pi 或 Gajae Code 使用的 Claude 账户也显示用量限制。",
+        "Antigravity 的提问显示为可在聊天中回答的卡片。",
+        "关闭窗格和关闭标签页可在设置中绑定快捷键。"
+      ],
+      "improved": [
+        "安装程序和远程 PC 运行一个经过验证的编译版服务器。",
+        "在手机上，标签页重新显示为页眉下的一行。",
+        "在手机上，新建工作区的 + 位于每台 PC 的行上。",
+        "Android 应用已上架 Google Play，iPhone 应用已上架 App Store。",
+        "每个智能体行都会显示它处于当前状态的时长。"
+      ],
+      "fixed": [
+        "在本机用 localhost 以外的名称打开时，会先要求配对。",
+        "来自其他电脑的文件会按本服务器自己的保护设置打开。",
+        "聊天消息不再接在智能体输入框里已输入的文字后面。",
+        "Codex 和 Claude Code 的错误显示在聊天消息下方。",
+        "在手机上，返回会先关闭打开的内容再离开页面。"
+      ]
+    }
+  },
+  "0.5.3": {
+    "en": {
+      "new": [
+        "Delete account erases your Ovis account, in the apps or app.ovis.sh.",
+        "The relay tab lists your account's other PCs to connect or add.",
+        "Settings → Appearance imports a theme from a Base16 color file.",
+        "GJC and omp suggest your next prompt as grey text in Chat.",
+        "An ovis command adds this PC to your account from its terminal."
+      ],
+      "improved": [
+        "A split pane has a Close button in its top-right corner.",
+        "The desktop app tells you as soon as an update is ready.",
+        "The PC's CPU, memory and disk show in the status bar by default.",
+        "On a phone, the header is calmer, with one Chat/Terminal button.",
+        "An HTML page in the file viewer runs scripts only when you ask."
+      ],
+      "fixed": [
+        "herdr-core terminals keep your login shell's sign-ins and colour.",
+        "Korean and other input-method typing keeps up in the terminal again.",
+        "A chat message is no longer typed into one of Codex's own screens.",
+        "Ctrl+Backspace in the terminal deletes the word before the cursor.",
+        "A Claude subagent's report shows in its task card in Chat again."
+      ]
+    },
+    "ko": {
+      "new": [
+        "계정 삭제로 앱이나 app.ovis.sh에서 Ovis 계정을 지울 수 있어요.",
+        "릴레이 탭에 내 계정의 다른 PC가 보이고, 바로 연결하거나 추가해요.",
+        "설정 → 모양에서 Base16 색상 파일로 테마를 가져올 수 있어요.",
+        "GJC와 omp가 제안하는 다음 프롬프트가 채팅 입력창에 회색 글자로 보여요.",
+        "ovis 명령으로 터미널에서 이 PC를 내 계정에 추가할 수 있어요."
+      ],
+      "improved": [
+        "분할된 패널의 오른쪽 위에 닫기 버튼이 생겼어요.",
+        "데스크톱 앱이 업데이트가 준비되는 대로 알려 줘요.",
+        "PC의 CPU, 메모리, 디스크 사용량이 기본으로 상태 표시줄에 보여요.",
+        "휴대폰 헤더가 단순해지고, 채팅/터미널은 버튼 하나로 전환해요.",
+        "파일 뷰어의 HTML 페이지는 원할 때만 스크립트를 실행해요."
+      ],
+      "fixed": [
+        "herdr-core 터미널이 로그인 셸의 로그인 정보와 색을 그대로 써요.",
+        "한국어처럼 입력기로 빠르게 입력해도 터미널이 다시 잘 따라와요.",
+        "채팅 메시지가 Codex 자체 화면에 잘못 입력되지 않아요.",
+        "터미널에서 Ctrl+Backspace가 커서 앞의 단어를 지워요.",
+        "Claude 서브에이전트의 보고가 다시 채팅의 작업 카드에 보여요."
+      ]
+    },
+    "ja": {
+      "new": [
+        "アカウントを削除 で、アプリや app.ovis.sh から Ovis アカウントを消せます。",
+        "リレーのタブに自分のアカウントの他の PC が並び、接続や追加ができます。",
+        "設定 → 外観 で、Base16 の色ファイルからテーマを取り込めます。",
+        "GJC と omp が提案する次のプロンプトが、チャットの入力欄に灰色で出ます。",
+        "ovis コマンドで、ターミナルからこの PC をアカウントに追加できます。"
+      ],
+      "improved": [
+        "分割したペインの右上に閉じるボタンが付きました。",
+        "デスクトップアプリは、更新の準備ができるとすぐに知らせます。",
+        "PC の CPU、メモリ、ディスクが既定でステータスバーに出ます。",
+        "スマホのヘッダーがすっきりし、チャット/ターミナルは 1 つのボタンで切り替えます。",
+        "ファイルビューアの HTML ページは、頼んだときだけスクリプトを実行します。"
+      ],
+      "fixed": [
+        "herdr-core のターミナルが、ログインシェルのサインインと色を保ちます。",
+        "日本語などを入力メソッドで速く打っても、ターミナルが再び追いつきます。",
+        "チャットのメッセージが Codex 自身の画面に入力されなくなりました。",
+        "ターミナルで Ctrl+Backspace がカーソルの前の単語を消します。",
+        "Claude のサブエージェントの報告が、再びチャットのタスクカードに出ます。"
+      ]
+    },
+    "zh": {
+      "new": [
+        "可在应用或 app.ovis.sh 中用“删除账户”删除你的 Ovis 账户。",
+        "中继标签页列出你账户中的其他电脑，可直接连接或添加。",
+        "设置 → 外观可从 Base16 颜色文件导入主题。",
+        "GJC 和 omp 建议的下一条提示会以灰字显示在聊天输入框中。",
+        "用 ovis 命令可在终端里把这台电脑加入你的账户。"
+      ],
+      "improved": [
+        "分屏面板的右上角新增了关闭按钮。",
+        "桌面应用会在更新准备好时立即通知你。",
+        "电脑的 CPU、内存和磁盘默认显示在状态栏中。",
+        "手机标题栏更简洁，聊天/终端改为一个按钮切换。",
+        "文件查看器中的 HTML 页面只在你要求时才运行脚本。"
+      ],
+      "fixed": [
+        "herdr-core 终端会保留登录 shell 的登录凭据和颜色。",
+        "用输入法快速输入中文等文字时，终端又能跟上了。",
+        "聊天消息不再被输入到 Codex 自己的界面中。",
+        "在终端中按 Ctrl+Backspace 会删除光标前的单词。",
+        "Claude 子代理的报告再次显示在聊天的任务卡片中。"
+      ]
+    }
+  },
+  "0.5.2": {
+    "en": {
+      "new": [
+        "On a computer, Alt+Enter in Chat holds a message until you send it.",
+        "Hermes's dangerous-command approval is answered from a card in Chat.",
+        "Letta Code's /model opens as a card in Chat.",
+        "app.ovis.sh is now a console with an Overview of all your PCs.",
+        "Typing / in a Letta Code pane's Chat lists Letta's own commands."
+      ],
+      "improved": [
+        "The header and tab row are one compact line, with + for New workspace.",
+        "The sidebar is denser, with one-line workspace rows.",
+        "The Agents list puts the agents waiting for you first by default.",
+        "On a phone, the header counts working and finished sessions.",
+        "A long tool output in Chat shows its start, with Show all below."
+      ],
+      "fixed": [
+        "A Claude pane waiting on a long CI run no longer reads as done.",
+        "The update-available line no longer blinks and moves the terminal.",
+        "A terminal selection shows over text with a background colour.",
+        "Closing the full-screen macOS app no longer leaves a black screen.",
+        "On Windows, Settings → About switches to the Herdr app's terminals."
+      ]
+    },
+    "ko": {
+      "new": [
+        "컴퓨터에서는 채팅 입력창에서 Alt+Enter로 메시지를 잡아 두었다가 원할 때 보내요.",
+        "Hermes의 위험한 명령 승인을 채팅의 카드에서 답할 수 있어요.",
+        "Letta Code의 /model이 채팅에서 카드로 열려요.",
+        "app.ovis.sh가 모든 PC를 개요에서 한눈에 보는 콘솔로 바뀌었어요.",
+        "Letta Code 패널의 채팅에서 /를 입력하면 Letta의 명령 목록이 나와요."
+      ],
+      "improved": [
+        "헤더와 탭 줄이 한 줄로 합쳐지고, +로 새 워크스페이스를 만들어요.",
+        "사이드바가 더 촘촘해져 워크스페이스가 한 줄씩 보여요.",
+        "에이전트 목록이 기본으로 응답이 필요한 에이전트를 맨 위에 보여 줘요.",
+        "휴대폰 헤더에 작업 중인 세션과 끝난 세션 수가 보여요.",
+        "채팅의 긴 도구 출력은 앞부분만 보이고, 모두 보기로 펼쳐요."
+      ],
+      "fixed": [
+        "오래 걸리는 CI를 기다리는 Claude 패널이 더는 완료로 표시되지 않아요.",
+        "업데이트 안내 줄이 깜빡이며 터미널을 밀어내지 않아요.",
+        "배경색이 있는 글자 위에서도 터미널 선택 영역이 보여요.",
+        "macOS 앱을 전체 화면에서 닫아도 검은 화면이 남지 않아요.",
+        "Windows에서도 설정 → 정보에서 Herdr 앱의 터미널로 바꿀 수 있어요."
+      ]
+    },
+    "ja": {
+      "new": [
+        "パソコンでは、チャットの入力欄で Alt+Enter を押すと、送るまでメッセージを保留します。",
+        "Hermes の危険なコマンドの承認に、チャットのカードで答えられます。",
+        "Letta Code の /model がチャットでカードとして開きます。",
+        "app.ovis.sh が、すべての PC を概要で見渡せるコンソールになりました。",
+        "Letta Code のペインのチャットで / を入力すると、Letta のコマンド一覧が出ます。"
+      ],
+      "improved": [
+        "ヘッダーとタブの行が 1 行にまとまり、+ で新しいワークスペースを作れます。",
+        "サイドバーが詰まり、ワークスペースが 1 行ずつ並びます。",
+        "エージェント一覧は、既定で応答待ちのエージェントを先頭に並べます。",
+        "スマホのヘッダーに、作業中と完了したセッションの数が出ます。",
+        "チャットの長いツール出力は冒頭だけ表示し、すべて表示で開けます。"
+      ],
+      "fixed": [
+        "長い CI を待つ Claude ペインが完了と表示されなくなりました。",
+        "更新の案内行が点滅してターミナルを動かすことがなくなりました。",
+        "背景色のある文字の上でも、ターミナルの選択範囲が表示されます。",
+        "macOS アプリを全画面のまま閉じても、黒い画面が残りません。",
+        "Windows でも 設定 → 情報 から Herdr アプリのターミナルに切り替えられます。"
+      ]
+    },
+    "zh": {
+      "new": [
+        "在电脑上，在聊天输入框按 Alt+Enter 可暂存消息，等你点发送时再发出。",
+        "Hermes 的危险命令审批可在聊天中的卡片上回答。",
+        "Letta Code 的 /model 在聊天中以卡片形式打开。",
+        "app.ovis.sh 改为控制台，可在概览中查看你的所有电脑。",
+        "在 Letta Code 窗格的聊天中输入 /，会列出 Letta 自己的命令。"
+      ],
+      "improved": [
+        "标题栏和标签栏合并为紧凑的一行，点 + 新建工作区。",
+        "侧边栏更紧凑，每个工作区只占一行。",
+        "代理列表默认把等待你回应的代理排在最前。",
+        "在手机上，标题栏会显示工作中和已完成的会话数。",
+        "聊天中很长的工具输出只显示开头，可点“显示全部”展开。"
+      ],
+      "fixed": [
+        "等待长时间 CI 的 Claude 窗格不再显示为已完成。",
+        "更新提示行不再闪烁并推动终端。",
+        "带背景色的文字上也能显示终端的选中区域。",
+        "在全屏状态下关闭 macOS 应用不再留下黑屏。",
+        "在 Windows 上也可从设置 → 关于切换到 Herdr 应用的终端。"
+      ]
+    }
+  },
   "0.5.1": {
     "en": {
       "new": [

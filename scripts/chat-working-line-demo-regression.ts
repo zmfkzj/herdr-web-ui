@@ -121,6 +121,9 @@ try {
         localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" }));
         for (const id of ids) localStorage.setItem(`ovis:view:${id}`, "chat");
       }, [panes.api, panes.flaky, panes.omp]);
+      // the first check reads the Claude pane's running turn: it stays at work, or on a slow runner the
+      // demo ends it (4.5s in) before the check comes
+      await context.addInitScript(() => Reflect.set(window, "__ovisDemoHoldTurn", true));
       const page = await context.newPage();
       const errors: string[] = [];
       page.on("pageerror", (error) => errors.push(error.message));
@@ -354,7 +357,7 @@ try {
       await row.waitFor({ state: "attached" });
       await row.evaluate((node: HTMLElement) => node.click());
       await page.locator(`.pane-select[title^="${blank} \u2014"][aria-current="true"]`).first().waitFor({ state: "attached" });
-      await page.getByTitle("Chat transcript (\u2318\u21e7J)", { exact: true }).click();
+      await page.locator(".view-switch").getByRole("button", { name: "Chat", exact: true }).click();
       const greeting = page.locator(".pane-frame.is-current .composer-greeting");
       // the demo's new agent works for a moment first: it is greeted once it rests
       await greeting.waitFor({ timeout: 8_000 });

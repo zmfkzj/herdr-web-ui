@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { act, createElement } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 
@@ -33,7 +33,7 @@ const snapshot: SessionSnapshot = {
 };
 const machines: Machine[] = [{ id: "local", name: "Host", kind: "local", enabled: true, state: "connected", error: null, snapshot }];
 // App's actions on each PC: split and zoom as the PC offers them (lib/layoutActions.ts, tested there)
-const actionsOf = (offer: LayoutOffer, own: Partial<AppActions> = {}) => new Proxy({ splitPane: offer.split ? () => {} : null, zoomPane: offer.arrange ? () => {} : null, enableNotifications: null, openFiles: null, lock: null, openLocalPage: null, ...own }, { get: (own, key) => key in own ? own[key as keyof typeof own] : () => {} }) as unknown as AppActions;
+const actionsOf = (offer: LayoutOffer, own: Partial<AppActions> = {}) => new Proxy({ splitPane: offer.split ? () => {} : null, zoomPane: offer.arrange ? () => {} : null, enableNotifications: null, openFiles: null, lock: null, openLocalPage: null, inboxMode: null, closeTab: null, ...own }, { get: (own, key) => key in own ? own[key as keyof typeof own] : () => {} }) as unknown as AppActions;
 const LAYOUT_ROWS = ["Rename tab", "Split pane right", "Split pane down", "Split pane right and open it", "Split pane down and open it", "Zoom pane"];
 
 describe("the command palette on a PC the Herdr app lays out", () => {
@@ -70,11 +70,11 @@ describe("the command palette on a PC the Herdr app lays out", () => {
     }
   });
 
-  async function rows(offer: LayoutOffer, selectedPaneId: string, initialQuery: string, actions = actionsOf(offer)): Promise<string[]> {
+  async function rows(offer: LayoutOffer, selectedPaneId: string, initialQuery: string, actions = actionsOf(offer), shown = snapshot, online = false, inboxMode = false): Promise<string[]> {
     await act(async () => { renderer?.unmount(); });
     await act(async () => {
       renderer = create(createElement(SettingsProvider, null, createElement(AppLayoutContext.Provider, { value: offer },
-        createElement(CommandPalette, { open: true, initialQuery, onClose: () => {}, machines, onSelect: () => {}, snapshot, online: false, selectedPaneId, view: "chat", actions }))));
+        createElement(CommandPalette, { open: true, initialQuery, onClose: () => {}, machines, onSelect: () => {}, snapshot: shown, online, selectedPaneId, view: "chat", actions, inboxMode }))));
     });
     return renderer!.root.findAll((node) => node.props.className === "menu-item-main" && typeof node.props.children === "string").map((node) => node.props.children as string);
   }
@@ -83,6 +83,37 @@ describe("the command palette on a PC the Herdr app lays out", () => {
     const listed = await rows(TUI, "p1", ">");
     for (const row of LAYOUT_ROWS) expect(listed).toContain(row);
     expect(await rows(TUI, "p3", ">move tab")).toEqual(["Move tab to w1"]);
+  });
+
+  it("keeps the footer's path line when a settings action replaces a pane under the pointer", async () => {
+    await rows(TUI, "p1", "theme");
+    const path = () => renderer!.root.findByProps({ className: "palette-footer-path" });
+    // This fixture's pane has no cwd either: the empty path still reserves the second line.
+    expect(path().children).toEqual([]);
+    const settings = renderer!.root.findByProps({ "data-section": "settings-pages" });
+    const first = settings.findAllByProps({ role: "option" })[0]!;
+    await act(async () => first.props.onMouseMove());
+    expect(path().children).toEqual([]);
+    expect(renderer!.root.findByProps({ className: "palette-footer-place" }).children).toEqual(["Appearance"]);
+  });
+
+  it("lists Close pane where App offers it, and not when opened over another dialog, where it would close the pane under it", async () => {
+    let closes = 0;
+    const closing = actionsOf(TUI, { closePane: () => { closes += 1; } });
+    expect(await rows(TUI, "p1", ">close pane", closing)).toEqual(["Close pane"]);
+    expect(await rows(TUI, "p1", ">close pane", actionsOf(TUI, { closePane: null }))).toEqual([]);
+    // Files (or Settings) is open under the palette: an aria-modal surface that is not the palette's own
+    (document as unknown as { querySelectorAll: () => unknown[] }).querySelectorAll = () => [{}];
+    expect(await rows(TUI, "p1", ">close pane", closing)).toEqual([]);
+    expect(closes).toBe(0);
+  });
+
+  it("lists Close tab where App offers it, and not when opened over another dialog (#3751)", async () => {
+    const closing = actionsOf(TUI, { closeTab: () => {} });
+    expect(await rows(TUI, "p1", ">close tab", closing)).toEqual(["Close tab"]);
+    expect(await rows(TUI, "p1", ">close tab")).toEqual([]);
+    (document as unknown as { querySelectorAll: () => unknown[] }).querySelectorAll = () => [{}];
+    expect(await rows(TUI, "p1", ">close tab", closing)).toEqual([]);
   });
 
   it("keeps Rename tab where a lone tab draws no row, whose dialog stands in for the row's field", async () => {
@@ -96,6 +127,30 @@ describe("the command palette on a PC the Herdr app lays out", () => {
     expect(listed).toContain("New workspace");
     expect(listed).toContain("New tab");
     expect(await rows(APP_CORE, "p3", ">move tab")).toEqual([]);
+  });
+
+  it("offers nothing the inbox mode's shell has no place for: no New tab, Rename tab or sidebar row, in a thread as on the list", async () => {
+    const SHELL_ROWS = ["New tab", "Rename tab", "Toggle sidebar", "Filter workspaces and agents"];
+    const thread = await rows(TUI, "p1", ">", undefined, snapshot, false, true);
+    for (const row of SHELL_ROWS) expect(thread).not.toContain(row);
+    for (const row of ["New workspace", "Switch to terminal", "Settings", "Toggle theme"]) expect(thread).toContain(row);
+    const classic = await rows(TUI, "p1", ">");
+    for (const row of SHELL_ROWS) expect(classic).toContain(row);
+  });
+
+  it("lists the way into the agent inbox where it is offered, and the way back while in it", async () => {
+    const went: string[] = [];
+    expect(await rows(TUI, "p1", ">inbox")).toEqual([]);
+    const into = actionsOf(TUI, { inboxMode: { on: false, go: () => { went.push("in"); } } });
+    expect(await rows(TUI, "p1", ">open agent inbox", into)).toEqual(["Open agent inbox"]);
+    await act(async () => renderer!.root.find((node) => node.props.id === "palette-item-0").props.onClick());
+    const out = actionsOf(TUI, { inboxMode: { on: true, go: () => { went.push("out"); } } });
+    expect(await rows(TUI, "p1", ">back to ovis", out, snapshot, false, true)).toEqual(["Back to Ovis"]);
+    // the way back is drawn with the app's own mark here as at the column's foot and in a phone's More: one glyph for it
+    const glyphs = renderer!.root.find((node) => node.props.id === "palette-item-0").findAll((node) => node.type === "img");
+    expect(glyphs.map((node) => node.props.className)).toEqual(["ovis-mark"]);
+    await act(async () => renderer!.root.find((node) => node.props.id === "palette-item-0").props.onClick());
+    expect(went).toEqual(["in", "out"]);
   });
 
   it("lists a core PC's rename, split, zoom and move rows where Ovis keeps its layout", async () => {
@@ -117,6 +172,53 @@ describe("the command palette on a PC the Herdr app lays out", () => {
     // off by default: Web links open in a new tab, and the palette offers no page
     expect(await rows(TUI, "p1", "localhost:8448")).not.toContain("Open localhost:8448");
     expect(await rows(TUI, "p1", ">")).not.toContain("Open a page on this PC…");
+  });
+
+  const checkout = (linked: boolean): SessionSnapshot => ({ ...snapshot, workspaces: [{ ...workspace("w1", 1), worktree: { repo_key: "r", repo_name: "r", repo_root: "/r", checkout_path: linked ? "/r-wt" : "/r", is_linked_worktree: linked } }, workspace("w2", 1)] });
+  const workspaceRows = ["New worktree", "Open worktree…", "Earlier sessions…"];
+  // the PC answers what the palette reads as it opens: no plugins, and no unmarked folder is a repository
+  const answering = () => spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (input: string | URL | Request) => String(input).includes("worktree/list")
+    ? Response.json({ error: { code: "not_a_repository", message: "not a repository" } }, { status: 400 })
+    : Response.json({ plugins: [] }), globalThis.fetch));
+
+  it("lists New worktree and Open worktree… for a repository's main checkout, where the PC offers worktrees", async () => {
+    const fetched = answering();
+    try {
+      const worktreeRows = ["New worktree", "Open worktree…"];
+      expect((await rows(TUI, "p1", ">", undefined, checkout(false), true)).filter((row) => worktreeRows.includes(row))).toEqual(worktreeRows);
+      for (const listed of [await rows(TUI, "p1", ">", undefined, checkout(true), true), await rows(APP_CORE, "p1", ">", undefined, checkout(false), true), await rows(TUI, "p3", ">", undefined, checkout(false), true)]) {
+        expect(listed.filter((row) => worktreeRows.includes(row))).toEqual([]);
+      }
+    } finally {
+      fetched.mockRestore();
+    }
+  });
+
+  it("offers no worktree or earlier-sessions row while the PC is disconnected", async () => {
+    const fetched = answering();
+    try {
+      expect((await rows(TUI, "p1", ">", undefined, checkout(false), true)).filter((row) => workspaceRows.includes(row))).toEqual(workspaceRows);
+      expect((await rows(TUI, "p1", ">", undefined, checkout(false), false)).filter((row) => workspaceRows.includes(row))).toEqual([]);
+    } finally {
+      fetched.mockRestore();
+    }
+  });
+
+  it("lists them for a repository's folder herdr did not mark, as the sidebar's row menu does once git answers for it", async () => {
+    // git answers for w1's folder and refuses w2's, as GET /api/worktree/list does
+    const fetched = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (input: string | URL | Request) => String(input).includes("workspace_id=w1")
+      ? Response.json({ worktrees: [] })
+      : Response.json({ error: { code: "not_a_repository", message: "not a repository" } }, { status: 400 }), globalThis.fetch));
+    try {
+      const worktreeRows = ["New worktree", "Open worktree…"];
+      await rows(TUI, "p1", ">", undefined, snapshot, true);
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      const listed = () => renderer!.root.findAll((node) => node.props.className === "menu-item-main" && typeof node.props.children === "string").map((node) => node.props.children as string);
+      expect(listed().filter((row) => worktreeRows.includes(row))).toEqual(worktreeRows);
+      expect((await rows(TUI, "p3", ">", undefined, snapshot, true)).filter((row) => worktreeRows.includes(row))).toEqual([]);
+    } finally {
+      fetched.mockRestore();
+    }
   });
 
   it("lists rename and move but no split or zoom on a core that keeps no documents", async () => {

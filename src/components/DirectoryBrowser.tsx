@@ -200,7 +200,7 @@ export function DirectoryBrowser({ start, onPick, onOpenFile, onFolder }: Direct
           {/* inside New workspace's form: Enter makes the folder rather than starting the workspace,
               Escape closes this field rather than the dialog, and an IME keeps its own keys */}
           <input className="input" aria-label={t("New folder name")} placeholder={t("New folder name")} autoFocus value={naming} readOnly={creating}
-            autoComplete="off" autoCapitalize="off" spellCheck={false} aria-invalid={namingError !== null}
+            autoComplete="off" autoCapitalize="off" spellCheck={false} enterKeyHint="done" aria-invalid={namingError !== null}
             onChange={(event) => { setNaming(event.target.value); setNamingError(null); }}
             onBlur={() => { if (naming.trim() === "") setNaming(null); }}
             onKeyDown={(event) => {
@@ -243,7 +243,13 @@ export function DirectoryBrowser({ start, onPick, onOpenFile, onFolder }: Direct
             </li>
           ))}
           {listing !== null && onPick !== undefined && normalizedQuery !== "" && directories?.length === 0 && <li className="dir-browser-note" role="status">{t("No matching folders")}</li>}
-          {listing !== null && normalizedQuery === "" && listing.directories.length === 0 && (listing.files ?? []).length === 0 && <li className="dir-browser-note">{t(onOpenFile ? "Nothing here" : "No folders here")}</li>}
+          {listing !== null && normalizedQuery === "" && listing.directories.length === 0 && (listing.files ?? []).length === 0 && (
+            <li className="dir-browser-note">
+              {t(onOpenFile ? "Nothing here" : "No folders here")}
+              {/* a file browser says the way on: hidden entries, or another folder */}
+              {onOpenFile && <span className="dir-browser-hint">{t(hidden ? "Go to the parent or home folder." : "Turn on Show hidden or go to the parent folder.")}</span>}
+            </li>
+          )}
           {listing?.truncated && <li className="dir-browser-note">{t("Showing the first {n} folders; type the rest of the path to go further.", { n: listing.directories.length })}</li>}
           {listing?.truncated && onPick !== undefined && <li className="dir-browser-note">{t("Search is limited to the {n} loaded folders.", { n: listing.directories.length })}</li>}
         </ul>

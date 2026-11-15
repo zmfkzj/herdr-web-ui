@@ -25,6 +25,7 @@ import { chromium, type Browser, type Page } from "playwright-core";
 import panes from "../site/demo/fixtures/panes.json";
 import { buildDemoApp } from "./demo-build.ts";
 import { chromePath } from "./chrome-path.ts";
+import { openLens } from "./header-lens.ts";
 
 const repo = join(import.meta.dir, "..");
 const app = mkdtempSync(join(tmpdir(), "herdr-new-session-skills-"));
@@ -32,7 +33,7 @@ const evidence = join(process.env["UI_EVIDENCE_DIR"] || join(repo, "evidence"), 
 mkdirSync(evidence, { recursive: true });
 
 interface Recorded { url: string; body: Record<string, unknown> }
-interface QaWindow { qaRequests: Recorded[]; qaHold: boolean; qaRelease: () => void; qaSubmits: string[]; qaDrop: () => void; qaOldBridge: boolean; qaSkillsBusy: Record<string, number>; qaSkillsBusyServed: number }
+interface QaWindow { qaRequests: Recorded[]; qaHold: boolean; qaRelease: () => void; qaSubmits: string[]; qaDrop: () => void; qaSockets: WebSocket[]; qaOldBridge: boolean; qaSkillsBusy: Record<string, number>; qaSkillsBusyServed: number }
 
 const settled = (page: Page) => page.evaluate(() => Promise.all(document.getAnimations().map((animation) => animation.finished.catch(() => undefined))).then(() => new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())))));
 const recorded = (page: Page) => page.evaluate(() => (window as unknown as QaWindow).qaRequests);
@@ -42,7 +43,7 @@ const submits = (page: Page) => page.evaluate(() => (window as unknown as QaWind
 async function openChat(page: Page, url: string): Promise<void> {
   await page.goto(url);
   await page.locator(".conn-live").waitFor({ state: "attached" });
-  await page.getByTitle("Chat transcript (⌘⇧J)", { exact: true }).click();
+  await openLens(page, "chat");
   await page.locator(".pane-frame.is-current .terminal-stack.is-chat").waitFor();
 }
 
@@ -50,7 +51,7 @@ async function openChat(page: Page, url: string): Promise<void> {
 async function openDialog(page: Page) {
   const phone = (page.viewportSize()?.width ?? 1280) <= 640;
   if (phone) {
-    await page.locator(".app-header .context-tabs").tap();
+    await page.locator(".app-header .header-tabs-sheet").tap();
     // the menu is a sheet on a phone (RowMenu): its items are buttons there
     await page.getByRole("button", { name: "New tab with agent…", exact: true }).tap();
   } else {
@@ -168,7 +169,7 @@ try {
     return (await body.exists()) ? new Response(body) : new Response("not found", { status: 404 });
   } });
   const url = `http://127.0.0.1:${server.port}/herdr-web-ui/demo/app/?pane=${encodeURIComponent(panes.api)}`;
-  const settings = (theme: string): void => { localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", theme })); };
+  const settings = (theme: string): void => { localStorage.setItem("ovis:settings", JSON.stringify({ language: "en", theme })); localStorage.setItem("ovis:phone-tabs", JSON.stringify("header")); };
   const phone = (browser: Browser, theme: "dark" | "light") => browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 3, locale: "en-US", colorScheme: theme });
   const desktop = (browser: Browser, theme: "dark" | "light") => browser.newContext({ viewport: { width: 1280, height: 800 }, locale: "en-US", colorScheme: theme });
   const log: string[] = [];
@@ -350,7 +351,9 @@ try {
         await dialog.waitFor({ state: "detached" });
         await page.locator(".pane-frame.is-current .pending-message-bubble", { hasText: "Reconnect me" }).waitFor();
         await page.evaluate(() => (window as unknown as QaWindow).qaDrop());
-        await page.locator(".conn-live").waitFor({ state: "detached" });
+        // a drop the connection is back from within the reconnect grace is not said (src/lib/reconnectGrace.ts): the
+        // socket opened after the drop is what shows the reconnect
+        await page.waitForFunction(() => (window as unknown as QaWindow).qaSockets.some((socket) => socket.readyState === WebSocket.OPEN));
         await page.locator(".conn-live").waitFor({ state: "attached" });
         const turn = page.locator(".pane-frame.is-current .chat-turn", { hasText: "Reconnect me" });
         // the agent rests with the message held, not typed: the note says why, and Send now and Discard are offered

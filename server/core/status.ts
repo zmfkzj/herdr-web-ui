@@ -5,27 +5,33 @@
 import type { TailnetPcsOptions } from "../tailnet-pcs.ts";
 import type { SshCandidatesOptions } from "../ssh-candidates.ts";
 import { createAlertWebhook } from "../alert-webhook.ts";
+import { stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { RelaySocket } from "../../shared/relay-channel.ts";
 import type { AgentStatus, HerdrPane, PaneContext, PlanSummary, ServerMessage, SessionSnapshot } from "../../shared/protocol.ts";
 import { alertStatus, paneAlertsMuted, pushPaneTitle } from "../../shared/notify-policy.ts";
+import { AgentTaskStatus, isTaskAgent } from "../agent-tasks.ts";
+import { resolveAgyStore } from "../agy-store.ts";
 import { BackgroundWait } from "../background-wait.ts";
 import { busyPanes, DESKTOP_ACTIVITY_FILE, trackDesktopActivity } from "../desktop-activity.ts";
 import { ClaudeSubagentStatus } from "../claude-subagents.ts";
-import { codexOpenRollout, paneCodexHome } from "../codex.ts";
+import { codexLastTurnEnd, codexOpenRollout, paneCodexHome } from "../codex.ts";
 import { startStatusCollector } from "../collector.ts";
 import { CompletionTracker, type OmoRest } from "../completion.ts";
 import { listHcMachines, startMachineBridge } from "../herdr-core/machine-bridge.ts";
-import { coreConnection, servingCore } from "../herdr-core/runtime.ts";
+import { coreConnection } from "../herdr-core/runtime.ts";
+import { capabilities } from "../runtime/capabilities.ts";
 import { Finishes, herdrLifetime } from "../finishes.ts";
-import { claudePanePid, claudePaneSession, forgetPaneTranscriptState } from "../conversation.ts";
-import { openCodeNativeState, openCodeVerificationCheckpoint, releaseOpenCodePane, trackVerifiedOpenCodePanes } from "../opencode-native.ts";
+import { claudePanePid, claudePaneSession, forgetPaneTranscriptState, paneTranscript, stoppedAgentJob } from "../conversation.ts";
+import { openCodeNativeState, openCodePanePid, openCodeVerificationCheckpoint, releaseOpenCodePane, trackVerifiedOpenCodePanes } from "../opencode-native.ts";
 import { opencodeDatabasePath } from "../opencode.ts";
 import { OpencodeSubagentStatus } from "../opencode-subagents.ts";
 import { openCodeServiceOptions, readOpenCodeService } from "../opencode-service.ts";
 import { processStartUpperBoundAsync } from "../process-start.ts";
 import type { DeviceStore } from "../devices.ts";
 import { createGjcStatus, gjcPanes, readOmoSnapshot, reconcileProviderStatus } from "../gjc-status.ts";
+import { resolveGrokStore } from "../grok-store.ts";
+import { createLettaStatus, lettaPanes, lettaTitleStatus } from "../letta-status.ts";
 import type { HerdrMachineProfile } from "../herdr-profiles.ts";
 import { paneGet, paneProcessInfo, sessionSnapshot } from "../herdr/client.ts";
 import { resolveAgent } from "../pane-context.ts";
@@ -41,6 +47,7 @@ import { type AlertTiming, createPushService, defaultStateDir } from "../push.ts
 import { SessionPlans } from "../session-plan.ts";
 import { readStatuslineContext } from "../statusline.ts";
 import { userHome } from "../user-home.ts";
+import { notePaneFolders } from "../windows-share.ts";
 import type { Telemetry } from "../telemetry.ts";
 import type { UsageLoginService } from "../usage-login.ts";
 import type { UsageService } from "../usage.ts";
@@ -60,6 +67,8 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     relayPcSocket?: (url: string) => RelaySocket;
     /** how they dial those PCs' direct carriers; tests point it at a local listener */
     relayPcDirectSocket?: (url: string) => RelaySocket;
+    /** how often another PC's own update is looked at while it runs; tests shorten it */
+    pcUpdateTimings?: { pollMs?: number; startMs?: number; checkMs?: number; offerMs?: number };
     /** how other PCs on this PC's Tailscale are found (server/tailnet-pcs.ts); tests give their own status and addresses */
     tailnetPcs?: TailnetPcsOptions;
     sshCandidates?: SshCandidatesOptions;
@@ -129,7 +138,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
 
   /** `done` for agents herdr loses track of (server/completion.ts), kept across restarts */
   // on herdr-core every status is the program's own report (completion.ts reportedOnly)
-  const completions = new CompletionTracker(join(options.stateDir ?? defaultStateDir(), "completions.json"), undefined, servingCore);
+  const completions = new CompletionTracker(join(options.stateDir ?? defaultStateDir(), "completions.json"), undefined, () => capabilities().agents === "reported");
   const finishes = new Finishes(options.herdrIdentity);
   /** the herdr identity that answered the lifecycle subscription, bound to that connection; null while it is closed (currentHerdrLifetime) */
   let liveHerdr: string | null = null;
@@ -150,6 +159,27 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     onChange: (paneId, derived, _background, turn, rest) => gjcChanged(paneId, derived, turn, rest),
     onFound: (paneId) => completions.adopt(paneId, "gjc", []),
   }, omo);
+  /** each Letta pane's status as its own title last said it, where nothing else gave one (letta-status.ts lettaTitleStatus) */
+  const lettaTitled = new Map<string, AgentStatus>();
+  /** why a Letta pane came to rest while its title said it waited for approval, told when the wait ends */
+  const lettaRests = new Map<string, OmoRest>();
+  /** snapshot reads in the order they began, and the newest whose titles were applied: an older read finishing late tells no turn */
+  let titleReads = 0;
+  let titleApplied = 0;
+  /** Letta panes no report gives a status get it from Letta's own local messages (server/letta-status.ts) */
+  const letta = createLettaStatus({
+    // a runtime that works out a pane's status gives Letta panes theirs: only where it passes on reports alone are they Ovis's to tell
+    discover: (panes) => capabilities().agents === "reported" ? lettaPanes(panes) : Promise.resolve(new Map()),
+    snapshot: omoSnapshot,
+    // Letta's title says it waits for the user's approval: an answer the file reads after that was written before it
+    // (an aborted or errored answer written meanwhile is kept, so that the wait's end is told as the failed rest it is)
+    onChange: (paneId, derived, _background, turn, rest) => {
+      if (lettaTitled.get(paneId) !== "blocked") { gjcChanged(paneId, derived, turn, rest, "letta"); return; }
+      // each turn the file tells replaces the last: a later good answer leaves no earlier failure standing
+      if (turn && rest !== undefined && derived !== "working") lettaRests.set(paneId, rest); else if (turn) lettaRests.delete(paneId);
+    },
+    onFound: (paneId) => completions.adopt(paneId, "letta", []),
+  });
   /** Claude panes whose turn ended while work it started runs in the background (server/background-wait.ts) */
   const waits = new BackgroundWait(options.statusNow ?? Date.now, options.backgroundWait);
   /** the pane whose status event is reading its background work now: that event sends the one frame and alert of it */
@@ -185,11 +215,17 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     onChange: (paneId, running, turnRunning, promptAt) => {
       if (agentNow.get(paneId) !== "claude" || !owns(paneId, "claude")) return;
       claudeAgentsChanged(paneId, running, turnRunning, promptAt, false, "claude");
-      // the queue's hold came or went with the pane's status unchanged: its queued input is told now
-      const status = completions.current(paneId);
-      if (status !== undefined && paneId !== settling && pending.current(paneId) !== queueStatus(paneId, status)) { pending.status(paneId, queueStatus(paneId, status)); drainPending(paneId); }
+      // the queue's hold came or went with the pane's status unchanged: its queued input is told now.
+      // Not for a pane that settles: the status reported next tells the queue, and what settles it tells of a
+      // self-resumed turn's hold its poll found begun or ended (onStatus, reportStatus)
+      if (paneId !== settling) tellQueue(paneId);
     },
   });
+  /** Tell a pane's queued input the status it goes by now (queueStatus), when that changed with the status shown unchanged. */
+  function tellQueue(paneId: string): void {
+    const status = completions.current(paneId);
+    if (status !== undefined && pending.current(paneId) !== queueStatus(paneId, status)) { pending.status(paneId, queueStatus(paneId, status)); drainPending(paneId); }
+  }
   /** herdr's last word on each Claude pane, before restingClaude took it for a rest */
   const heard = new Map<string, AgentStatus>();
   /**
@@ -219,9 +255,14 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
   /**
    * The status the pane's queued input goes by: a Claude pane shown at rest while a busy signal
    * whose turn was never written holds it (ClaudeSubagentStatus.holdsQueue) is not ready for it.
+   * Nor is one whose turn Claude resumed by itself (a /loop wakeup, a scheduled task, a background
+   * task's notice) and no rest was written since, which herdr may still read at rest, or at rest
+   * again (loopHolds, #3494): that hold is the transcript's alone, so no word of herdr's begins or
+   * ends it.
    */
   function queueStatus(paneId: string, status: AgentStatus): AgentStatus {
-    return heard.get(paneId) === "working" && agentNow.get(paneId) === "claude" && claudeAgents.holdsQueue(paneId) && (status === "idle" || status === "done") ? "working" : status;
+    if (agentNow.get(paneId) !== "claude" || (status !== "idle" && status !== "done")) return status;
+    return (heard.get(paneId) === "working" && claudeAgents.holdsQueue(paneId)) || claudeAgents.loopHolds(paneId) ? "working" : status;
   }
   // a prompt the chat sent may be a turn the transcript does not show yet. Not so a slash command,
   // which can run with no turn (`/model`), nor a message Claude Code may hold: what they start is
@@ -256,6 +297,21 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     // a count that fell only because that setting was turned off ended no work: no grace is held for it
     onChange: (paneId, running, turnRunning, promptAt, toggled) => { if (owns(paneId, "opencode")) claudeAgentsChanged(paneId, running, turnRunning, promptAt, false, null, toggled); },
   });
+  /** agy and grok panes count their sessions' background tasks and timers (server/agent-tasks.ts) */
+  const taskAgents = new AgentTaskStatus({
+    resolve: async (pane) => {
+      if (pane.agent === "grok") {
+        const path = await resolveGrokStore(pane);
+        return path === null ? null : { path, started: null, owner: null };
+      }
+      const store = await resolveAgyStore(pane);
+      return store === null ? null : { path: store.path, started: await processStartUpperBoundAsync(store.pid), owner: `${store.pid}:${store.started}` };
+    },
+    onReset: (paneId) => { if (isTaskAgent(agentNow.get(paneId))) newLifetime(paneId, null); },
+    onChange: (paneId, count) => {
+      if (isTaskAgent(agentNow.get(paneId)) && !omo.runs(paneId)) claudeAgentsChanged(paneId, count.running, count.turnRunning, count.promptAt, false, null, false, count.capped);
+    },
+  });
   /**
    * Whether a subagent tracker's word on a pane's count and wait stands: not once OmO runs there, nor
    * the other tracker's agent on a session that tracker holds, whose count and wait the pane's are now
@@ -281,13 +337,74 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     // the window the chat's ring takes for a Claude session (conversation.ts)
     claudeWindow: (path, model) => readStatuslineContext(userHome(), basename(path, ".jsonl"), model, path),
   });
+  /** how long a Codex finish waits for its rollout to be read, and how soon a failed look is tried again */
+  const CODEX_LOOK_MS = 1000;
+  const CODEX_RETRY_MS = 2000;
+  /** Codex panes whose last turn ended in an error, until the next one starts (codexRest) */
+  const codexFailed = new Set<string>();
+  /**
+   * each Codex pane's rollout as codexRest last looked at it (null: none was found, and none is looked for
+   * again until the pane works), the panes it is looking at now, and each pane's turns begun, so a look that
+   * a new turn overtook keeps nothing
+   */
+  const codexLooked = new Map<string, { path: string; size: number } | null>();
+  const codexLooking = new Map<string, Promise<void>>();
+  /** when a Codex pane whose rollout look failed may be looked at again */
+  const codexRetryAt = new Map<string, number>();
+  const codexTurns = new Map<string, number>();
+  /** snapshot reads begun, and the count when each pane's failure was found: a read begun before it tells no new turn */
+  let codexReads = 0;
+  const codexFailedAt = new Map<string, number>();
+  /**
+   * A Codex pane's last turn is no longer the failed one, and its rollout may be another: `began`, it is at work again,
+   * a turn this server sees run (only such a turn's failure is told: one found already over, after a restart or in a pane
+   * first seen at rest, was the user's to see then, as OmO's `failed-before` is)
+   */
+  const codexWorking = (paneId: string, began: boolean): void => {
+    codexFailed.delete(paneId);
+    codexFailedAt.delete(paneId);
+    codexLooked.delete(paneId);
+    codexRetryAt.delete(paneId);
+    if (began) codexTurns.set(paneId, (codexTurns.get(paneId) ?? 0) + 1);
+  };
+  /** herdr calls a Codex at rest DONE, idle or `unknown` (codex/unknown at rest, server/completion.ts) */
+  const atRest = (status: AgentStatus): boolean => status === "done" || status === "idle" || status === "unknown";
+  /** herdr calls such a pane's rest DONE as it calls any finish it did not see, or `unknown`: it is at rest, and READY */
+  const codexRests = (snapshot: SessionSnapshot): SessionSnapshot => {
+    if (codexFailed.size === 0) return snapshot;
+    const rest = (pane: { pane_id: string; agent?: string | null; agent_status: AgentStatus }) => codexFailed.has(pane.pane_id) && pane.agent === "codex" && (pane.agent_status === "done" || pane.agent_status === "unknown");
+    return { ...snapshot, panes: snapshot.panes.map((pane) => rest(pane) ? { ...pane, agent_status: "idle" } : pane), agents: snapshot.agents.map((agent) => rest(agent) ? { ...agent, agent_status: "idle" } : agent) };
+  };
   /** herdr's snapshot with OmO's and GJC's own status in it: what the completion tracker and web push are given */
   const rawSnapshot = async (): Promise<SessionSnapshot> => {
+    const titleRead = ++titleReads;
+    const codexRead = ++codexReads;
     const promptCheckpoint = options.openCodeState?.checkpoint();
     const read = opencodeAgents.beginRead();
     const snapshot = await omoSnapshot();
     await gjc.refresh(snapshot.panes);
-    const named = gjc.apply(omo.apply(snapshot));
+    // a report or another agent takes a pane back from Letta's own files
+    for (const pane of snapshot.panes) if (letta.runs(pane.pane_id) && (pane.agent !== "letta" || pane.agent_status !== "unknown")) letta.ended(pane.pane_id);
+    await letta.refresh(snapshot.panes);
+    // a Codex pane herdr reads DONE may have ended its turn in an error: looked at, not waited for
+    for (const pane of snapshot.panes) {
+      if (pane.agent !== "codex") continue;
+      // reads overlap: one begun before a failure was found is no turn after it
+      if (pane.agent_status === "working") { if ((codexFailedAt.get(pane.pane_id) ?? -1) < codexRead) codexWorking(pane.pane_id, true); }
+      // at DONE, or at any rest after a failure (a late end of the turn after it is read there too)
+      else if ((pane.agent_status === "done" || (codexFailed.has(pane.pane_id) && atRest(pane.agent_status))) && !omo.runs(pane.pane_id) && !gjc.runs(pane.pane_id)) void codexRest(pane.pane_id, snapshot);
+    }
+    const named = codexRests(letta.apply(gjc.apply(omo.apply(snapshot))));
+    // reads overlap (the collector's, each client's): only one newer than every read applied before tells title turns
+    const newest = titleRead > titleApplied;
+    if (newest) titleApplied = titleRead;
+    // a share a pane works on is the PC's own to read (windows-share.ts): as the newest read tells the folders
+    if (newest) notePaneFolders(named.panes.flatMap((pane) => [pane.cwd, pane.foreground_cwd]));
+    if (capabilities().agents === "reported") for (const { paneId, status } of lettaTitleStatus(named, (paneId) => letta.tracks(paneId), lettaTitled, newest)) {
+      const rest = status === "idle" ? lettaRests.get(paneId) : undefined;
+      if (status !== "blocked") lettaRests.delete(paneId);
+      gjcChanged(paneId, status, true, rest, "letta");
+    }
     const ids = new Set(named.panes.map((pane) => pane.pane_id));
     for (const paneId of [...agentNow.keys()]) {
       if (ids.has(paneId) || (agentRead.get(paneId) ?? 0) > read) continue;
@@ -306,6 +423,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     // The plans come after: a Claude pane's transcript is the one the subagent tracker found
     void claudeAgents.refresh(named.panes).catch(() => undefined).then(() => plans.refresh(named.panes)).catch(() => undefined);
     void opencodeAgents.refresh(named.panes, read);
+    void taskAgents.refresh(named.panes).catch(() => undefined);
     // an agent this server started has had no turn yet: its start screen is no work (launched-agents.ts)
     for (const pane of named.panes) {
       pane.agent_status = launchedAgents.settle(pane.pane_id, pane.agent_status);
@@ -316,7 +434,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     options.openCodeState?.reconcile(named.panes, promptCheckpoint);
     return named;
   };
-  const backgroundOf = (paneId: string): number => omo.backgroundOf(paneId) || claudeAgents.countOf(paneId) || opencodeAgents.countOf(paneId);
+  const backgroundOf = (paneId: string): number => omo.backgroundOf(paneId) || claudeAgents.countOf(paneId) || opencodeAgents.countOf(paneId) || taskAgents.countOf(paneId);
   /** the snapshot clients get: finishes settled, OmO panes named, background tasks, waits, plan progress and context */
   const clientSnapshot = async (): Promise<SessionSnapshot> => {
     // the order this read can show is the one of the moves confirmed before it starts: taken before any wait,
@@ -367,10 +485,10 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
   /** A pane's status frame: every one says whether the pane waits on its turn's background work. */
   const paneStatus = (paneId: string, status: AgentStatus, about: { background_tasks?: number; plan?: PlanSummary | null; context?: PaneContext | null } = {}): ServerMessage =>
     ({ type: "pane-status", pane_id: paneId, agent_status: status, ...finishes.status(paneId, status), ...about, ...(waits.waiting(paneId) ? { background_wait: true as const } : {}) });
-  const machines = options.machines === false ? null : new MachineManager(options.stateDir ?? defaultStateDir(), push, completions, clientSnapshot, { bootId: options.orderSequence?.epoch, localFinishEpoch: () => finishes.epoch, relaySocket: options.relayPcSocket, relayDirectSocket: options.relayPcDirectSocket, serverId: options.serverId, tailnet: options.tailnetPcs, sshCandidates: options.sshCandidates });
+  const machines = options.machines === false ? null : new MachineManager(options.stateDir ?? defaultStateDir(), push, completions, clientSnapshot, { restoreReplaced: () => preferences.get().settings.restoreReplacedServer === true, bootId: options.orderSequence?.epoch, localFinishEpoch: () => finishes.epoch, relaySocket: options.relayPcSocket, relayDirectSocket: options.relayPcDirectSocket, serverId: options.serverId, tailnet: options.tailnetPcs, sshCandidates: options.sshCandidates, ...(options.pcUpdateTimings ? { ownUpdate: options.pcUpdateTimings } : {}) });
   if (machines && options.herdrProfiles) machines.watchHerdrProfiles(options.herdrProfiles);
   // on herdr-core, the core's other machines are PCs too, each reached through this PC's core
-  if (machines && servingCore()) machines.watchHcMachines(() => listHcMachines(coreConnection()), (machine) => startMachineBridge(machine, options.stateDir ?? defaultStateDir()));
+  if (machines && capabilities().machines) machines.watchHcMachines(() => listHcMachines(coreConnection()), (machine) => startMachineBridge(machine, options.stateDir ?? defaultStateDir()));
 
   const desktopActivity = options.desktopActivity === true ? trackDesktopActivity({
     path: join(options.stateDir ?? defaultStateDir(), DESKTOP_ACTIVITY_FILE),
@@ -417,9 +535,9 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
    * form has had its answer. gjc keeps no background records to count, so a change is always a
    * turn, and an idle read after work is the finish — one ended in an error is not (#687).
    */
-  function gjcChanged(paneId: string, derived: AgentStatus, turn: boolean, rest: OmoRest | undefined): void {
+  function gjcChanged(paneId: string, derived: AgentStatus, turn: boolean, rest: OmoRest | undefined, agent: "gjc" | "letta" = "gjc"): void {
     if (turn && derived === "working") promptWaitEnded(paneId);
-    const status = turn ? completions.observe(paneId, derived, "gjc", rest) : completions.current(paneId) ?? completions.observe(paneId, derived, "gjc");
+    const status = turn ? completions.observe(paneId, derived, agent, rest) : completions.current(paneId) ?? completions.observe(paneId, derived, agent);
     if (turn) { pending.status(paneId, status); drainPending(paneId); }
     broadcastAll(paneStatus(paneId, status));
     if (turn) push.onStatus(paneId, status).catch(logPushError);
@@ -432,8 +550,8 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
    * the alerts took it for working meanwhile, so a wait that ends with no turn after it is that
    * turn's finish, told then.
    */
-  function claudeAgentsChanged(paneId: string, running: number, turnRunning: number, promptAt: number | null, resetHold = false, agent: string | null = null, settled = false): void {
-    const changed = waits.running(paneId, turnRunning, promptAt, true, settled) || resetHold;
+  function claudeAgentsChanged(paneId: string, running: number, turnRunning: number, promptAt: number | null, resetHold = false, agent: string | null = null, settled = false, capped = true): void {
+    const changed = waits.running(paneId, turnRunning, promptAt, capped, settled) || resetHold;
     if (paneId === settling) return;
     // a pane herdr reads as working: its session's turn came to rest under its subagents' spinner, or moved on again
     if (agent === "claude" && agentNow.get(paneId) === "claude" && !gjc.runs(paneId) && heard.get(paneId) === "working" && (completions.current(paneId) === "working") === claudeAgents.restsOn(paneId)) {
@@ -482,16 +600,33 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     agentNow.set(paneId, agent);
     const was = settling;
     settling = paneId;
+    // a self-resumed turn's hold as the queue was last told of it: the poll below tells nobody (the pane settles)
+    const resumed = claudeAgents.loopTold(paneId);
     try {
       hearClaude(paneId, agent, read, replay === undefined);
       if (agent === "claude") claudeAgents.poll(paneId);
     } finally { settling = was; }
-    const raw = restingClaude(paneId, agent, launchedAgents.settle(paneId, read));
+    // a live report makes what the title said before it stale
+    if (agent === "letta" && read !== "unknown" && replay === undefined) lettaTitled.delete(paneId);
+    // an unreported Letta pane has no word of the runtime's where it passes on reports alone: what its own title last said stands for it
+    const titled = agent === "letta" && read === "unknown" && capabilities().agents === "reported" && !letta.tracks(paneId) ? lettaTitled.get(paneId) : undefined;
+    const raw = restingClaude(paneId, agent, launchedAgents.settle(paneId, titled ?? read));
     gjc.poll();
+    // a report or another agent takes the pane back from Letta's own files
+    // a replay around a gap carries Ovis's own projected status, not herdr's word: only another agent hands the pane back then
+    if (letta.runs(paneId) && (agent !== "letta" || (replay === undefined && read !== "unknown"))) letta.ended(paneId);
+    letta.poll();
     // read back from a snapshot around a gap between subscriptions. An OmO pane's status there
     // is OmO's own or herdr's by turns (server/omo-status.ts), and a difference is no change;
     // a GJC pane's may be a provider child's while gjc's own transcript is tracked
-    if (replay && (omo.runs(paneId) || gjc.tracks(paneId) || !completions.replayed(paneId, raw, replay))) return;
+    if (replay && (omo.runs(paneId) || gjc.tracks(paneId) || letta.tracks(paneId) || !completions.replayed(paneId, raw, replay))) {
+      // no status is reported after this replay, and its poll told the queue nothing (the pane was
+      // settling): a self-resumed turn's hold that poll found begun or ended is told here (#3494).
+      // Only that: any other hold is told as before, by the next status or the next change. Only a
+      // Claude pane's poll, made above, changes what was told of that hold
+      if (claudeAgents.loopTold(paneId) !== resumed) tellQueue(paneId);
+      return;
+    }
     // Native OmO discovery owns the pane even when herdr names its provider child.
     if (reconcileProviderStatus(omo, gjc, { pane_id: paneId, agent })) completions.forget(paneId);
     // the frame below names no agent: one herdr names anew is read into the roster now. An OmO
@@ -506,7 +641,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     // a GJC one while its transcript is tracked: their own status stands, and no Claude turn waits there
     // (an OmO pane's wait on its background tasks is omoChanged's)
     if (omo.tracks(paneId)) return;
-    if (gjc.tracks(paneId)) {
+    if (gjc.tracks(paneId) || letta.tracks(paneId)) {
       waits.forget(paneId);
       return;
     }
@@ -522,26 +657,108 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     if (raw === "working") promptWaitEnded(paneId);
     // an agent herdr lost on the way still works and finishes as such (server/completion.ts);
     // an OmO pane whose session is not known keeps herdr's status, under its own name
-    const status = completions.observe(paneId, raw, omo.runs(paneId) ? "omo" : gjc.runs(paneId) ? "gjc" : agent);
+    // a Codex pane whose rollout ended its last turn in an error stays at rest, whatever herdr calls that rest (codexRest)
+    if (raw === "working" || agent !== "codex") codexWorking(paneId, raw === "working" && agent === "codex");
+    // (herdr's own DONE or Codex's `unknown` at rest included: the tracker reads a failed rest only from an idle)
+    const failedRest = codexFailed.has(paneId) && raw !== "blocked";
+    const status = completions.observe(paneId, failedRest ? "idle" : raw, omo.runs(paneId) ? "omo" : gjc.runs(paneId) ? "gjc" : agent, failedRest ? "failed" : undefined);
     pending.status(paneId, queueStatus(paneId, status)); drainPending(paneId);
     // a Claude turn that ended holds on its background work: what it started is read now, while
     // the pane is still taken for the status before (work that ended before the turn did holds
     // nothing), and this frame says all of it, so none says the pane finished first
-    // so does an OpenCode turn on the subagents it started
-    const tracker = omo.runs(paneId) ? null : agent === "claude" ? claudeAgents : agent === "opencode" ? opencodeAgents : null;
+    // so does an OpenCode turn on the subagents it started, and an agy or grok one on its tasks
+    const tracker = omo.runs(paneId) ? null : agent === "claude" ? claudeAgents : agent === "opencode" ? opencodeAgents : isTaskAgent(agent) ? taskAgents : null;
     if (tracker !== null) {
+      const resumed = claudeAgents.loopTold(paneId);
       settling = paneId;
       try { void tracker.poll(paneId); } finally { settling = null; }
+      // that poll told the queue nothing, as the pane settled. A self-resumed turn's hold it found begun or ended
+      // (a fire, or the resumed turn's rest, written since the status event's own read; its time run out) is
+      // told now: no later poll finds it changed, and the status told above was read before it (#3494).
+      // Only the Claude tracker's poll changes what was told of that hold
+      if (claudeAgents.loopTold(paneId) !== resumed) tellQueue(paneId);
       waits.status(paneId, status);
     } else waits.forget(paneId);
-    broadcastAll(paneStatus(paneId, status, tracker !== null ? { background_tasks: tracker.countOf(paneId) } : {}));
-    push.onStatus(paneId, alertStatus(status, waits.waiting(paneId))).catch(logPushError);
+    const tell = (): void => {
+      broadcastAll(paneStatus(paneId, status, tracker !== null ? { background_tasks: tracker.countOf(paneId) } : {}));
+      push.onStatus(paneId, alertStatus(status, waits.waiting(paneId))).catch(logPushError);
+    };
+    // a Codex turn this server saw run is told DONE only once its rollout is read (codexRest), or CODEX_LOOK_MS on: a
+    // turn that ended in an error is told at rest instead, and no browser plays a finish for it first
+    if (agent === "codex" && status === "done" && !omo.runs(paneId) && !gjc.runs(paneId) && (codexTurns.get(paneId) ?? 0) > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      void Promise.race([codexRest(paneId), new Promise<void>((resolve) => { timer = setTimeout(resolve, CODEX_LOOK_MS); })])
+        .then(() => { clearTimeout(timer); if (completions.current(paneId) === status) tell(); });
+    } else tell();
     // an OpenCode turn whose session is not known yet: its pane is looked up now, not at the next snapshot, so a
     // turn that ended on its subagents is held while the finish alert still waits (and is called off)
     if (tracker === opencodeAgents && opencodeAgents.sessionOf(paneId)?.live !== true) {
       const begun = opencodeAgents.beginRead();
       void paneGet(paneId).then((pane) => { if (opencodeAgents.ensure(pane, begun)) void opencodeAgents.poll(paneId); }).catch(() => undefined);
     }
+    // so is an agy or grok one, or one whose session was looked up a while ago: the agent may have restarted there
+    if (tracker === taskAgents && taskAgents.stale(paneId)) void paneGet(paneId).then((pane) => taskAgents.track(pane)).catch(() => undefined);
+  }
+
+  /**
+   * A Codex turn herdr saw come to rest: the rollout the chat reads says whether it ended in an error (a usage limit, a
+   * refused request), which is at rest, not finished (#687's rule, on Codex's own record). The rollout is looked at again
+   * only once it grew; a rollout not read, or its end not written yet, leaves herdr's word.
+   */
+  function codexRest(paneId: string, snapshot?: SessionSnapshot): Promise<void> {
+    const known = codexLooked.get(paneId);
+    const turn = codexTurns.get(paneId) ?? 0;
+    // a pane already at a failed rest is looked at again only once its rollout grew (a retry's end written late);
+    // a look that failed (herdr or the store not answering) is tried again, not more often than CODEX_RETRY_MS
+    if (turn === 0 || known === null || (codexRetryAt.get(paneId) ?? 0) > Date.now()) return Promise.resolve();
+    const looking = codexLooking.get(paneId);
+    if (looking !== undefined) return looking;
+    const look = (found: { path: string; size: number } | null): void => { if ((codexTurns.get(paneId) ?? 0) === turn) codexLooked.set(paneId, found); };
+    const retry = (): null => { codexRetryAt.set(paneId, Date.now() + CODEX_RETRY_MS); return null; };
+    const done = (async () => {
+      let path = known?.path;
+      let size = path === undefined ? -1 : await stat(path).then((file) => file.size, () => -1);
+      if (size < 0) {
+        const transcript = await paneTranscript(paneId, options.codexHome, snapshot).catch(() => undefined);
+        if (transcript === undefined) return retry();
+        // no Codex rollout for this pane at all: none is looked for again until it works
+        if (transcript.source !== "codex-transcript") { look(null); return null; }
+        path = transcript.path;
+        size = await stat(path).then((file) => file.size, () => -1);
+        if (size < 0) return retry();
+      } else if (known!.size === size) return null;
+      codexRetryAt.delete(paneId);
+      const end = await codexLastTurnEnd(path!);
+      look({ path: path!, size });
+      return (codexTurns.get(paneId) ?? 0) === turn ? end : null;
+    })().then((end) => {
+      // a turn under way (a retry the user just sent, herdr not yet saying so) is neither: its end tells
+      if (end === null || end === "running") return;
+      if (end === "answered") {
+        if (!codexFailed.has(paneId)) return;
+        // read again after the rollout grew: the turn after the failure answered, which is a finish (#687's `answered`)
+        codexFailed.delete(paneId); codexFailedAt.delete(paneId);
+        const status = completions.observe(paneId, "idle", "codex", "answered");
+        pending.status(paneId, queueStatus(paneId, status)); drainPending(paneId);
+        waits.status(paneId, status);
+        broadcastAll(paneStatus(paneId, status));
+        push.onStatus(paneId, status).catch(logPushError);
+        return;
+      }
+      const now = completions.current(paneId);
+      if (now === "working" || now === "blocked" || codexFailed.has(paneId)) return;
+      codexFailed.add(paneId);
+      codexFailedAt.set(paneId, codexReads);
+      const status = completions.observe(paneId, "idle", "codex", "failed");
+      // told as any rest is: the queue and the wait on background work hear it before devices do
+      pending.status(paneId, queueStatus(paneId, status)); drainPending(paneId);
+      waits.status(paneId, status);
+      broadcastAll(paneStatus(paneId, status));
+      push.onStatus(paneId, status).catch(logPushError);
+      push.onFailed(paneId).catch(logPushError);
+    }, () => undefined).finally(() => codexLooking.delete(paneId));
+    codexLooking.set(paneId, done);
+    return done;
   }
 
   // Process proof belongs to this exact snapshot, so the collector's newer-event guards
@@ -553,15 +770,21 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
   function paneGone(paneId: string): void {
     // the Pi visual tools forget it, before its pending messages are held
     paneEnded?.(paneId);
+    codexWorking(paneId, false);
+    codexTurns.delete(paneId);
     omo.ended(paneId);
     gjc.ended(paneId);
+    letta.ended(paneId);
+    lettaRests.delete(paneId);
     options.openCodeState?.forget(paneId);
     releaseOpenCodePane(paneId);
     finishes.ended(paneId);
-    if (usageLogin.ended(paneId)) usage.invalidate();
+    const signedIn = usageLogin.ended(paneId);
+    if (signedIn) usage.invalidate(signedIn);
     holdPendingPane(paneId, { code: "pane_not_found", message: "The pane ended; its pending messages were not sent" });
     pending.forget(paneId);
     waits.forget(paneId);
+    taskAgents.forget(paneId);
     completions.forget(paneId);
     heard.delete(paneId);
     agentNow.delete(paneId);
@@ -591,7 +814,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     onBaseline: (panes) => {
       const projected = panes.map((pane) => ({ ...pane, agent_status: restingClaude(pane.pane_id, pane.agent, pane.agent_status) }));
       // A resting baseline never reholds old work after a bridge restart.
-      for (const pane of projected) if (pane.agent === "claude" || pane.agent === "opencode") waits.seed(pane.pane_id, pane.agent_status);
+      for (const pane of projected) if (pane.agent === "claude" || pane.agent === "opencode" || isTaskAgent(pane.agent)) waits.seed(pane.pane_id, pane.agent_status);
       push.seed(projected.map((pane) => ({ ...pane, agent_status: alertStatus(pane.agent_status, waits.waiting(pane.pane_id)) })));
       for (const pane of projected) {
         // A fast mirrored client may queue before the collector's first baseline. A
@@ -607,9 +830,11 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
       // only a verified pane holds the stream: a verification still in flight settles for itself, and
       // a snapshot read before it started must not cancel it
       const verified = new Set(openCodeNativeState().panes);
+      // herdr can keep calling a pane OpenCode after it left (0.9.3 on a loaded host): the shell alone in front says it did
       for (const pane of panes) {
-        if (!verified.has(pane.pane_id) || pane.agent === "opencode") continue;
-        if (pane.agent || pane.agent_status !== "unknown" || shellSnapshots.has(pane)) releaseOpenCodePane(pane.pane_id, snapshotVerifications.get(pane));
+        if (!verified.has(pane.pane_id)) continue;
+        const left = pane.agent === "opencode" ? shellSnapshots.has(pane) : pane.agent || pane.agent_status !== "unknown" || shellSnapshots.has(pane);
+        if (left) releaseOpenCodePane(pane.pane_id, snapshotVerifications.get(pane));
       }
       if (machines) machines.localAgents(panes); else bridgeAgents!.reconciled(panes);
     },
@@ -620,7 +845,7 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
       finishes.resync(completions, projected, newer);
       const settled = (pane: HerdrPane): AgentStatus => completions.current(pane.pane_id) ?? pane.agent_status;
       for (const pane of panes) { pending.status(pane.pane_id, queueStatus(pane.pane_id, settled(pane))); drainPending(pane.pane_id); }
-      for (const pane of panes) if (!newer.has(pane.pane_id) && (pane.agent === "claude" || pane.agent === "opencode")) waits.status(pane.pane_id, settled(pane));
+      for (const pane of panes) if (!newer.has(pane.pane_id) && (pane.agent === "claude" || pane.agent === "opencode" || isTaskAgent(pane.agent))) waits.status(pane.pane_id, settled(pane));
       push.resync(panes.map((pane) => ({ ...pane, agent_status: alertStatus(settled(pane), waits.waiting(pane.pane_id)) })), newer);
     },
     onPaneEnded: (paneId) => {
@@ -635,6 +860,9 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     onPaneMoved: (from, to) => {
       // its finishes go on counting under the new ID, and what was read of them is read there (server/seen.ts)
       const renumber = finishes.moved(from, to);
+      // a Codex pane's failed rest and its turns go with it too
+      for (const state of [codexFailedAt, codexTurns, codexLooked] as Map<string, unknown>[]) if (state.has(from)) { state.set(to, state.get(from)); state.delete(from); }
+      if (codexFailed.delete(from)) codexFailed.add(to);
       // a read record that cannot be written costs that record, never the rest of the move
       try { options.seenMoved?.(from, to, renumber); }
       catch (error) { console.warn(`seen: could not carry the reads of ${from} to ${to}:`, error); }
@@ -649,31 +877,54 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     // Windows reports only the shell even while its agent runs; it supplies no foreground proof.
     if (process.platform !== "win32") {
       const verified = new Set(openCodeNativeState().panes);
-      await Promise.all(snapshot.panes.map(async (pane) => {
-        if (pane.agent || pane.agent_status !== "unknown" || !verified.has(pane.pane_id)) return;
-        const info = await paneProcessInfo(pane.pane_id).catch(() => undefined);
+      // `exec opencode` keeps the shell's pid, but not its process identity.
+      const shell = /(?:^|\/)-?(?:sh|bash|dash|zsh|fish|ksh|mksh|csh|tcsh|ash|nu)$/u;
+      const shellAlone = (info: Awaited<ReturnType<typeof paneProcessInfo>>): info is NonNullable<typeof info> & { shell_pid: number } => {
         const front = info?.foreground_processes?.[0];
-        // `exec opencode` keeps the shell's pid, but not its process identity.
-        const shell = /(?:^|\/)-?(?:sh|bash|dash|zsh|fish|ksh|mksh|csh|tcsh|ash|nu)$/u;
-        if (info?.shell_pid != null && info.foreground_processes?.length === 1 && front?.pid === info.shell_pid
-          && shell.test(front.name) && shell.test(front.argv?.[0] ?? front.argv0 ?? front.name)) shellSnapshots.add(pane);
+        return info?.shell_pid != null && info.foreground_processes?.length === 1 && front?.pid === info.shell_pid
+          && shell.test(front.name) && shell.test(front.argv?.[0] ?? front.argv0 ?? front.name);
+      };
+      await Promise.all(snapshot.panes.map(async (pane) => {
+        if (!verified.has(pane.pane_id) || (pane.agent ? pane.agent !== "opencode" : pane.agent_status !== "unknown")) return;
+        const info = await paneProcessInfo(pane.pane_id).catch(() => undefined);
+        // OpenCode stopped with Ctrl+Z leaves the shell alone in front too, and herdr's label stays: it has not left.
+        // Only the OpenCode the pane was verified with counts, when known: another one stopped there holds nothing.
+        if (!shellAlone(info) || await stoppedAgentJob(info.shell_pid, "opencode", { pid: openCodePanePid(pane.pane_id) })) return;
+        // an `fg` after herdr's answer finds no stopped job: herdr must still name the shell alone in front
+        const again = await paneProcessInfo(pane.pane_id).catch(() => undefined);
+        if (shellAlone(again) && again.shell_pid === info.shell_pid) shellSnapshots.add(pane);
       }));
     }
     return snapshot;
   } });
   omo.start();
   gjc.start();
+  letta.start();
   claudeAgents.start();
   opencodeAgents.start();
+  taskAgents.start();
   const waitTimer = setInterval(waitsRanOut, 1000);
   waitTimer.unref?.();
   plans.start();
 
   // a verified OpenCode pane is tracked like a usage-login pane: its end or close reaches paneGone above
-  const untrackOpenCode = trackVerifiedOpenCodePanes((paneId) => collector.trackPane(paneId));
-  const tracked = { ...collector, stop() { untrackOpenCode(); stopMutes(); stopSubmitted(); desktopActivity?.stop(); collector.stop(); } };
+  const untrackOpenCode = trackVerifiedOpenCodePanes((paneId) => collector.trackPane(paneId), () => collector.refresh());
+  const tracked = { ...collector, stop() { untrackOpenCode(); stopMutes(); stopSubmitted(); desktopActivity?.stop(); taskAgents.stop(); collector.stop(); } };
 
-  const queueHeld = (paneId: string): boolean => queueStatus(paneId, "idle") === "working";
+  /**
+   * Whether a pane shown at rest holds its queue (queueStatus), as its last poll left it. `fresh`: whether a
+   * turn Claude resumed by itself holds it, as the pane's transcript says now, read before answering: a /loop
+   * wakeup or a scheduled task may have fired since that poll, or a background task ended (#3494). Only that
+   * hold is read anew, and only it is answered for: it is the one a transcript line begins with no word of
+   * herdr's, and a pane with no such line is asked nothing it was not asked before. A hold that read finds
+   * begun or ended is told to the queue, as by any poll (ClaudeSubagentStatus.loopHoldsNow). A pane whose
+   * transcript is not found has none to read, and none is looked for here (a snapshot does,
+   * ClaudeSubagentStatus.ensure): nothing holds it until then. `fresh` is asked of every caller: a wiring
+   * that dropped it would make delivery's last checks read an answer up to a poll old, with every test still
+   * passing.
+   */
+  const queueHeld = (paneId: string, fresh: boolean): boolean =>
+    fresh ? agentNow.get(paneId) === "claude" && claudeAgents.loopHoldsNow(paneId) : queueStatus(paneId, "idle") === "working";
   /**
    * The herdr this server reads now, as a snapshot names it, known without asking herdr anything: only the
    * one whose lifecycle subscription is open, under the same socket. A socket file alone proves nothing: a
@@ -683,5 +934,5 @@ export function createStatusHub<Owner, Lease>({ options, devices, preferences, c
     const identity = finishes.herdrIdentity();
     return identity === null || identity !== liveHerdr ? undefined : herdrLifetime(identity);
   };
-  return { push, alertWebhook, omo, gjc, claudeAgents, opencodeAgents, plans, clientSnapshot, currentHerdrLifetime, queueHeld, countVisit, machines, broadcastAll, logPushError, collector: tracked, waitTimer };
+  return { push, alertWebhook, omo, gjc, letta, claudeAgents, opencodeAgents, taskAgents, plans, clientSnapshot, currentHerdrLifetime, queueHeld, countVisit, machines, broadcastAll, logPushError, collector: tracked, waitTimer };
 }

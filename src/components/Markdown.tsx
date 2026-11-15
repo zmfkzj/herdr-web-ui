@@ -1,3 +1,4 @@
+import { Visualization } from "./Visualization.tsx";
 import { createContext, Fragment, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { BookOpen, Check, Copy, ImageOff, Maximize2 } from "lucide-react";
 
@@ -419,7 +420,7 @@ function CodeBlock({ language, value }: { language: string; value: string }) {
     <div className="markdown-code" ref={block}>
       <div className="markdown-code-header">
         <span>{language || "text"}</span>
-        <button type="button" className="icon-button markdown-code-copy" onClick={() => void copy()} aria-label={t(copied ? "Code copied" : "Copy code")}>
+        <button type="button" className="icon-button markdown-code-copy" onClick={() => void copy()} aria-label={t(copied ? "Code copied" : "Copy code")} title={t(copied ? "Code copied" : "Copy code")}>
           {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
         </button>
       </div>
@@ -436,14 +437,22 @@ function CodeBlock({ language, value }: { language: string; value: string }) {
 }
 
 function Blocks({ blocks }: { blocks: MarkdownBlock[] }) {
+  const visualizations = new Map<string, number>();
   return <>{blocks.map((block, index): ReactNode => {
     const key = `${block.type}-${index}`;
     switch (block.type) {
+      case "visualization": {
+        const occurrence = visualizations.get(block.path) ?? 0;
+        visualizations.set(block.path, occurrence + 1);
+        return <Visualization key={`visualization-${block.path}-${occurrence}`} {...block} />;
+      }
       case "heading":
         // agent headings are h3 whatever the agent wrote: the app's own h1/h2 (Brand, the dialog
         // titles) stay the outline above them. The level rides on a class, so the stylesheet
-        // keeps drawing each level as it did (ChatView.css `.markdown h1`...`.markdown h6`).
-        return <h3 key={key} className={`markdown-h${block.level}${block.align ? " markdown-center" : ""}`}><Inline nodes={block.content} /></h3>;
+        // keeps drawing each level as it did (ChatView.css `.markdown-h1`...`.markdown-h6`), and on
+        // aria-level, so a screen reader keeps the text's own levels apart below the app's: its # is
+        // level 3, its ## level 4, on to the deepest level there is
+        return <h3 key={key} className={`markdown-h${block.level}${block.align ? " markdown-center" : ""}`} aria-level={Math.min(block.level + 2, 6)}><Inline nodes={block.content} /></h3>;
       case "paragraph":
         return <p key={key} className={block.align ? "markdown-center" : undefined}>{block.lines.map((line, lineIndex) => <span key={lineIndex}><Inline nodes={line} standalone={standaloneImage(line)} />{lineIndex < block.lines.length - 1 && <br />}</span>)}</p>;
       case "list": return <List key={key} block={block} />;
@@ -473,8 +482,12 @@ function Blocks({ blocks }: { blocks: MarkdownBlock[] }) {
  * Markdown rendered. Its props are primitive values, so `memo` skips a parent's re-render: a long plan in
  * the file viewer is not rendered again every time the app polls.
  */
-export const Markdown = memo(function Markdown({ children, className, html = false, skills = null }: { children: string; className?: string; html?: boolean; skills?: SkillMatcher | null }) {
-  const blocks = useMemo(() => parseMarkdown(children, 0, html), [children, html]);
+export const Markdown = memo(function Markdown({ children, className, html = false, skills = null, visualizations = false }: {
+  children: string; className?: string; html?: boolean; skills?: SkillMatcher | null;
+  /** a chat answer's: a Codex visualization reference is drawn as its preview card; elsewhere the reference stays text */
+  visualizations?: boolean;
+}) {
+  const blocks = useMemo(() => parseMarkdown(children, 0, html, visualizations), [children, html, visualizations]);
   // always a provider, which passes on the names around it when it has none of its own: the pane's skill names
   // load after its text, and a tree that changed shape then would mount every message again, a decoded image
   // dropping back to its loading slot

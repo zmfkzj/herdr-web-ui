@@ -101,7 +101,7 @@ describe("installing the Pi visual bridge", () => {
       // the plain Update bridge of a current bridge is a no-op, as before
       expect((await until(manager.updateBridge(id).id)).phase).toBe("connected");
       expect(operations.slice(before)).toEqual(["verify:4242"]);
-      const update = await until(manager.updateBridge(id, false, "pi-visual").id);
+      const update = await until(manager.updateBridge(id, false, undefined, { feature: "pi-visual" }).id);
       expect(update.phase).toBe("connected");
       expect(operations.slice(-5)).toEqual(["install:pi-visual", "verify:4242", "stop:4242", "start", "verify:4243"]);
       expect(manager.piVisual(id)).toEqual({ protocol: 1 });
@@ -112,21 +112,21 @@ describe("installing the Pi visual bridge", () => {
   });
   it("leaves a bridge that already serves the tools running", async () => {
     await scenario({ current: { protocol: 1 } }, async ({ manager, id, operations, until }) => {
-      expect((await until(manager.updateBridge(id, false, "pi-visual").id)).phase).toBe("connected");
+      expect((await until(manager.updateBridge(id, false, undefined, { feature: "pi-visual" }).id)).phase).toBe("connected");
       expect(operations.some((step) => step.startsWith("install") || step.startsWith("stop:"))).toBe(false);
       expect(manager.piVisual(id)).toEqual({ protocol: 1 });
     });
   });
   it("replaces a bridge whose Pi visual routes are of another protocol", async () => {
     await scenario({ current: { protocol: 99 }, replacement: { protocol: 1 } }, async ({ manager, id, operations, until }) => {
-      expect((await until(manager.updateBridge(id, false, "pi-visual").id)).phase).toBe("connected");
+      expect((await until(manager.updateBridge(id, false, undefined, { feature: "pi-visual" }).id)).phase).toBe("connected");
       expect(operations).toContain("install:pi-visual");
       expect(manager.piVisual(id)).toEqual({ protocol: 1 });
     });
   });
   it("stops nothing when this server's bundle lacks the tools", async () => {
     await scenario({ current: null, bundleRefuses: true }, async ({ manager, id, operations, until }) => {
-      const update = await until(manager.updateBridge(id, false, "pi-visual").id);
+      const update = await until(manager.updateBridge(id, false, undefined, { feature: "pi-visual" }).id);
       expect(update.phase).toBe("failed");
       expect(update.error).toContain("does not include pi-visual");
       expect(operations.some((step) => step.startsWith("stop:") || step === "start")).toBe(false);
@@ -134,7 +134,7 @@ describe("installing the Pi visual bridge", () => {
   });
   it("does not call it a success when the new bridge does not serve the tools", async () => {
     await scenario({ current: null, replacement: null }, async ({ manager, id, until }) => {
-      const update = await until(manager.updateBridge(id, false, "pi-visual").id);
+      const update = await until(manager.updateBridge(id, false, undefined, { feature: "pi-visual" }).id);
       expect(update.phase).toBe("failed");
       expect(update.error).toContain("does not serve this server's Pi visual tools");
     });

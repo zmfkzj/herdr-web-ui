@@ -2,11 +2,12 @@ import type { AgentRowTokens } from "./pane-tokens.ts";
 import type { SharedPreferences } from "./preferences.ts";
 import type { PiVisualBridge } from "./pi-visual.ts";
 import type { HealthAuth, SecuritySummary, ServerMessage, SessionSnapshot } from "./protocol.ts";
+import type { MoveStatus, MoveUnavailable } from "./runtime-move.ts";
 import type { SeenFinish } from "./seen.ts";
 
 export const LOCAL_MACHINE = "local";
 export const BRIDGE_PROTOCOL = 1;
-export const REMOTE_BUNDLE_VERSION = "43";
+export const REMOTE_BUNDLE_VERSION = "48";
 export interface PaneTarget { machine_id: string; pane_id: string }
 export type MachineState = "connecting" | "connected" | "reconnecting" | "disconnected" | "error";
 export interface SshTarget {
@@ -14,6 +15,11 @@ export interface SshTarget {
   port?: number;
   identity_file?: string;
   session?: string;
+  herdr_socket?: string;
+  /** Socket identity of this account's own Ovis registration; reverified over SSH on every connection. */
+  own_ovis?: string;
+  /** Explicitly chosen on this PC; permits starting its configured session when absent. */
+  start_new_herdr?: boolean;
 }
 export interface Machine {
   /** Read-only identity inherited from the local herdr catalog. */
@@ -40,6 +46,11 @@ export interface Machine {
   error: string | null;
   /** Attention needed; windows_login retries, windows_start_failed waits for a startup decision. */
   action_required?: MachineAction | null;
+  /** herdr daemons found on the PC before this bridge was started */
+  found_herdr_sessions?: FoundHerdrSession[];
+  found_ovis?: FoundOvis[];
+  /** Runtime proved by the server's HerdrIdentity, absent until it answers. */
+  runtime?: "herdr" | "herdr-core";
   /** a bridge update running for this PC right now (in the background, or from its dialog) */
   updating?: MachineUpdate | null;
   /** the PC's latest roster as its server read it, with that read's order_epoch/read_seq copied unchanged */
@@ -66,6 +77,126 @@ export interface Machine {
    * to install its own update; without, it is "setup" and `reason` says why.
    */
   remote_ovis?: RemoteOvis | null;
+  /**
+   * The update this PC can take from here, told without being asked (the devices list's badge): absent or null
+   * when it is up to date or cannot tell yet (not connected, an older server). `POST /api/machines/:id/update`
+   * runs it; `updating` shows its steps. Not for this server's own PC (Settings → Updates) or a herdr-core machine.
+   */
+  ovis_update?: PcUpdateOffer | null;
+  /** why this PC's last update from here failed, in plain words; cleared when another one starts or it succeeds */
+  update_error?: string | null;
+  /**
+   * A connected SSH or relay PC's move to herdr-core (docs/runtime-move.md, "On another PC"), as its own
+   * GET /api/runtime/move tells it. Null when that PC cannot tell (an older Ovis, or a bridge with no
+   * runtime to switch); absent while it is not connected, not read yet, and for this PC and hc machines.
+   */
+  runtime_move?: PcMoveOffer | null;
+}
+/**
+ * An update a PC can take from here.
+ * - `bridge`: this app's bridge on an SSH PC is of another version; the bridge update replaces it (approved setup).
+ * - `own`: the PC runs its own Ovis (a relay PC, direct or through the relay, or an SSH PC's own server) and its own
+ *   updater offers a newer release, which it installs by revision when asked from here.
+ * - `install`: an SSH PC's own Ovis cannot update itself from here (started by hand, or a supervisor too old to
+ *   install by revision): this app does it over SSH (PcInstallJob), as `steps` says, then updates it.
+ * `updatable` false: `reason` says why in plain words, and asking for it is refused with that reason.
+ * Versions are releases without the v (`0.5.1`), null where the PC names none (a bridge).
+ */
+export interface PcUpdateOffer {
+  how: "bridge" | "own" | "install";
+  current_version: string | null;
+  latest_version: string | null;
+  updatable: boolean;
+  reason: string | null;
+  /**
+   * `own`, and an `install` that restarts its Ovis and then updates it: the release on offer (its commit), which an
+   * update asked for may name; only that release is installed
+   */
+  revision?: string | null;
+  /** `install` only: what it does on that PC, in plain words, for the person to read before they start it */
+  steps?: string[];
+}
+/**
+ * POST /api/machines/install: install Ovis on a PC over SSH with the official installer, pinned to this app's
+ * release (docs/remote-pcs.md). `machine_id` names a PC added here whose own Ovis cannot update itself (its offer's
+ * `how: "install"`); without one, the PC is added once Ovis answers there.
+ */
+/** POST /api/machines/install: a PC saved here by its id, or a new one by its SSH address (and a name for it) */
+export type PcInstallRequest = { machine_id: string } | (SshTarget & { name?: string; machine_id?: undefined });
+/** why an install over SSH stopped, for the words to show (`error` carries them in English) */
+export type PcInstallFailure = "ssh_refused" | "ssh_host_key" | "ssh_unreachable" | "unsupported" | "missing_tool" | "disk" | "permission"
+  | "bridge_there" | "ovis_there" | "changed" | "not_stopped" | "installer_failed" | "no_launcher" | "not_started" | "connect_failed";
+/**
+ * An install over SSH (GET /api/machines/install/:id). `mode`: `install` on a PC without Ovis; `replace` stops the
+ * Ovis server started by hand there, then installs; `restart` restarts an Ovis whose supervisor is too old through
+ * its own launcher, then updates it. `connect_job`: the setup job (GET /api/machines/setup/:id) that connects the PC.
+ * SSH uses keys only (BatchMode): nothing asks for a password.
+ */
+export interface PcInstallJob {
+  id: string;
+  machine_id: string | null;
+  target: SshTarget;
+  mode: "install" | "replace" | "restart";
+  phase: "connecting" | "checking" | "stopping" | "installing" | "starting" | "connecting_pc" | "connected" | "failed" | "cancelled";
+  step: string;
+  error: string | null;
+  error_code: PcInstallFailure | null;
+  connect_job: string | null;
+}
+/**
+ * POST /api/machines/:id/update, with an optional JSON body: `revision`, the offer's as shown. When the offer this
+ * server holds names another release, nothing is installed: 409 `update_unavailable`. When the PC itself offers
+ * another one by the time it is asked, the 202 update ends with `update_error` saying so, and nothing is installed.
+ */
+export interface PcUpdateRequest { revision?: string }
+/**
+ * POST /api/machines/:id/update: the update started; its steps show on the PC's `updating`. This and update-all are
+ * this PC's owner's only (403 `forbidden` otherwise), and need the `X-Herdr-Update: 1` header.
+ */
+export interface PcUpdateStarted { job_id: string }
+/**
+ * POST /api/machines/update-all: every PC with an update it can take. `started`: running now (own updates run side
+ * by side); `queued`: bridge updates, which run one after another (they share one bundle download) and show
+ * `updating.queued` until their turn; `skipped`: an update is offered but cannot run, with why. Up-to-date PCs are
+ * not listed.
+ */
+export interface PcUpdateAll {
+  started: { machine_id: string; job_id: string }[];
+  queued: string[];
+  skipped: { machine_id: string; reason: string }[];
+}
+/**
+ * Where another PC stands on the move to herdr-core. `serving: "herdr"` with `offered` is the "not moved
+ * yet" badge. `offered`: the move can start there, or herdr-core can be installed there first (`reason`
+ * is then "no_herdr_core"); otherwise `reason` says why not. `status` is the progress of its move.
+ */
+export interface PcMoveOffer {
+  serving: "herdr" | "herdr-core";
+  offered: boolean;
+  reason: MoveUnavailable | null;
+  status: PcMoveStatus;
+}
+/**
+ * A PC's move status as every roster (a watching device's too) may carry it: where it is and how far,
+ * and how many agents a move that could not finish left. Its reasons name folders and agents' words, so
+ * they stay in the plan answer (GET /api/machines/:id/runtime/move), which only a driving device reads.
+ */
+export type PcMoveStatus =
+  | { state: "idle" | "waiting" | "done" }
+  | Extract<MoveStatus, { state: "moving" }>
+  | { state: "rolled_back" | "interrupted"; left: number };
+/** POST /api/machines/runtime/move-all: the revision of each PC's plan as the person previewed it. */
+export interface MoveAllRequest {
+  plans: { machine_id: string; revision: string }[];
+}
+/**
+ * Its 202 answer: the PCs whose move started (each waits for its own busy panes), why the others did not,
+ * and those whose answer never came: the start may have reached them, so their move status says.
+ */
+export interface MoveAllResponse {
+  started: string[];
+  refused: { machine_id: string; code: string; message: string }[];
+  unknown: { machine_id: string; message: string }[];
 }
 /**
  * What a PC's own Ovis says of its own update (GET /api/updates there, read through the SSH tunnel).
@@ -143,6 +274,12 @@ export interface HerdrCoreLayout {
  * no name to change, and a helper whose parent is shown cannot go there (server/herdr-core/adapter.ts).
  */
 export const HC_OTHER_WORKSPACE_ID = "hc-other";
+/**
+ * A runtime a server can be asked to serve: herdr's TUI server, herdr-core (the Herdr app's core), or
+ * `alt-runtime`. `alt-runtime` is never picked from what the PC has, only by OVIS_RUNTIME or a choice
+ * saved from Settings, and a saved choice of it that cannot start falls back to herdr.
+ */
+export type RuntimeName = "herdr" | "herdr-core" | "alt-runtime";
 /** where this server's runtime came from: OVIS_RUNTIME, the choice saved from Settings, or what the PC has */
 export type RuntimeSource = "env" | "saved" | "detected";
 /** why Settings cannot switch the runtime: OVIS_RUNTIME decides, the server was not started by Ovis's launcher, or herdr-core is not served on this OS */
@@ -150,16 +287,17 @@ export type RuntimeLock = "env" | "unmanaged" | "platform";
 /**
  * Which runtime this server serves and what Settings may switch it to (GET /api/health, a driving
  * owner only). `switch_to`: the other runtime when this PC has it and nothing locks the choice.
- * `fallback`: the saved choice was herdr-core, but no herdr-core answered, so herdr is served.
+ * `fallback`: the saved choice was herdr-core, but no herdr-core answered (`no_herdr_core`), or it was
+ * alt-runtime, which could not start (`no_alt_runtime`), so herdr is served.
  */
 export interface HerdrRuntimeFacts {
-  serving: "herdr" | "herdr-core";
+  serving: RuntimeName;
   source: RuntimeSource;
   tui: { installed: boolean; running: boolean };
   app_installed: boolean;
-  switch_to: "herdr" | "herdr-core" | null;
+  switch_to: RuntimeName | null;
   locked: RuntimeLock | null;
-  fallback?: "no_herdr_core";
+  fallback?: "no_herdr_core" | "no_alt_runtime";
 }
 /**
  * What this PC has of herdr-core, the Herdr app's runtime, whichever runtime the server serves
@@ -173,9 +311,19 @@ export interface HerdrCoreFacts {
   session: string | null;
   running: boolean;
 }
-export type MachineAction = "connect" | "update_bridge" | "setup" | "bridge_conflict" | "windows_login" | "windows_start_failed";
+export interface FoundHerdrSession { socket_path: string; session?: string; label: string }
+export interface FoundOvis { socket_path: string; runtime: "herdr-core" }
+export type MachineAction = "connect" | "update_bridge" | "setup" | "bridge_conflict" | "windows_login" | "windows_start_failed" | "choose_herdr";
 /** `ovis`: the PC's own Ovis updates itself (Machine.remote_ovis); absent for a bridge this app installs */
-export interface MachineUpdate { job_id: string; step: string; progress: SetupProgress | null; ovis?: boolean }
+export interface MachineUpdate {
+  /** what cancels it: DELETE /api/machines/:id/update (any update), or a setup job's cancel; empty while `queued` */
+  job_id: string;
+  step: string;
+  progress: SetupProgress | null;
+  ovis?: boolean;
+  /** waiting for the bridge updates of Update all before it to finish */
+  queued?: boolean;
+}
 /**
  * Where a bridge install is. download (the web server fetching the bundle) and upload (the
  * bundle going to the PC over SSH) count bytes; install and restart have no size.
@@ -192,10 +340,13 @@ export interface MachineSettings {
    */
   set_aside?: string[];
 }
-export interface SetupRequest extends SshTarget { name?: string; machine_id?: string; update_remote?: boolean }
+export interface SetupRequest extends SshTarget { name?: string; machine_id?: string; update_remote?: boolean; start_new_herdr?: boolean }
 export type SetupPhase = "connecting" | "authentication" | "checking" | "approval" | "installing" | "starting" | "connected" | "failed" | "cancelled";
 export interface SetupChallenge { id: string; kind: "host_key" | "secret"; prompt: string }
 export interface SetupJob {
+  found_herdr_sessions?: FoundHerdrSession[];
+  found_ovis?: FoundOvis[];
+  runtime?: "herdr" | "herdr-core";
   id: string;
   machine_id: string;
   phase: SetupPhase;
@@ -264,6 +415,18 @@ export interface RelayPairingRequest {
   expires_at: string;
   /** absent from an older server: `pc` */
   intent?: PairingIntent;
+  /**
+   * Asked while this PC waited to be added to an account (docs/account.md, "Adding a PC"): the device
+   * added from shows no digits, its person types this PC's there. It follows the PC's window, so a
+   * device that came by an ordinary link meanwhile has it too and shows digits to compare.
+   * Absent from an older server, or when false.
+   */
+  local_only?: boolean;
+  /**
+   * How long the request still waits, counted by the PC when it told this list: a window counts down
+   * from when it heard, since its own clock need not match the PC's `expires_at`. Absent from an older server.
+   */
+  left_ms?: number;
 }
 /**
  * The same request as an account member connected through the relay sees it: three candidates
@@ -278,6 +441,12 @@ export interface RemotePairingRequest {
   expires_at: string;
   /** the new device's key (P-256 SPKI, base64url) from PAIR_REQUEST, bound by its commitment and the digits: what the approver signs an `add` for */
   key: string;
+  /**
+   * Another PC of the account vouched for by an admission (`pair-intent-pc-vouched`, docs/account.md "Adding a PC of
+   * your account"): its intent stays `pc`, so nothing is signed for it, and the approver shows who is asking and checks
+   * the admission as for an account join. Absent from an older server, or when false.
+   */
+  vouched?: true;
 }
 
 export type MachineEvent = { type: "machines"; machines: Machine[] } | { type: "machine-message"; machine_id: string; message: ServerMessage }
@@ -300,8 +469,10 @@ export interface RemotePairingsEvent { type: "remote-pairings"; pairings: Remote
  * serves. `accepted`: its launcher took it as its own past the startup check (absent when no launcher
  * runs it). All three absent from older servers.
  */
-export interface BridgeHealth { ok: true; auth: HealthAuth; bridge_protocol: number; security?: SecuritySummary; web_ui?: { boot_id: string }; runtime?: "herdr" | "herdr-core"; accepted?: boolean; /** a driving owner only, as on the whole answer */ herdr_runtime?: HerdrRuntimeFacts }
+export interface BridgeHealth { ok: true; auth: HealthAuth; bridge_protocol: number; security?: SecuritySummary; web_ui?: { boot_id: string }; runtime?: RuntimeName; accepted?: boolean; /** a driving owner only, as on the whole answer */ herdr_runtime?: HerdrRuntimeFacts }
 export interface BridgeIdentity {
+  /** Only on an authenticated /api/bridge?discover=herdr request. */
+  found_herdr_sessions?: FoundHerdrSession[];
   pid: number;
   managed_remote: boolean;
   bridge_protocol: number;

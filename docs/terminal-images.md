@@ -135,7 +135,7 @@ not show stale ones).
    `remote-v29` bundle ignores `session`/`digest`, sends no echo, and its pane shows no images. A
    remote PC resolves its images itself, so a fix to the id rule reaches it only with a new bridge:
    `bun run build:remote <target>` on the connection server, then update that PC's bridge
-   (`POST /api/machines/<id>/update-bridge?feature=pi-visual`, which installs over the same version).
+   (`POST /api/machines/<id>/update-bridge` with `{ "feature": "pi-visual" }`, which installs over the same version).
 2. **Pi on every PC (local and remote) where images should show:** pi 1.3.x and the pi images
    extension with terminal references (`oh-my-pi-extensions/images`, `src/terminal-refs.ts`, from
    its commit d264707). It writes markers only when pi uses Kitty images inside a herdr pane

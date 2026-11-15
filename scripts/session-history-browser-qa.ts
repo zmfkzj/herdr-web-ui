@@ -155,7 +155,7 @@ try {
   };
   // the workspace menu lists the item beside Rename workspace, and it opens the folder's sessions newest first
   const menu = await openMenu("w1");
-  assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "Rename workspace", "Earlier sessions…", "Close workspace"]);
+  assert.deepEqual(await menu.getByRole("menuitem").allTextContents(), ["Pin workspace", "New tab with agent…", "Rename workspace", "Earlier sessions…", "Close workspace"]);
   await page.keyboard.press("Escape");
   await menu.waitFor({ state: "detached" });
   await openHistory("w1");
@@ -353,7 +353,7 @@ try {
   await picker.locator(".agent-mark.claude").waitFor();
   assert.equal(await picker.locator(".agent-picker-label").textContent(), "Claude Code");
   await dialog.locator(".session-empty").waitFor();
-  assert.equal(await dialog.locator(".session-empty").textContent(), "No earlier Claude Code sessions in this folder.");
+  assert.equal(await dialog.locator(".session-empty").textContent(), "No earlier Claude Code sessions in this folder. Choose another agent.");
   await page.keyboard.press("Escape");
   await dialog.waitFor({ state: "detached" });
   console.log("PASS the agent picker lists the agents with their marks, closes its list alone on Escape and takes the keys; an empty store is said in words");
@@ -564,7 +564,7 @@ try {
   // StrictMode mounts the sidebar's effect twice in this development bundle: each probe is query-less
   assert.ok(probes.length >= 1 && probes.every((query) => query === ""), `the probe carries no workspace and lists no session: ${JSON.stringify(probes)}`);
   const remoteMenu = await openMenu("w1");
-  assert.deepEqual(await remoteMenu.getByRole("menuitem").allTextContents(), ["Pin workspace", "Rename workspace", "Close workspace"], "no Earlier sessions on a PC whose bridge cannot list them");
+  assert.deepEqual(await remoteMenu.getByRole("menuitem").allTextContents(), ["Pin workspace", "New tab with agent…", "Rename workspace", "Close workspace"], "no Earlier sessions on a PC whose bridge cannot list them");
   await settled(page);
   await page.screenshot({ path: join(evidence, "remote-404.png") });
   await page.keyboard.press("Escape");

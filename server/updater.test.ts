@@ -55,6 +55,30 @@ afterEach(() => {
 });
 
 /**
+ * A port for the managed bridge that nothing listens on, held for a moment to make sure, then given
+ * back. The bridge binds it three process starts later (launcher, supervisor, bridge), and again
+ * each time an update or a restart replaces the bridge.
+ *
+ * Below 32768, under the ports a system hands out on its own by default: Linux gives a listener on
+ * port 0 or an outgoing connection one from 32768 up (ip_local_port_range), macOS and Windows from
+ * 49152 up. A port asked of the system with port 0 and given back is one of those: the next
+ * `port: 0` server of a test file running beside this one can be handed it before the bridge binds
+ * it, and the bridge then fails to start (EADDRINUSE) while the test waits for its answer. Below
+ * 20000 too, where scripts/check.test.ts takes the ports of its runs: the unit tests run beside
+ * this file in `bun run check concurrent`.
+ */
+function bridgePort(): number {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const port = 10_000 + Math.floor(Math.random() * 10_000);
+    try {
+      Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } }).stop(true);
+      return port;
+    } catch { /* taken: another port */ }
+  }
+  throw new Error("no free port for the managed bridge");
+}
+
+/**
  * A real launcher + supervisor + bridge on a free port, serving the fixture checkout. Given `home`,
  * they run with it as $HOME and keep their state in the default dir under it, as an install not
  * told OVIS_STATE_DIR does.
@@ -62,9 +86,12 @@ afterEach(() => {
 async function managedFixture(supervisor?: string, slowHealth = false, home?: string) {
   updater.stop();
   mkdirSync(join(upstream, "server"), { recursive: true });
+  // The bridge is this repository's server code started from a file in the fixture's tree. A real bridge's code is in
+  // the tree it serves; this one is told so before that code loads (server/entries.ts reads OVIS_ASSETS once, then)
   const entry = `
-    import { createServer } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};
-    import { connectUpdater } from ${JSON.stringify(join(import.meta.dir, "update-api.ts"))};
+    process.env.OVIS_ASSETS = require("node:path").join(import.meta.dir, "..");
+    const { createServer } = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+    const { connectUpdater } = await import(${JSON.stringify(join(import.meta.dir, "update-api.ts"))});
     ${slowHealth ? `
     // a busy PC: the bridge answers, but its first six health checks outlast the supervisor's 1 s probe
     // timeout, so they are refused on any machine and the start takes about 6.6 s (fixed 800 ms let a
@@ -82,8 +109,7 @@ async function managedFixture(supervisor?: string, slowHealth = false, home?: st
   if (supervisor !== undefined) writeFileSync(join(upstream, "server/supervisor.ts"), supervisor);
   await commit("managed initial");
   await git(root, "pull", "--ff-only", "--quiet");
-  const reservation = Bun.serve({ port: 0, fetch: () => new Response() });
-  const port = reservation.port!; reservation.stop(true);
+  const port = bridgePort();
   const origin = `http://127.0.0.1:${port}`;
   const headers = { authorization: "Bearer test-managed-token", "x-herdr-update": "1" };
   // what the launcher, the supervisor and the bridge print: a failed test prints it
@@ -156,7 +182,9 @@ function copySupervisor(into: string) {
     const copy = join(into, relative(repo, file));
     mkdirSync(dirname(copy), { recursive: true });
     writeFileSync(copy, source);
-    for (const { path } of transpiler.scanImports(source)) {
+    // what it loads as it starts, not the entries server/entries.ts names by import(): those are the whole server
+    for (const { path, kind } of transpiler.scanImports(source)) {
+      if (kind !== "import-statement") continue;
       const imported = resolve(dirname(file), path);
       if (path.startsWith(".") && !files.includes(imported)) files.push(imported);
     }
@@ -350,6 +378,69 @@ describe("managed source updates with real Git repositories and builds", () => {
     expect((await resumed.initialize())?.directory).toBe(saved.directory);
     resumed.stop();
     expect(launcherSupervisor(root, stateDir)).toBe(join(saved.directory, "server", "supervisor.ts"));
+  });
+
+  it("keeps an offer up while a later check runs, and ends it only with a check's answer (#3325)", async () => {
+    const target = await release("second", "v0.2.0");
+    // the page polls the published status: a check that withdrew the offer while it ran made the
+    // app-wide line blink out, and the terminal under it resize
+    const published: Array<{ phase: string; available: boolean }> = [];
+    const watched = new Updater({ ...updater.options, publish(status) { published.push({ phase: status.phase, available: status.available }); } });
+    await watched.initialize();
+    await watched.request("check");
+    expect(watched.status).toMatchObject({ available: true, latest_revision: target });
+    published.length = 0;
+    await watched.request("check");
+    expect(published.at(0)).toEqual({ phase: "checking", available: true });
+    expect(published.filter((status) => !status.available)).toEqual([]);
+
+    // a check that cannot reach the releases ends the offer: the server refuses an install then
+    await git(root, "remote", "set-url", "origin", join(directory, "missing"));
+    await watched.request("check");
+    expect(watched.status).toMatchObject({ phase: "error", available: false });
+    await git(root, "remote", "set-url", "origin", upstream);
+    await watched.request("check");
+    expect(watched.status).toMatchObject({ phase: "idle", available: true });
+
+    // so does a check that finds the checkout blocked
+    writeFileSync(join(root, "local-change.txt"), "x");
+    await watched.request("check");
+    expect(watched.status.blocked_reason).not.toBeNull();
+    expect(watched.status.available).toBe(false);
+    watched.stop();
+  });
+
+  it("ends the offer when the checkout becomes blocked while the release builds (#3325)", async () => {
+    await release("second", "v0.2.0");
+    // the checkout changes while the release builds: the check after the build finds it blocked
+    const building = new Updater({ ...updater.options, publish(status) {
+      if (status.step === "build" && !existsSync(join(root, "local-change.txt"))) writeFileSync(join(root, "local-change.txt"), "x");
+    } });
+    await building.initialize();
+    await building.request("install");
+    expect(building.status.phase).toBe("error");
+    expect(building.status.blocked_reason).toContain("local changes");
+    expect(building.status.available).toBe(false);
+    building.stop();
+  });
+
+  it("never shows an offer under a channel it was not made on while the check runs (#3325)", async () => {
+    const appState = join(directory, "app-state");
+    mkdirSync(appState);
+    writeFileSync(join(appState, UPDATE_CHANNEL_FILE), "beta\n");
+    const published: Array<{ phase: string; channel: string | undefined; available: boolean }> = [];
+    const switched = new Updater({ root, stateDir, autoUpdate: false, activate: async (_next, persist) => persist(),
+      publish(status) { published.push({ phase: status.phase, channel: status.channel, available: status.available }); },
+      channel: () => updateChannel({}, appState) });
+    await switched.initialize();
+    await release("beta", "beta/v0.2.0-beta.1");
+    await switched.request("check");
+    expect(switched.status).toMatchObject({ channel: "beta", available: true });
+    writeFileSync(join(appState, UPDATE_CHANNEL_FILE), "stable\n");
+    published.length = 0;
+    await switched.request("check");
+    expect(published.filter((status) => status.channel === "stable" && status.available)).toEqual([]);
+    switched.stop();
   });
 
   it("tells what an update brings from the release's own changelog, every release since the running one", async () => {
@@ -764,7 +855,7 @@ describe("managed source updates with real Git repositories and builds", () => {
   it("takes a bridge by its own answer, or by the whole one when it predates the bridge-scope boot id, and tells it", async () => {
     // runSupervisor in a stand-in child, as above: the bridge is a fake whose health answers say what
     // a bridge of this revision says (its boot id and runtime in ?scope=bridge) or an older one (none)
-    const asked = async (older: boolean, herdrSocket?: string) => {
+    const asked = async (older: boolean, herdrSocket?: string, runtime = "herdr") => {
       const root = mkdtempSync(join(directory, "launch-root-"));
       const stateDir = mkdtempSync(join(directory, "launch-state-"));
       const record = join(stateDir, "launch-record.json");
@@ -788,7 +879,7 @@ describe("managed source updates with real Git repositories and builds", () => {
         globalThis.fetch = (async (url: string) => {
           urls.push(new URL(url).search);
           const bridge = new URL(url).search === "?scope=bridge";
-          return { ok: true, json: async () => bridge ? (${older} ? { ok: true } : { ok: true, web_ui: { boot_id: bootId }, runtime: "herdr" }) : { web_ui: { boot_id: bootId } } };
+          return { ok: true, json: async () => bridge ? (${older} ? { ok: true } : { ok: true, web_ui: { boot_id: bootId }, runtime: ${JSON.stringify(runtime)} }) : { web_ui: { boot_id: bootId } } };
         }) as unknown as typeof fetch;
         await (await import(${JSON.stringify(join(import.meta.dir, "supervisor.ts"))})).runSupervisor(${JSON.stringify(root)});
         writeFileSync(${JSON.stringify(record)}, JSON.stringify({ urls, sent }));
@@ -813,6 +904,8 @@ describe("managed source updates with real Git repositories and builds", () => {
     const older = await asked(true);
     expect(older.urls).toEqual(["?scope=bridge", ""]);
     expect(older.sent.filter((message) => message.type === "bridge-accepted")).toHaveLength(1);
+    // a runtime the bridge starts itself must answer, whichever it is: none is taken on the bridge's word alone
+    for (const runtime of ["herdr-core", "alt-runtime"]) expect((await asked(false, undefined, runtime)).urls).toEqual(["?scope=bridge", ""]);
     if (process.platform === "win32") return; // herdr's socket is a named pipe there: no unix socket file is left behind
     // a socket file a killed herdr left behind refuses the connect: herdr is stopped, as with no socket (#2670)
     const stale = join(mkdtempSync(join(directory, "stale-")), "herdr.sock");
@@ -1476,4 +1569,54 @@ describe("update channels", () => {
       expect(updateChannel({ OVIS_UPDATE_CHANNEL: "beta" }, appState)).toBe("beta");
     } finally { rmSync(appState, { recursive: true, force: true }); }
   });
+});
+
+it("cancels an install while it builds: nothing is installed, its offer stays, and it is not taken for a failed release", async () => {
+  const running = updater.status.current_revision;
+  // a release whose build never ends on its own
+  writeFileSync(join(upstream, "build-fixture.ts"), "await new Promise(() => {});");
+  await git(upstream, "add", ".");
+  await git(upstream, "commit", "-qm", "slow build");
+  await git(upstream, "tag", "v9.0.0");
+  const building = Promise.withResolvers<void>();
+  const watched = new Updater({ ...updater.options, publish(status) { if (status.step === "build") building.resolve(); } });
+  await watched.initialize();
+  try {
+    // nothing to cancel before an install runs
+    expect(watched.cancel("11111111-2222-4333-8444-555555555555")).toBe(false);
+    const install = watched.request("install", true, undefined, "11111111-2222-4333-8444-555555555555");
+    await building.promise;
+    // another's id (another device's install, or this PC's own Settings') never stops it
+    expect(watched.cancel("99999999-2222-4333-8444-555555555555")).toBe(false);
+    expect(watched.cancel("11111111-2222-4333-8444-555555555555")).toBe(true);
+    await install;
+    expect(watched.status).toMatchObject({ phase: "error", error_code: "update_cancelled", current_revision: running, available: true, install_cancellable: true });
+    expect(existsSync(join(stateDir, "failed.json"))).toBe(false);
+    // the 5-minute timer's check (auto-update on) leaves the cancelled release alone: it would build it again otherwise
+    (watched.options as { autoUpdate: boolean }).autoUpdate = true;
+    await watched.request("check");
+    expect(watched.status.phase).toBe("idle");
+    expect(watched.status.current_revision).toBe(running);
+  } finally { watched.stop(); }
+});
+
+it("stops an install cancelled while it still checks what is on offer, before anything is built", async () => {
+  writeFileSync(join(upstream, "build-fixture.ts"), "await new Promise(() => {});");
+  await git(upstream, "add", ".");
+  await git(upstream, "commit", "-qm", "slow build");
+  await git(upstream, "tag", "v9.0.1");
+  const seen: Array<string | null> = [];
+  const watched: Updater = new Updater({ ...updater.options, publish(status) {
+    seen.push(status.step ?? null);
+    // asked as soon as the run starts checking
+    if (status.phase === "checking" && !asked) asked = watched.cancel("11111111-2222-4333-8444-555555555555");
+  } });
+  let asked = false;
+  await watched.initialize();
+  try {
+    await watched.request("install", true, undefined, "11111111-2222-4333-8444-555555555555");
+    expect(asked).toBe(true);
+    expect(watched.status).toMatchObject({ phase: "error", error_code: "update_cancelled", available: true });
+    expect(seen).not.toContain("build");
+  } finally { watched.stop(); }
 });

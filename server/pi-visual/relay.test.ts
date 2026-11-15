@@ -117,7 +117,7 @@ beforeAll(async () => {
           relay.close(); return new Response("upgrade", { status: 426 });
         } catch (error) { return new Response(error instanceof Error ? error.message : "refused", { status: 403 }); }
       }
-      return handleMachineRequest(request, manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, { desktops });
+      return handleMachineRequest(request, manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, false, { desktops });
     },
     websocket: { open(ws) { ws.data.relay.bind(ws as ServerWebSocket<unknown>); }, message(ws, raw) { ws.data.relay.message(String(raw)); }, close(ws) { ws.data.relay.close(); } },
   });
@@ -218,12 +218,12 @@ describe("private desktops of other PCs", () => {
   });
 
   it("decides HTTPS and its own switch on the browser's request, before the PC is asked", async () => {
-    const insecure = await handleMachineRequest(new Request("http://pc.example.net/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://pc.example.net" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, { desktops });
+    const insecure = await handleMachineRequest(new Request("http://pc.example.net/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://pc.example.net" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, false, { desktops });
     expect(insecure.status).toBe(403);
     expect((await insecure.json() as { error: { code: string } }).error.code).toBe("https_required");
     // straight over Tailscale to this server's tailnet address (index.ts: directTailnetRequest): plain http passes,
     // and the browser still needs its own `/gui view` grant
-    const overTailnet = (encrypted: boolean) => handleMachineRequest(new Request("http://100.127.163.32:7318/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://100.127.163.32:7318" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, { desktops, encrypted });
+    const overTailnet = (encrypted: boolean) => handleMachineRequest(new Request("http://100.127.163.32:7318/api/machines/pc-b/pane/pi-visual/desktop?pane_id=p1", { method: "POST", headers: { "x-herdr-machine": "1", "content-type": "application/json", cookie: COOKIE, origin: "http://100.127.163.32:7318" }, body: JSON.stringify(AUTO) }), manager as unknown as MachineManager, undefined, undefined, false, undefined, undefined, undefined, undefined, false, { desktops, encrypted });
     expect((await (await overTailnet(true)).json() as { error: { code: string } }).error.code).toBe("gui_view_required");
     ran("pc-b");
     const cleartext = await overTailnet(false);
@@ -323,7 +323,8 @@ describe("private desktops of other PCs", () => {
 
   it("keeps a review image's sandbox and nosniff through the PC proxy", async () => {
     const image = await fetch(`http://127.0.0.1:${local.port}/api/machines/pc-b/pane/pi-visual/review/image?pane_id=p1&session=${SESSION}&id=x`);
-    expect(image.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+    // the proxy's own policy for every PC answer (machine-api.ts), as strict as the review image's
+    expect(image.headers.get("content-security-policy")).toBe("sandbox; default-src 'none'");
     expect(image.headers.get("x-content-type-options")).toBe("nosniff");
   });
 });

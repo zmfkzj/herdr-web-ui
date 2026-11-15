@@ -742,6 +742,34 @@ describe("approving a device that asks to join the account", () => {
     expect(vouchedAdmission(tied, "pc-x", "k", now)?.label).toBe(vouchedAdmission([...tied].reverse(), "pc-x", "k", now)?.label);
   });
 
+  it("declines another PC of the account vouched for when the account service never saw its key ask at that PC", async () => {
+    const { service, X } = await setUp();
+    const decisions: string[] = [];
+    let admitted = false;
+    const outcome = approveJoin({
+      request: { id: "r1", label: "Ovis on Desk", intent: "pc", vouched: true, choices: ["111111", "222222", "333333"], expires_at: "", key: (await accountKey()).public_spki },
+      digits: "111111", through: X, service, decide: async (decision) => { decisions.push(decision); }, admit: async () => { admitted = true; },
+    });
+    await expect(outcome).rejects.toBeInstanceOf(UnverifiedJoinError);
+    expect(decisions).toEqual(["decline"]);
+    expect(admitted).toBe(false);
+  });
+
+  it("approves another PC of the account vouched for only on that PC: its admission checked, nothing signed", async () => {
+    const { service, X } = await setUp();
+    const desk = await accountKey();
+    await service.postAdmission(X, "Ovis on Desk", desk.public_spki, "linux");
+    const shown = vouchedAdmission(await service.recentAdmissions(), X, desk.public_spki, Date.now())!;
+    const decisions: string[] = [];
+    let admitted = false;
+    await approveJoin({
+      request: { id: "r1", label: "Ovis on Desk", intent: "pc", vouched: true, choices: ["111111", "222222", "333333"], expires_at: "", key: desk.public_spki },
+      digits: "222222", through: X, service, shown, decide: async (decision, digits) => { decisions.push(`${decision}:${digits}`); }, admit: async () => { admitted = true; },
+    });
+    expect(decisions).toEqual(["approve:222222"]);
+    expect(admitted).toBe(false);
+  });
+
   it("approves a request for this PC only without adding the device to the account", async () => {
     const { service, X } = await setUp();
     let admitted = false;
@@ -782,7 +810,7 @@ it("leaves the account from this device: every PC revokes it from its mailbox, a
   await accountStore.set("session", { service: SERVICE, account: ACCOUNT, provider: "github", access_token: service.issueToken(ACCOUNT), refresh_token: "r", expires_at: Date.now() + 3600_000 });
   const account = new AccountService({ store: accountStore, fetch: service.fetch });
   for (const at of [a, b]) await account.putPc(at.identity.server_id, { label: "pc", public_key: Array.from(importPublicKey(at.identity.public_key), (byte) => byte.toString(16).padStart(2, "0")).join(""), relay: "wss://relay.example" });
-  expect((await leaveAccount({ service: account, accountStore, relayStore: phone })).unconfirmed).toEqual([]);
+  expect((await leaveAccount({ service: account, accountStore, relayStore: phone, session: (await account.session())! })).unconfirmed).toEqual([]);
   expect(await phone.list()).toEqual([]);
   expect(await accountStore.get("session")).toBeUndefined();
   for (const at of [a, b]) {
@@ -873,7 +901,7 @@ it("keeps a pairing the account does not list when this device leaves, and says 
   const account = new AccountService({ store: accountStore, fetch: service.fetch });
   // only one PC is in the directory: the other never reached it (or the service hides it)
   await account.putPc(a.identity.server_id, { label: "pc", public_key: Array.from(importPublicKey(a.identity.public_key), (byte) => byte.toString(16).padStart(2, "0")).join(""), relay: "wss://relay.example" });
-  const { unconfirmed } = await leaveAccount({ service: account, accountStore, relayStore: phone });
+  const { unconfirmed } = await leaveAccount({ service: account, accountStore, relayStore: phone, session: (await account.session())! });
   expect(unconfirmed).toEqual([hidden.identity.server_id]);
   expect((await phone.list()).map((device) => device.server_id)).toEqual([hidden.identity.server_id]);
   // the listed PCs tombstone that key: the next sign-in makes a new one, and the kept pairing still connects with its own
@@ -951,6 +979,6 @@ it("does not count a PC as reached when this device holds the account key there 
   for (const at of [x, y]) await account.putPc(at.identity.server_id, { label: "pc", public_key: Array.from(importPublicKey(at.identity.public_key), (byte) => byte.toString(16).padStart(2, "0")).join(""), relay: "wss://relay.example" });
   const { unconfirmed } = await removeFromAccount({ service: account, accountStore, relayStore: phone, key: lost.public_spki, account: ACCOUNT, hereId: x.identity.server_id, here: pcFetch(await connect(x, onX)) });
   expect(unconfirmed).toEqual([y.identity.server_id]);
-  const left = await leaveAccount({ service: account, accountStore, relayStore: phone });
+  const left = await leaveAccount({ service: account, accountStore, relayStore: phone, session: (await account.session())! });
   expect(left.unconfirmed).toEqual([y.identity.server_id]);
 });

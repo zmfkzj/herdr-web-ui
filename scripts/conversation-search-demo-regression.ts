@@ -6,6 +6,7 @@ import { chromium, type Page } from "playwright-core";
 import panes from "../site/demo/fixtures/panes.json";
 import { buildDemoApp } from "./demo-build.ts";
 import { chromePath } from "./chrome-path.ts";
+import { openMoreGroup } from "./header-more.ts";
 
 // Search conversation (#2018) in the unmodified app over the demo's fixture transport: offered in
 // the pane's menu and the palette where the PC's bridge searches, opened there, a pick opening the
@@ -16,11 +17,20 @@ const app = mkdtempSync(join(tmpdir(), "ovis-search-demo-"));
 const evidence = process.env.UI_EVIDENCE_DIR;
 if (evidence) mkdirSync(evidence, { recursive: true });
 
-/** The pane's menu: a mouse right-clicks the pane; a phone's header, which lists the tabs, has More carry the pane's actions. */
+/**
+ * The pane's menu: a mouse right-clicks the pane; a phone's header, which lists the tabs, has More carry the pane's actions,
+ * its find items under Find… when there are two of them (G-143).
+ */
 const paneMenu = async (page: Page, width: number): Promise<void> => {
-  if (width >= 640) await page.locator(".pane-frame.is-current .chat-view").click({ button: "right", position: { x: 300, y: 200 } });
-  else await page.locator(".header-more-button").click();
-  await page.getByText("Close pane", { exact: true }).first().waitFor();
+  if (width >= 640) {
+    await page.locator(".pane-frame.is-current .chat-view").click({ button: "right", position: { x: 300, y: 200 } });
+    await page.getByText("Close pane", { exact: true }).first().waitFor();
+    return;
+  }
+  await page.locator(".header-more-button").click();
+  await page.locator(".row-sheet").waitFor();
+  await openMoreGroup(page, "find");
+  await page.getByText("Find in terminal", { exact: true }).waitFor();
 };
 const paletteActions = async (page: Page): Promise<string[]> => {
   await page.keyboard.press("Control+Shift+K");
@@ -87,13 +97,17 @@ try {
   try {
     for (const [width, height] of [[1280, 800], [390, 844]] as const) {
       const context = await browser.newContext({ viewport: { width, height }, locale: "en-US", hasTouch: width < 640, isMobile: width < 640 });
-      await context.addInitScript(() => localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" })));
+      // a phone's More folds the pane's Find items where its tabs are in the header (Settings -> Tabs on a phone)
+      await context.addInitScript(() => { localStorage.setItem("ovis:settings", JSON.stringify({ language: "en" })); localStorage.setItem("ovis:phone-tabs", JSON.stringify("header")); });
       const page = await context.newPage();
       const errors: string[] = [];
       page.on("pageerror", (error) => errors.push(error.message));
       await page.goto(url());
       await page.locator(".conn-live").waitFor({ state: "attached" });
       await page.locator(".pane-frame.is-current .chat-turn").first().waitFor();
+      // the demo ends this turn 4.5 s after load (site/demo/transport.ts) and adds its final answer to it: search the
+      // conversation as it is after that, never across it
+      await page.locator(".pane-frame.is-current .chat-turn").getByText("6 tests pass.", { exact: false }).first().waitFor();
 
       await paneMenu(page, width);
       if (evidence) await page.screenshot({ path: join(evidence, `conversation-search-menu-${width}.png`) });
@@ -103,7 +117,7 @@ try {
       await dialog.getByText("Searched the whole conversation.").waitFor();
       // the agent's answers and the user's message; the commentary before the tools is work, and no tool's output counts
       assert.deepEqual(await dialog.locator(".conversation-search-snippet").allTextContents(), [
-        "Adding a payments_idempotent_replays_total counter next to the existing request metrics.",
+        "Adding a payments_idempotent_replays_total counter next to the existing request metrics. Added payments_idempotent_replays_total, incremented where a stored response is replayed, and exposed…",
         "Nice. Now add a metric for replayed requests.",
         "…colliding. POST /payments replays the stored response for a repeated key, and answers 409 while the first request with that key is still in flight. A repeated key with a different body is…",
       ]);

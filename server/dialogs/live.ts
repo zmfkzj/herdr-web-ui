@@ -6,6 +6,7 @@ import { OMO_FOOTER_LINES, OMO_HINT_LINES, OMO_NOT_FOOTER_RE, OMO_OPTIONS_HINT_R
 import { CLAUDE_ASK_HINT_RE, CLAUDE_CONFIRM_HINT_RE, CLAUDE_EFFORT_HINT_RE, claudeModelListWaits, withoutClaudeSidePanel, withoutClaudeTasks } from "./claude.ts";
 import { OMP_CLIPPED_SINGLE_HINT_RE, OMP_MULTI_CLIPPED_HINT_RE, OMP_MULTI_HINT_RE, OMP_REVIEW_HINT_RE, OMP_SINGLE_CLIPPED_HINT_RE, OMP_SINGLE_HINT_RE, ompApprovalPanelShown } from "./omp.ts";
 import { HERMES_HINT_RE } from "./hermes.ts";
+import { AGY_ASK_HINT_RE } from "./agy.ts";
 import { PI_INPUT_HINT_RE, PI_MENU_HINT_RE, PI_THINKING_HINT_LINES } from "./pi.ts";
 import { openCodeV1QuestionActive } from "./opencode.ts";
 import { isPiQuestionnaireScreen } from "./pi-questionnaire.ts";
@@ -84,6 +85,7 @@ function omoFooterIsActive(lines: string[]): boolean {
   return rules === 1;
 }
 
+/** Whether the parsed dialog's hint or footer is still the active tail at the bottom of `screen`. */
 export function promptTailIsActive(prompt: ParsedPrompt, screen: string): boolean {
   const cleanLines = screen.replace(ANSI_RE, "").split(/\r?\n/).map(cleanLine);
   const visible = cleanLines.filter((line) => line && !isDivider(line));
@@ -106,6 +108,9 @@ export function promptTailIsActive(prompt: ParsedPrompt, screen: string): boolea
   // Hermes keeps its status line (and maybe the hint's wrapped tail) under the hint; an answered
   // question leaves the screen, so a hint among the last few lines is the live one
   if (prompt.responder === "hermes-question" || prompt.responder === "hermes-input") return shown.slice(-4).some((line) => HERMES_HINT_RE.test(line));
+  if (prompt.responder === "agy-question") return shown.slice(-6).some((_, at, tail) => AGY_ASK_HINT_RE.test(tail.slice(at, at + 3).join(" ")));
+  // its reader already found the panel over Hermes's own hint and the input it holds, nothing else under them
+  if (prompt.responder === "hermes-approval") return true;
   if (prompt.responder === "codex-menu") return ends(CODEX_CONTINUE_HINT_RE);
   if (prompt.responder === "codex-question") return ends(CODEX_ASK_HINT_RE);
   if (prompt.responder === "codex-async-question") return cleanLines.slice(-4).some((line) => CODEX_ASYNC_ASK_HINT_RE.test(line)) || ends(CODEX_ASYNC_ASK_HINT_RE);
@@ -129,6 +134,10 @@ export function promptTailIsActive(prompt: ParsedPrompt, screen: string): boolea
   if (prompt.responder === "claude-goal") return ends(/esc to dismiss$/i);
   if (prompt.responder === "claude-model") return claudeModelListWaits(screen);
   if (prompt.responder === "claude-effort") return ends(CLAUDE_EFFORT_HINT_RE);
+  // Letta's pickers end the screen with their own hint (parseLettaModel, parseLettaEffort)
+  // or, when its search matches nothing, with the line saying so
+  if (prompt.responder === "letta-model") return ends(/^(?:enter select · ↑↓ navigate · ←→\/tab switch · esc cancel|no models match your search\.)$/i);
+  if (prompt.responder === "letta-effort") return ends(/^enter select · ←→\/tab switch · esc back$/i);
   if (prompt.responder === "codex-model") return ends(/(?:^|\s)enter select\s*·\s*esc back$|(?:^|\s)enter (?:default|apply)\s*·\s*s session\s*·\s*esc back$/i);
   if (prompt.responder === "omo-question" || prompt.responder === "omo-review" || prompt.responder === "omo-typing") {
     // The form is live only with OmO's footer and extension status under its hint: blank lines, one

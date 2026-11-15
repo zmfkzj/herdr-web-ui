@@ -42,9 +42,10 @@ try {
     + event("assistant.message", { content: "Native Copilot answer.", phase: "final_answer", model: "fixture-model" }));
   // A Node script named copilot is a genuine foreground process with a PID-held native
   // marker; its stdin remains the pane's PTY so the regular composer can reach it.
+  // It keeps node's own process name, like an npm-installed Copilot: on WSL herdr leaves
+  // out the argv of a process named after an agent, which Copilot ownership cannot prove.
   writeFileSync(executable, `import { appendFileSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
-process.title = "copilot";
 const home = process.env.COPILOT_HOME;
 const marker = join(home, "session-state", process.argv[2], \`inuse.\${process.pid}.hold\`);
 mkdirSync(join(home, "session-state", process.argv[2]), { recursive: true });
@@ -99,6 +100,8 @@ console.log("fixture ready");`);
   if (await head.getAttribute("aria-expanded") !== "true") await head.click();
   await log.locator(".work-row-head").first().click();
   await log.locator(".chat-tool-more").click();
+  // a long whole output opens folded to its head: its own Show all unfolds it
+  await log.locator(".chat-tool-io.is-whole + .chat-tool-result-more[aria-expanded=false]").click();
   await log.getByText(/COPILOT_OUTPUT_END/).waitFor();
   await log.locator(".work-row-head").nth(1).click();
   await log.getByText("Proceed with this choice?").waitFor();
@@ -107,7 +110,16 @@ console.log("fixture ready");`);
   appendFileSync(transcript, event("session.resume", { selectedModel: "fixture-model" })
     + event("user.message", { content: "Follow-up prompt" })
     + event("assistant.message", { content: "Follow-up answer.", phase: "final_answer", model: "fixture-model" }));
-  await log.getByText("Follow-up answer.", { exact: true }).waitFor();
+  // The opened tool output is reading there (#1388): unless the view is back at the end by then, the
+  // turn arrives under New messages, and the list does not draw a row that far below the view.
+  const followUp = log.getByText("Follow-up answer.", { exact: true });
+  const newMessages = page.locator(`.pane-frame[data-layout-pane="${pane}"]`).getByRole("button", { name: "New messages" });
+  await followUp.or(newMessages).first().waitFor();
+  // looked up and clicked in one step in the page: the list settling at its end in between unmounts the
+  // button, and a locator click would wait on a button that is gone. New messages only, not the icon-only
+  // Jump to latest that shares its class
+  await page.evaluate((pane) => document.querySelector<HTMLButtonElement>(`.pane-frame[data-layout-pane="${pane}"] .chat-new-messages:not(.is-icon)`)?.click(), pane);
+  await followUp.waitFor();
   appendFileSync(transcript, event("user.message", { content: "Finish task" })
     + event("assistant.message", { toolRequests: [{ toolCallId: "finish-call", name: "task_complete",
       arguments: { summary: "Autopilot finished this task." } }] })

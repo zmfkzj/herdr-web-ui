@@ -211,6 +211,16 @@ export function addressesNode(input: Pick<AccessInput, "host" | "dnsName" | "tai
   return (input.dnsName !== null && name === input.dnsName.toLowerCase()) || (input.tailnetIp !== null && name === input.tailnetIp);
 }
 
+/**
+ * Is the Host one a request from this PC carries other than through a rebound name: a loopback name,
+ * or this PC's tailnet name or address (tailscale serve keeps the device's Host: serve.go
+ * `r.Out.Host = r.In.Host`)? A web page whose own name was rebound to 127.0.0.1 reaches a loopback
+ * server from loopback, and its Host and Origin are still that name. No Host at all is no browser's.
+ */
+export function knownAuthority(input: Pick<AccessInput, "host" | "dnsName" | "tailnetIp">): boolean {
+  return input.host === null || isLoopbackHost(input.host) || addressesNode(input);
+}
+
 /** The request shape of the owner's no-login grant: a serve-only install, a forwarded request from loopback with no login, not Funnel. */
 export function isServeOwnerRequest(input: Pick<AccessInput, "serveOnly" | "loopback" | "forwarded" | "funnel" | "tailscaleLogin">): boolean {
   return input.serveOnly && input.loopback && input.forwarded && !input.funnel && input.tailscaleLogin === null;
@@ -280,6 +290,16 @@ export function portalLogin(input: Pick<AccessInput, "portal">): PortalLogin | n
   return { user, method };
 }
 
+/**
+ * The owner, from any device he signed in or paired himself, for actions that change what runs on this PC's PCs
+ * (updates, installs, approving a setup, server/machine-api.ts): a driving sign-in on this PC, its token, its
+ * Tailscale login, or a driving device paired with this install, directly or over the relay (his phone, his other
+ * PCs). Never a visitor of an open install (nothing paired), a Portal visitor, or a device that only watches.
+ */
+export function ownerAccess(access: Access): boolean {
+  return access.level === "full" && access.role === "drive" && access.via !== "open" && access.via !== "portal";
+}
+
 export function decideAccess(input: AccessInput): Access {
   if (input.relayPeer !== undefined) return { level: "full", via: "relay", role: input.relayPeer.role, device: input.relayPeer };
   if (input.tokenMatched) return { level: "full", via: "token", role: "drive" };
@@ -296,6 +316,9 @@ export function decideAccess(input: AccessInput): Access {
     if (!(family === 4 ? tailnetIpv4.check(address, "ipv4") : family === 6 && tailnetIpv6.check(address, "ipv6"))) {
       return { level: "none", reason: "pairing_required" };
     }
+    // A page whose own name was rebound to 127.0.0.1 can type the login and the address too, but its
+    // Host stays its own name (knownAuthority)
+    if (!knownAuthority(input)) return { level: "none", reason: "pairing_required" };
     if (input.tailscaleLogin.toLowerCase() === input.owner.toLowerCase()) return { level: "full", via: "tailscale", role: "drive", login: input.tailscaleLogin };
     return { level: "none", reason: "other_user" };
   }
@@ -309,6 +332,8 @@ export function decideAccess(input: AccessInput): Access {
   }
   if (input.loopback && !input.forwarded) return { level: "full", via: "local", role: "drive" };
   if (input.loopback && input.forwarded && (input.owner !== null || input.tagged || input.serveOnly)) return { level: "none", reason: "pairing_required" };
+  // nor is the open grant: a rebound page on this PC is not a client of the open LAN
+  if (input.loopback && !knownAuthority(input)) return { level: "none", reason: "pairing_required" };
   // the public internet is never "open", whatever is paired
   if (!input.gated && !input.funnel) return { level: "full", via: "open", role: "drive" };
   return { level: "none", reason: "pairing_required" };

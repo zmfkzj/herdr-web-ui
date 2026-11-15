@@ -22,7 +22,7 @@ mock.module("../collector.ts", () => ({
   startStatusCollector: (seen: Handlers, deps: { snapshot: typeof collectorSnapshot }) => {
     collectorSnapshot = deps.snapshot;
     handlers = seen;
-    return { ready: Promise.resolve(), structureReady: Promise.resolve(), focusReady: Promise.resolve(), trackPane() {}, stop() {} };
+    return { ready: Promise.resolve(), structureReady: Promise.resolve(), focusReady: Promise.resolve(), trackPane() {}, refresh() {}, stop() {} };
   },
 }));
 const { createStatusHub } = await import("./status.ts");
@@ -81,6 +81,8 @@ export function hub<Owner = unknown, Lease = unknown>(path = transcript, queued?
     spyOn(service, "readOpenCodeService").mockReturnValue(null),
     spyOn(conversation, "claudePaneSession").mockResolvedValue({ path, startedAt: null, pid: null } as never),
     spyOn(conversation, "claudePanePid").mockResolvedValue(null as never),
+    // the fixtures' shell pids are made up: no process of this PC answers for them
+    spyOn(conversation, "stoppedAgentJob").mockResolvedValue(false),
   );
   const frames: { type: string; agent_status?: string; background_tasks?: number; background_wait?: boolean }[] = [];
   const client: Client = { data: connectionData({ deviceId: undefined, readOnly: false }), readyState: WebSocket.OPEN, getBufferedAmount: () => 0, send: (encoded: string) => { frames.push(JSON.parse(encoded)); return 1; }, close: () => {} };
@@ -97,7 +99,7 @@ export function hub<Owner = unknown, Lease = unknown>(path = transcript, queued?
   const poll = status.opencodeAgents.poll.bind(status.opencodeAgents);
   stubs.push(spyOn(status.opencodeAgents, "poll").mockImplementation((only) => { const read = poll(only); polls.push(read); return read; }));
   stubs.push(spyOn(status.push, "onStatus").mockImplementation(async (_paneId: string, alert: string) => { alerts.push(alert); }));
-  stubs.push({ mockRestore: () => { status.collector.stop(); status.omo.stop(); status.gjc.stop(); status.claudeAgents.stop(); status.opencodeAgents.stop(); status.plans.stop(); clearInterval(status.waitTimer); } });
+  stubs.push({ mockRestore: () => { status.collector.stop(); status.omo.stop(); status.gjc.stop(); status.letta.stop(); status.claudeAgents.stop(); status.opencodeAgents.stop(); status.taskAgents.stop(); status.plans.stop(); clearInterval(status.waitTimer); } });
   const ended: string[] = [];
   stubs.push(spyOn(status.push, "onEnded").mockImplementation(async (paneId: string) => { ended.push(paneId); }));
   return {

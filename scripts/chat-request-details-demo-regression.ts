@@ -9,6 +9,7 @@ import type { ConversationTurn } from "../shared/protocol.ts";
 import { appFaces } from "./app-faces.ts";
 import { buildDemoApp } from "./demo-build.ts";
 import { chromePath } from "./chrome-path.ts";
+import { openMoreGroup } from "./header-more.ts";
 
 // Compaction and failed requests (#901), always on, on the unmodified app over the demo's fixture
 // transport, at a phone's and a desktop's width, light and dark, also on a device that stored the
@@ -75,6 +76,8 @@ async function check(browser: Browser, origin: string, width: number, theme: "li
     // the demo's other agents finish turns now and then: their in-app alerts stay off over the transcript
     await context.addInitScript(([settings, pane, stored]) => {
       localStorage.setItem("ovis:settings", settings!);
+      // a phone's More folds the pane's Find items where its tabs are in the header (Settings -> Tabs on a phone)
+      localStorage.setItem("ovis:phone-tabs", JSON.stringify("header"));
       localStorage.setItem(`ovis:view:${pane}`, "chat");
       if (stored === "true") localStorage.setItem("ovis:chat-request-details", "false");
     }, [JSON.stringify({ language: "en", alertsOn: false, theme }), PANE, String(storedOff)]);
@@ -108,8 +111,8 @@ async function check(browser: Browser, origin: string, width: number, theme: "li
       // folded again, a search's pick of words in an error opens the row it is in
       await row.locator("summary").click();
       await page.waitForFunction((element) => !(element as HTMLDetailsElement).open, await row.elementHandle());
-      // a phone's header lists the tabs, so its More carries the pane's actions
-      if (phone) await page.locator(".header-more-button").click();
+      // a phone's header lists the tabs, so its More carries the pane's actions, the find ones under Find… (G-143)
+      if (phone) { await page.locator(".header-more-button").click(); await page.locator(".row-sheet").waitFor(); await openMoreGroup(page, "find"); }
       else await scope.locator(".chat-view").click({ button: "right", position: { x: 300, y: 200 } });
       await page.getByText("Search conversation", { exact: true }).click();
       const search = page.getByRole("dialog", { name: "Search conversation" });

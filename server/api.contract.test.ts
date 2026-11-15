@@ -42,6 +42,7 @@ import { OmoStatus } from "./omo-status.ts";
 import { omoJobTasks } from "./omo-jobs.ts";
 import { ClaudeSubagentStatus } from "./claude-subagents.ts";
 import { setFilePoolOptions } from "./file-pool.ts";
+import { SLEEP } from "../scripts/fixtures/sleep.ts";
 
 /**
  * Contract test for Ovis's HTTP + WS surface.
@@ -103,7 +104,7 @@ describe("Grok conversation API", () => {
     // A native stand-in owns the fd evidence and only sleeps; no model or user's store.
     const executable = join(root, "grok");
     const nativeExecutable = join(root, "grok-1.0.52-linux-x86_64");
-    copyFileSync("/bin/sleep", nativeExecutable); symlinkSync("grok-1.0.52-linux-x86_64", executable); chmodSync(executable, 0o755);
+    copyFileSync(SLEEP, nativeExecutable); symlinkSync("grok-1.0.52-linux-x86_64", executable); chmodSync(executable, 0o755);
     const created = await workspaceCreate({ cwd: root, label: "ovis-test-grok-api" });
     let app: ReturnType<typeof createServer> | undefined;
     try {
@@ -158,7 +159,7 @@ describe("Grok conversation API", () => {
         if (Date.now() > deadline) throw new Error("Herdr did not apply the second session report");
         await Bun.sleep(50);
       }
-      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "not_found" });
     } finally {
       app?.stop(); await workspaceClose(created.workspace.workspace_id);
       forgetTranscriptState(); rmSync(root, { recursive: true, force: true });
@@ -178,7 +179,7 @@ describe("Agy conversation API", () => {
     // Another unheld lock in the same store must never select a conversation.
     writeFileSync(join(root, "presence", "00000000-0000-4000-8000-000000000032.lock"), "");
     const executable = join(root, "agy");
-    copyFileSync("/bin/sleep", executable); chmodSync(executable, 0o755);
+    copyFileSync(SLEEP, executable); chmodSync(executable, 0o755);
     const created = await workspaceCreate({ cwd: root, label: "ovis-test-agy-api" });
     let app: ReturnType<typeof createServer> | undefined, db: Database | undefined;
     let monitor: ConversationMonitor | undefined;
@@ -192,7 +193,7 @@ describe("Agy conversation API", () => {
       }
       app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: join(root, "state") });
       const url = `http://127.0.0.1:${app.port}/api/pane/conversation?pane_id=${encodeURIComponent(paneId)}`;
-      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "unreadable" });
       db = new Database(join(root, "conversations", `${id}.db`));
       db.exec("PRAGMA journal_mode=WAL; CREATE TABLE steps(idx INTEGER PRIMARY KEY)");
       const empty = await (await fetch(url)).json();
@@ -237,7 +238,7 @@ describe("Agy conversation API", () => {
       const local = await fetch(url.replace("/api/pane/", "/api/machines/local/pane/"));
       expect((await local.json()).turns).toHaveLength(1);
       db.exec("DROP TABLE steps");
-      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "unreadable" });
     } finally {
       monitor?.stop(); app?.stop(); db?.close(); await workspaceClose(created.workspace.workspace_id);
       forgetTranscriptState(); rmSync(root, { recursive: true, force: true });
@@ -259,7 +260,7 @@ describe("Muse conversation API", () => {
     mkdirSync(first, { recursive: true }); mkdirSync(second);
     // a link, not a copy: macOS kills a copied system binary, and argv keeps the name it was run by
     const executable = join(root, "muse");
-    symlinkSync("/bin/sleep", executable);
+    symlinkSync(SLEEP, executable);
     const created = await workspaceCreate({ cwd: root, label: "ovis-test-muse-api" });
     let app: ReturnType<typeof createServer> | undefined;
     try {
@@ -279,7 +280,7 @@ describe("Muse conversation API", () => {
       // a session no lock ties to this process is never shown, whatever its folder or age
       writeFileSync(join(first, "session.jsonl"), live);
       writeFileSync(join(first, ".session.lock"), `pid=${pid! + 1}\nhost=${hostname()}\n`);
-      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "not_found" });
       writeFileSync(join(first, ".session.lock"), `pid=${pid}\nhost=${hostname()}\n`);
       // the scan that found nothing stands for 2 s, as for a fresh Muse that has written no log yet
       let response: Response, body;
@@ -306,13 +307,13 @@ describe("Muse conversation API", () => {
       // a record in a shape the reader does not know, or a log it cannot read, shows Terminal
       const log = join(second, "session.jsonl");
       appendFileSync(log, `${prompt.replace('"runtime.user_intent.accepted"', '"runtime.user_intent.renamed"')}\n`);
-      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+      expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "unreadable" });
       writeFileSync(log, `${prompt}\n`);
       expect((await (await fetch(url)).json()).source).toBe("muse-transcript");
       // root reads a file whatever its mode
       if (process.getuid?.() !== 0) {
         chmodSync(log, 0);
-        expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [] });
+        expect(await (await fetch(url)).json()).toEqual({ source: "scrollback", turns: [], unavailable: "unreadable" });
       }
     } finally {
       app?.stop(); await workspaceClose(created.workspace.workspace_id);
@@ -425,7 +426,7 @@ describe("native tool call id and state on GET /api/pane/conversation", () => {
       // Codex is found by the rollout its process holds open: a native stand-in that only sleeps
       const codexExe = join(cwd, "bin", "codex");
       mkdirSync(join(cwd, "bin"));
-      copyFileSync("/bin/sleep", codexExe); chmodSync(codexExe, 0o755);
+      copyFileSync(SLEEP, codexExe); chmodSync(codexExe, 0o755);
       const codexCreated = await workspaceCreate({ cwd, label: "herdr-web-ui-test-call-state-codex" });
       workspaces.push(codexCreated.workspace.workspace_id);
       const codex = codexCreated.root_pane.pane_id;
@@ -437,7 +438,7 @@ describe("native tool call id and state on GET /api/pane/conversation", () => {
       }
       // omp's session report is taken for a pane herdr sees running omp: the same kind of stand-in
       const ompExe = join(cwd, "bin", "omp");
-      copyFileSync("/bin/sleep", ompExe); chmodSync(ompExe, 0o755);
+      copyFileSync(SLEEP, ompExe); chmodSync(ompExe, 0o755);
       const ompCreated = await workspaceCreate({ cwd, label: "herdr-web-ui-test-call-state-omp" });
       workspaces.push(ompCreated.workspace.workspace_id);
       const omp = ompCreated.root_pane.pane_id;
@@ -636,6 +637,45 @@ describe("usage API", () => {
     } finally { app.stop(); rmSync(usageState, { recursive: true, force: true }); }
   });
 
+  it("returns a Claude account from Oh My Pi's record of its limits, named as that record, without Oh My Pi's sign-in", async () => {
+    const usageState = mkdtempSync(join(tmpdir(), "herdr-usage-recorded-contract-"));
+    const now = Date.parse("2026-10-06T00:00:00Z");
+    const secret = "omp-sign-in-contract-only";
+    const account = "11111111-2222-4333-8444-555555555555";
+    // Oh My Pi's store as it writes it: the limits it read four minutes ago, beside the table that holds its sign-in
+    mkdirSync(join(usageState, ".omp", "agent"), { recursive: true });
+    const store = new Database(join(usageState, ".omp", "agent", "agent.db"), { create: true });
+    store.exec(`
+      CREATE TABLE usage_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at INTEGER NOT NULL, provider TEXT NOT NULL, account_key TEXT NOT NULL,
+        email TEXT, account_id TEXT, limit_id TEXT NOT NULL, label TEXT NOT NULL, window_label TEXT, used_fraction REAL, status TEXT, resets_at INTEGER
+      );
+      CREATE INDEX idx_usage_history_recorded ON usage_history(recorded_at);
+      CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL);
+      INSERT INTO auth_credentials (provider, credential_type, data) VALUES ('anthropic', 'oauth', '{"access":"${secret}"}');
+      INSERT INTO usage_history (recorded_at, provider, account_key, email, account_id, limit_id, label, used_fraction, status, resets_at)
+        VALUES (${now - 4 * 60_000}, 'anthropic', 'oauth|account:${account}|email:me@example.com', 'me@example.com', '${account}', 'anthropic:5h', 'Claude 5 Hour', 0.42, 'ok', ${now + 3 * 3600_000});
+    `);
+    store.close();
+    const usage = new UsageService({
+      home: usageState, env: {}, platform: "linux", now: () => now,
+      keychain: async () => ({ status: "missing" }), run: async () => null, has: () => true,
+      fetch: async () => { throw new Error("a recorded account asks no provider"); },
+    }, USAGE_PROVIDERS.filter((provider) => provider.id === "claude"));
+    const app = createServer({ port: 0, stateDir: usageState, usage });
+    try {
+      const response = await fetch(`http://localhost:${app.port}/api/usage`);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).not.toContain(secret);
+      expect((JSON.parse(body) as UsageReport).providers).toEqual([{
+        id: "claude", key: `claude:${account}`, account: "me@example.com", plan: null, problem: null, checked_at: "2026-10-05T23:56:00.000Z",
+        windows: [{ kind: "session", scope: null, used_percent: 42, resets_at: "2026-10-06T03:00:00.000Z", starts_at: "2026-10-05T22:00:00.000Z" }],
+        recorded: { by: "omp", stale: false, signed_in: false },
+      }]);
+    } finally { app.stop(); rmSync(usageState, { recursive: true, force: true }); }
+  });
+
   it("answers the report and keeps it behind the token gate", async () => {
     const usageState = mkdtempSync(join(tmpdir(), "herdr-usage-auth-"));
     const usage = new UsageService(undefined, []);
@@ -645,7 +685,7 @@ describe("usage API", () => {
       const answered = await fetch(`http://localhost:${open.port}/api/usage`);
       expect(answered.status).toBe(200);
       expect(answered.headers.get("cache-control")).toBe("no-store");
-      expect(await answered.json() as UsageReport).toEqual({ providers: [] });
+      expect(await answered.json() as UsageReport).toEqual({ server_time: expect.any(String), providers: [] });
       expect((await fetch(`http://localhost:${gated.port}/api/usage`)).status).toBe(401);
       const withToken = await fetch(`http://localhost:${gated.port}/api/usage`, { headers: { authorization: "Bearer test-usage-token" } });
       expect(withToken.status).toBe(200);
@@ -831,7 +871,9 @@ describe("update API", () => {
       status = { ...status, latest_revision: offered };
       const accepted = await install(JSON.stringify({ expected_revision: offered }));
       expect(accepted.status).toBe(202);
-      expect(requests).toEqual([{ command: "install", expected_revision: offered }]);
+      // with its own id, which only its 202 tells: a cancel must name it
+      const { install_id } = await accepted.json() as { install_id: string };
+      expect(requests).toEqual([{ command: "install", expected_revision: offered, install_id }]);
       // a release that moves after the 202 is told by the status, not by the request that finished
       status = { ...status, phase: "error", latest_revision: moved, error_code: "update_offer_changed", error: "A different release is on offer than the one asked for, so nothing was installed. Review it, then update again." };
       expect(await (await fetch(`${origin}/api/updates`)).json()).toMatchObject({ phase: "error", error_code: "update_offer_changed", latest_revision: moved });
@@ -842,7 +884,7 @@ describe("update API", () => {
       expect(await code(older)).toBe("update_restart_required");
       // a check stays bodyless
       expect((await fetch(`${origin}/api/updates/check`, { method: "POST", headers: { "x-herdr-update": "1" } })).status).toBe(202);
-      expect(requests).toEqual([{ command: "install", expected_revision: offered }, { command: "check" }]);
+      expect(requests).toEqual([{ command: "install", expected_revision: offered, install_id }, { command: "check" }]);
     } finally { managed.stop(); rmSync(managedState, { recursive: true, force: true }); }
   });
 
@@ -850,9 +892,9 @@ describe("update API", () => {
     const protectedState = mkdtempSync(join(tmpdir(), "herdr-update-auth-"));
     const protectedServer = createServer({ port: 0, stateDir: protectedState, token: "test-update-token" });
     try {
-      for (const path of ["/api/updates", "/api/updates/notes", "/api/updates/installed", "/api/updates/check", "/api/updates/install"]) {
+      for (const path of ["/api/updates", "/api/updates/notes", "/api/updates/installed", "/api/updates/check", "/api/updates/install", "/api/updates/cancel"]) {
         const response = await fetch(`http://localhost:${protectedServer.port}${path}`, {
-          method: path === "/api/updates/check" || path === "/api/updates/install" ? "POST" : "GET", headers: { "x-herdr-update": "1" },
+          method: path === "/api/updates/check" || path === "/api/updates/install" || path === "/api/updates/cancel" ? "POST" : "GET", headers: { "x-herdr-update": "1" },
         });
         expect(response.status).toBe(401);
       }
@@ -889,8 +931,20 @@ describe("update API", () => {
       // the install still names the offer, as from the app's own controls
       expect((await call("/api/updates/install", `Bearer ${bridge}`, "{}")).status).toBe(400);
       expect(requests).toEqual([]);
-      expect((await call("/api/updates/install", `Bearer ${bridge}`, JSON.stringify({ expected_revision: offered }))).status).toBe(202);
-      expect(requests).toEqual([{ command: "install", expected_revision: offered }]);
+      const granted = await call("/api/updates/install", `Bearer ${bridge}`, JSON.stringify({ expected_revision: offered }));
+      expect(granted.status).toBe(202);
+      const { install_id } = await granted.json() as { install_id: string };
+      expect(requests).toEqual([{ command: "install", expected_revision: offered, install_id }]);
+      // and stop that install while it builds (POST /api/updates/cancel), once its supervisor can
+      status.phase = "building";
+      expect((await call("/api/updates/cancel", `Bearer ${bridge}`, JSON.stringify({ install_id }))).status).toBe(409);
+      status.install_cancellable = true;
+      // a cancel that names no install is refused; the one it names is passed on, for the supervisor to stop that one only
+      expect((await call("/api/updates/cancel", `Bearer ${bridge}`, "{}")).status).toBe(400);
+      expect((await call("/api/updates/cancel", `Bearer ${bridge}`, JSON.stringify({ install_id }))).status).toBe(202);
+      expect(requests.at(-1)).toEqual({ command: "cancel", install_id });
+      status.phase = "idle";
+      requests.splice(1);
       // a wrong bridge token is refused like any other, and the token opens no other update route
       expect((await call("/api/updates", `Bearer ${"c".repeat(64)}`)).status).toBe(401);
       for (const path of ["/api/updates/notes", "/api/updates/installed", "/api/updates/check", "/api/herdr/update"]) expect((await call(path, `Bearer ${bridge}`)).status).toBe(401);
@@ -900,7 +954,8 @@ describe("update API", () => {
       });
       const install = JSON.stringify({ expected_revision: offered });
       for (const [method, path, body] of [["GET", "/api/updates?anything=1"], ["HEAD", "/api/updates"], ["POST", "/api/updates", install], ["DELETE", "/api/updates"],
-        ["GET", "/api/updates/install"], ["PUT", "/api/updates/install", install], ["POST", "/api/updates/install?anything=1", install]] as const) {
+        ["GET", "/api/updates/install"], ["PUT", "/api/updates/install", install], ["POST", "/api/updates/install?anything=1", install],
+        ["GET", "/api/updates/cancel"], ["POST", "/api/updates/cancel?anything=1", ""]] as const) {
         expect({ method, path, status: (await send(method, path, body)).status }).toEqual({ method, path, status: 401 });
       }
       expect(requests).toHaveLength(1);
@@ -1518,7 +1573,7 @@ describe("agent rename", () => {
       const settings = await (await fetch(url)).json() as MachineSettings;
       expect(settings).toEqual({ auto_update_bridges: true, set_aside: [expect.stringMatching(/^machines\.json\.corrupt-\S+$/)] });
       expect(readdirSync(state)).toContain(settings.set_aside![0]!);
-      const patched = await fetch(url, { method: "PATCH", headers: { "content-type": "application/json", "x-herdr-machine": "1" }, body: JSON.stringify({ auto_update_bridges: false, set_aside: [] }) });
+      const patched = await fetch(url, { method: "PATCH", headers: { "content-type": "application/json", "x-herdr-machine": "1", "x-herdr-update": "1" }, body: JSON.stringify({ auto_update_bridges: false, set_aside: [] }) });
       expect(patched.status).toBe(200);
       expect(await patched.json()).toEqual({ auto_update_bridges: false, set_aside: settings.set_aside });
     } finally {
@@ -4732,7 +4787,7 @@ describe("PC management API", () => {
       const response = await fetch(`${base()}/api/machines/setup`, { method: "POST", headers, body: JSON.stringify({ destination: "host" }) });
       expect(response.status).toBe(403);
     }
-    const bad = await fetch(`${base()}/api/machines/setup`, { method: "POST", headers: { "x-herdr-machine": "1" }, body: JSON.stringify({ destination: "-oProxyCommand=bad" }) });
+    const bad = await fetch(`${base()}/api/machines/setup`, { method: "POST", headers: { "x-herdr-machine": "1", "x-herdr-update": "1" }, body: JSON.stringify({ destination: "-oProxyCommand=bad" }) });
     expect(bad.status).toBe(400);
     expect((await fetch(`${base()}/api/machines/missing/pane/read?pane_id=p1`)).status).toBe(503);
     expect((await fetch(`${base()}/api/machines/missing/auth`)).status).toBe(404);
@@ -4943,7 +4998,12 @@ describe("repository diff of a pane's folder", () => {
 describe("GET /api/sessions/history", () => {
   const line = (value: unknown) => `${JSON.stringify(value)}\n`;
 
-  /** Own all setup and cleanup, including failures before a server or workspace is returned. */
+  /**
+   * Own all setup and cleanup, including failures before a server or workspace is returned.
+   * The server's state is kept out of `root`: stop() does not wait for a read of the panes that is still in
+   * flight, and that read saves completions.json when it lands, which would bring back a `root` removed here.
+   * It goes under this file's state folder, which afterAll removes.
+   */
   async function withPiHistoryFixture(root: string, run: (fixture: { file: string; initial: string; url: string }) => Promise<void>, piSessionDeadlineMs?: number): Promise<void> {
     const previous = process.env["PI_CODING_AGENT_SESSION_DIR"];
     let created: Awaited<ReturnType<typeof workspaceCreate>> | undefined;
@@ -4964,7 +5024,7 @@ describe("GET /api/sessions/history", () => {
       writeFileSync(file, initial);
       process.env["PI_CODING_AGENT_SESSION_DIR"] = store;
       created = await workspaceCreate({ cwd, label: "ovis-test-pi-history" });
-      app = createServer({ port: 0, hostname: "127.0.0.1", stateDir: join(root, "state"), piSessionDeadlineMs });
+      app = createServer({ port: 0, hostname: "127.0.0.1", stateDir: join(stateDir, basename(root)), piSessionDeadlineMs });
       const url = `http://127.0.0.1:${app.port}/api/sessions/history?workspace_id=${encodeURIComponent(created.workspace.workspace_id)}&agent=pi`;
       await run({ file, initial, url });
     } finally {
@@ -5790,10 +5850,10 @@ describe("access facts on /api/health", () => {
   const guard = { "content-type": "application/json", "x-herdr-machine": "1" };
   /** a server of its own: a temp state dir, an empty token unless one is given, nothing from the runner's environment */
   const CORE_FACTS: HerdrCoreFacts = { version: "0.1.17", session: "default", running: false };
-  const serve = (options: { hostname?: string; token?: string; serveOnly?: boolean; owner?: string | null; seed?: (stateDir: string) => void; runtime?: RuntimeService; accepted?: () => boolean } = {}) => {
+  const serve = (options: { hostname?: string; token?: string; serveOnly?: boolean; owner?: string | null; seed?: (stateDir: string) => void; runtime?: RuntimeService; accepted?: () => boolean; bridgeToken?: string } = {}) => {
     const stateDir = mkdtempSync(join(tmpdir(), "herdr-security-summary-"));
     options.seed?.(stateDir);
-    const instance = createServer({ port: 0, hostname: options.hostname ?? "127.0.0.1", token: options.token ?? "", stateDir, tailscaleOwner: options.owner ?? null, tailscaleServeOnly: options.serveOnly ?? false, herdrCoreFacts: () => CORE_FACTS, ...(options.runtime ? { runtimeService: options.runtime } : {}), ...(options.accepted ? { launchAccepted: options.accepted } : {}) });
+    const instance = createServer({ port: 0, hostname: options.hostname ?? "127.0.0.1", token: options.token ?? "", stateDir, ...(options.bridgeToken ? { bridgeToken: options.bridgeToken } : {}), tailscaleOwner: options.owner ?? null, tailscaleServeOnly: options.serveOnly ?? false, herdrCoreFacts: () => CORE_FACTS, ...(options.runtime ? { runtimeService: options.runtime } : {}), ...(options.accepted ? { launchAccepted: options.accepted } : {}) });
     const read = async (headers: Record<string, string> = {}, scope = "") => {
       const response = await fetch(`http://127.0.0.1:${instance.port}/api/health${scope}`, { headers });
       const text = await response.text();
@@ -5899,7 +5959,7 @@ describe("access facts on /api/health", () => {
     let answer: SwitchAnswer = { ok: true };
     const runtime: RuntimeService = { facts: () => facts, request: (target) => { asked.push(target); return answer; } };
     let token = "";
-    const secured = serve({ token: SECRET, runtime, seed: (stateDir) => {
+    const secured = serve({ token: SECRET, runtime, bridgeToken: "fictional-bridge-token", seed: (stateDir) => {
       const store = new DeviceStore(stateDir);
       token = store.pair(store.startPairing().code, "Watch", "watch")!.token;
       store.match(token);
@@ -5915,6 +5975,8 @@ describe("access facts on /api/health", () => {
       expect((await secured.read(bearer, "?scope=bridge")).body.herdr_runtime).toEqual(facts);
       expect((await secured.read({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20" }, "?scope=bridge")).body.herdr_runtime).toBeUndefined();
       expect((await secured.read({}, "?scope=bridge")).body.herdr_runtime).toBeUndefined();
+      // the connection server reaching this PC with its bridge token shows its move badge from them
+      for (const scope of ["", "?scope=bridge"]) expect((await secured.read({ authorization: "Bearer fictional-bridge-token" }, scope)).body.herdr_runtime).toEqual(facts);
       // nobody but a driving owner, and only through the app's own request header
       expect((await post({})).status).toBe(401);
       expect((await post({ cookie: `ovis_device=${token}`, "x-forwarded-for": "192.168.0.20", "x-herdr-update": "1" })).status).toBe(403);
@@ -5999,12 +6061,14 @@ describe("access facts on /api/health", () => {
         expect([serveOnly, headers, body.security?.observed_ingress]).toEqual([serveOnly, headers, ingress]);
       } finally { secured.stop(); }
     }
-    // and a local sign-in is not "direct" because of its via: a rewritten Host is a proxy on this PC
+    // and a local sign-in is not "direct" because of its via: a forwarded request is a proxy on this PC
     const open = serve();
     try {
-      const body = (await open.read({ host: "pc.example.com" })).body;
+      const body = (await open.read({ "x-forwarded-for": "203.0.113.7" })).body;
       expect(body.auth).toMatchObject({ authenticated: true, via: "open" });
       expect(body.security?.observed_ingress).toBe("proxy");
+      // a Host this server does not know, from loopback, is a rebound name, never the open LAN
+      expect((await open.read({ host: "pc.example.com" })).body.auth).toMatchObject({ authenticated: false, reason: "pairing_required" });
     } finally { open.stop(); }
   });
 

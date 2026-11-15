@@ -11,8 +11,9 @@ export function visualUrl(machine: string,pane: string,route: string,query: Reco
 export class VisualRequestError extends Error {
   constructor(message: string, readonly code: string, readonly status: number) { super(message); }
 }
-export async function visualRequest<T>(url: string,method="GET",body?: unknown,signal?: AbortSignal): Promise<T> {
-  const response=await fetch(url,{method,credentials:"same-origin",cache:"no-store",headers:{"content-type":"application/json","x-herdr-machine":"1"},...(body===undefined?{}:{body:JSON.stringify(body)}),signal});
+/** `owner`: a change to the PC itself (its bridge, its desktop switch), which only the owner makes, with `x-herdr-update` as every such change (server/machine-api.ts). */
+export async function visualRequest<T>(url: string,method="GET",body?: unknown,signal?: AbortSignal,owner=false): Promise<T> {
+  const response=await fetch(url,{method,credentials:"same-origin",cache:"no-store",headers:{"content-type":"application/json","x-herdr-machine":"1",...(owner?{"x-herdr-update":"1"}:{})},...(body===undefined?{}:{body:JSON.stringify(body)}),signal});
   const result=await response.json().catch(()=>null);
   if(!response.ok) throw new VisualRequestError(typeof result?.error?.message==="string" ? result.error.message : "Pi visual request failed",typeof result?.error?.code==="string" ? result.error.code : "pi_visual_unavailable",response.status);
   return result as T;
@@ -30,10 +31,10 @@ export function fetchViewers(machine: string,pane: string,session: string|null,s
  * without (a job the PC list shows), off stops this server relaying its desktops at once.
  */
 export function setPcDesktop(machine: string,enabled: boolean): Promise<{job: unknown}|{enabled: boolean}> {
-  return visualRequest(`/api/machines/${encodeURIComponent(machine)}/pi-desktop`,"POST",{enabled});
+  return visualRequest(`/api/machines/${encodeURIComponent(machine)}/pi-desktop`,"POST",{enabled},undefined,true);
 }
 export async function installPiVisualBridge(machine: string): Promise<void> {
-  await visualRequest<unknown>(`/api/machines/${encodeURIComponent(machine)}/update-bridge?feature=pi-visual`,"POST");
+  await visualRequest<unknown>(`/api/machines/${encodeURIComponent(machine)}/update-bridge`,"POST",{feature:"pi-visual"},undefined,true);
 }
 export function sourceFromImage(src: string,machine: string,pane: string,origin: string): ReviewSource {
   const url=new URL(src,origin);

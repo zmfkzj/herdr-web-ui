@@ -12,9 +12,12 @@ import { DEFAULT_KEY_BAR_ITEMS, migrateKeyBarItems } from "./keyBar.ts";
 import { SHARED_SETTING_KEYS } from "../../shared/preferences.ts";
 import { NOTICE_VERSION, TELEMETRY_SETTINGS_KEYS, TELEMETRY_THEME_SIDE_KEYS, telemetrySettings } from "../../shared/telemetry.ts";
 import { SETTING_SCOPE, telemetrySettingsSnapshot, alertPrefs, CHAT_FONT_MAX, CHAT_FONT_MIN, CHAT_LANE_MAX_REM, CHAT_LANE_MIN, CHAT_WIDTHS, chatFontSize, chatLaneLength, chatLaneWidth, DEFAULT_SETTINGS, QUICK_REPLIES_MAX, QUICK_REPLY_MAX_CHARS, quickReplyButtons, sanitizeSettings, terminalTheme, forgetPaneViews, DICTATION_LANGUAGES, VOICE_BUTTONS, VOICE_ENGINES, wantsVoiceInput } from "./settings.ts";
-import { applyToDocument, loadSettings, pcLoadOn, saveSettings } from "./settings.ts";
+import { applyToDocument, loadSettings, pcLoadOn, PHONE_INBOX_STORAGE_KEY, phoneInboxOn, saveBootRows, saveSettings } from "./settings.ts";
+import { customRow, NO_CUSTOM_THEMES, readThemeFile, withTheme } from "./customThemes.ts";
+import { CUSTOM_ROWS_STORAGE_KEY, CUSTOM_THEMES_STORAGE_KEY } from "./themeBoot.ts";
 import { sanitizeSettings as oldSanitizeSettings, saveSettings as oldSaveSettings } from "./settings.legacy-fixture.ts";
 import { themeFor } from "./themeFor.ts";
+import { readStoredAppearance, storedAppearance } from "./themeBoot.ts";
 
 describe("saved theme migration", () => {
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -100,6 +103,20 @@ describe("saved theme migration", () => {
     expect(loadSettings().uiFontFamily).toBe("");
   });
 
+  it("keeps Tabs on a phone in its own key, out of an old tab's whole-record save", () => {
+    expect(loadSettings().phoneTabs).toBe("row");
+    saveSettings(sanitizeSettings({ phoneTabs: "header" }));
+    expect(JSON.parse(records.get(main) ?? "{}")).not.toHaveProperty("phoneTabs");
+    expect(records.get("ovis:phone-tabs")).toBe(JSON.stringify("header"));
+    oldSaveSettings({ ...readOld(), terminalFontSize: 18 });
+    expect(loadSettings().phoneTabs).toBe("header");
+    expect(loadSettings().terminalFontSize).toBe(18);
+    saveSettings({ ...loadSettings(), phoneTabs: "row" });
+    expect(loadSettings().phoneTabs).toBe("row");
+    records.set("ovis:phone-tabs", "not json");
+    expect(loadSettings().phoneTabs).toBe("row");
+  });
+
   it("keeps Wrap to screen / Original width in its own key, out of an old tab's whole-record save", () => {
     saveSettings(sanitizeSettings({ terminalMirrorWrap: false }));
     expect(JSON.parse(records.get(main) ?? "{}")).not.toHaveProperty("terminalMirrorWrap");
@@ -142,6 +159,28 @@ describe("saved theme migration", () => {
     expect(loadSettings().pcLoad).toBeNull();
     records.set("ovis:pc-load", "not json");
     expect(loadSettings().pcLoad).toBeNull();
+  });
+
+  it("keeps the phone's agent inbox choice in its own key, out of an old tab's whole-record save, and unchosen until chosen", () => {
+    expect(loadSettings().phoneInbox).toBeNull();
+    for (const phoneInbox of [true, false]) {
+      saveSettings(sanitizeSettings({ phoneInbox }));
+      expect(records.get(PHONE_INBOX_STORAGE_KEY)).toBe(JSON.stringify(phoneInbox));
+      expect(JSON.parse(records.get(main) ?? "{}")).not.toHaveProperty("phoneInbox");
+      oldSaveSettings({ ...readOld(), terminalFontSize: 18 });
+      // off is kept as false, told apart from no choice
+      expect(loadSettings().phoneInbox).toBe(phoneInbox);
+      expect(loadSettings().terminalFontSize).toBe(18);
+    }
+    saveSettings({ ...loadSettings(), phoneInbox: null });
+    expect(records.get(PHONE_INBOX_STORAGE_KEY)).toBe("null");
+    expect(loadSettings().phoneInbox).toBeNull();
+    records.set(PHONE_INBOX_STORAGE_KEY, "\"true\"");
+    expect(loadSettings().phoneInbox).toBeNull();
+    // the record's own field was never released: it is not read
+    records.delete(PHONE_INBOX_STORAGE_KEY);
+    putOld({ ...JSON.parse(records.get(main) ?? "{}"), phoneInbox: true });
+    expect(loadSettings().phoneInbox).toBeNull();
   });
 
   it("keeps the agent groups off until chosen, in keys of their own, out of an old tab's whole-record save", () => {
@@ -242,6 +281,27 @@ describe("saved theme migration", () => {
     expect(loadSettings().terminalFoldKeyBar).toBe(false);
     records.set("ovis:terminal-fold-key-bar", "\"true\"");
     expect(loadSettings().terminalFoldKeyBar).toBe(false);
+  });
+
+  it("keeps the imported themes in their own key, out of an old tab's whole-record save, and their rows for the first frame", () => {
+    const read = readThemeFile(JSON.stringify({ name: "Night", dark: { base00: "#101418", base05: "#d0d8e0" } }));
+    if (!("theme" in read)) throw new Error("the fixture is no theme");
+    const custom = withTheme(NO_CUSTOM_THEMES, read.theme, "dark")!;
+    expect(loadSettings().customThemes).toBe(NO_CUSTOM_THEMES);
+    saveSettings({ ...loadSettings(), customThemes: custom });
+    expect(JSON.parse(records.get(main) ?? "{}")).not.toHaveProperty("customThemes");
+    oldSaveSettings({ ...readOld(), terminalFontSize: 18 });
+    expect(loadSettings().customThemes).toEqual(custom);
+    records.set(CUSTOM_THEMES_STORAGE_KEY, "{not json");
+    expect(loadSettings().customThemes).toBe(NO_CUSTOM_THEMES);
+
+    // no record of rows while no side draws an imported theme
+    saveBootRows(NO_CUSTOM_THEMES);
+    expect(records.has(CUSTOM_ROWS_STORAGE_KEY)).toBe(false);
+    saveBootRows(custom);
+    expect(JSON.parse(records.get(CUSTOM_ROWS_STORAGE_KEY) ?? "{}")).toEqual({ dark: customRow(read.theme, "dark") });
+    saveBootRows({ ...custom, dark: null });
+    expect(records.has(CUSTOM_ROWS_STORAGE_KEY)).toBe(false);
   });
 
   it("keeps Keyboard only from the key bar in its own key, out of an old tab's whole-record save", () => {
@@ -353,6 +413,30 @@ describe("saved theme migration", () => {
     expect(root.style.colorScheme).toBe("dark");
     expect(meta).toBe(entry.bgPanel);
     expect(terminalTheme(entry.mode, entry.id)).toEqual(entry.terminal);
+  });
+
+  it("holds the page's surface under an imported row until the stylesheet is there, though the row sets --bg itself", () => {
+    const props = new Map<string, string>();
+    const root = { lang: "", dataset: {}, style: { colorScheme: "", backgroundColor: "", setProperty: (name: string, value: string) => { props.set(name, value); }, removeProperty: (name: string) => { if (name === "background-color") root.style.backgroundColor = ""; else props.delete(name); } } };
+    Object.defineProperty(globalThis, "document", { configurable: true, value: { documentElement: root, querySelector: () => null } });
+    const read = readThemeFile(JSON.stringify({ name: "Night", dark: { base00: "#101418", base05: "#d0d8e0" } }));
+    if (!("theme" in read)) throw new Error("the fixture is no theme");
+    const row = customRow(read.theme, "dark");
+    const settings = sanitizeSettings({ theme: "dark" });
+    // what the document answers: the row's own inline colours, and the stylesheet's tokens only once it has loaded
+    const withSheet = (loaded: boolean, run: () => void): void => {
+      const saved = Object.getOwnPropertyDescriptor(globalThis, "getComputedStyle");
+      Object.defineProperty(globalThis, "getComputedStyle", { configurable: true, value: () => ({ getPropertyValue: (name: string) => props.get(name) ?? (loaded && name === "--pdf-page" ? "#ffffff" : "") }) });
+      try { run(); } finally {
+        if (saved) Object.defineProperty(globalThis, "getComputedStyle", saved);
+        else Reflect.deleteProperty(globalThis, "getComputedStyle");
+      }
+    };
+    withSheet(false, () => applyToDocument(settings, row, "en"));
+    expect(props.get("--bg")).toBe("#101418");
+    expect(root.style.backgroundColor).toBe("#101418");
+    withSheet(true, () => applyToDocument(settings, row, "en"));
+    expect(root.style.backgroundColor).toBe("");
   });
 
   it("scales a file's text by the chat's size until it has its own, its source only once chosen", () => {
@@ -470,6 +554,19 @@ it("keeps the sidebar's hover peek off until this device turns it on, and keeps 
   expect(SHARED_SETTING_KEYS as readonly string[]).not.toContain("sidebarPeek");
 });
 
+it("keeps the phone's agent inbox off until this device turns it on, and keeps that choice its own", () => {
+  expect(DEFAULT_SETTINGS.phoneInbox).toBeNull();
+  expect(sanitizeSettings({}).phoneInbox).toBeNull();
+  for (const phoneInbox of ["true", 1, null]) expect(sanitizeSettings({ phoneInbox }).phoneInbox).toBeNull();
+  expect(sanitizeSettings({ phoneInbox: true }).phoneInbox).toBe(true);
+  expect(sanitizeSettings({ phoneInbox: false }).phoneInbox).toBe(false);
+  expect(phoneInboxOn({ phoneInbox: null })).toBe(false);
+  expect(phoneInboxOn({ phoneInbox: false })).toBe(false);
+  expect(phoneInboxOn({ phoneInbox: true })).toBe(true);
+  expect(SETTING_SCOPE.phoneInbox).toBe("device");
+  expect(SHARED_SETTING_KEYS as readonly string[]).not.toContain("phoneInbox");
+});
+
 it("keeps herdr's prefix keys off until this device turns them on, and keeps that choice its own", () => {
   expect(sanitizeSettings({}).herdrPrefixKeys).toBe(false);
   expect(sanitizeSettings({ herdrPrefixKeys: true }).herdrPrefixKeys).toBe(true);
@@ -494,14 +591,13 @@ it("ignores what was saved for the rows Settings no longer has", () => {
   expect(telemetrySettingsSnapshot(settings).alertInApp).toBe(true);
 });
 
-it("shows each PC's load while two or more PCs are connected, until this device chooses", () => {
+it("shows the selected PC's load until this device turns it off, however many PCs are connected", () => {
   const pc = (state: string) => ({ state });
   expect(sanitizeSettings({}).pcLoad).toBeNull();
   for (const pcLoad of ["true", 1, null]) expect(sanitizeSettings({ pcLoad }).pcLoad).toBeNull();
   expect(sanitizeSettings({ pcLoad: false }).pcLoad).toBe(false);
-  // unchosen: a second PC that is not connected does not count
-  expect(pcLoadOn({ pcLoad: null }, [pc("connected")])).toBe(false);
-  expect(pcLoadOn({ pcLoad: null }, [pc("connected"), pc("disconnected")])).toBe(false);
+  // unchosen: on, also with a lone PC
+  expect(pcLoadOn({ pcLoad: null }, [pc("connected")])).toBe(true);
   expect(pcLoadOn({ pcLoad: null }, [pc("connected"), pc("connected")])).toBe(true);
   // a choice holds whatever the roster says
   expect(pcLoadOn({ pcLoad: true }, [pc("connected")])).toBe(true);
@@ -682,6 +778,12 @@ describe("telemetry settings snapshot", () => {
     }
   });
 
+  it("keeps a phone's tabs under the header unless In the header was chosen", () => {
+    expect(sanitizeSettings({}).phoneTabs).toBe("row");
+    expect(sanitizeSettings({ phoneTabs: "header" }).phoneTabs).toBe("header");
+    expect(sanitizeSettings({ phoneTabs: "sheet" }).phoneTabs).toBe("row");
+  });
+
   it("reports every status indicator choice in a valid snapshot", () => {
     for (const statusIndicators of ["classic", "dots", "symbols"] as const) {
       const settings = sanitizeSettings({ statusIndicators });
@@ -807,6 +909,15 @@ describe("chat font size", () => {
     expect(sanitizeSettings({ terminalFontSize: 15 }).chatFontSize).toBeNull();
   });
 
+});
+
+describe("queued messages", () => {
+  it("sends queued messages by themselves unless that was turned off", () => {
+    expect(DEFAULT_SETTINGS.autoSendQueued).toBe(true);
+    expect(sanitizeSettings({}).autoSendQueued).toBe(true);
+    expect(sanitizeSettings({ autoSendQueued: false }).autoSendQueued).toBe(false);
+    expect(sanitizeSettings({ autoSendQueued: "yes" }).autoSendQueued).toBe(true);
+  });
 });
 
 describe("chat width", () => {
@@ -1351,6 +1462,11 @@ it("sanitizes input modes and shortcut overrides without accepting arbitrary com
   expect(sanitizeSettings({ terminalInputMode: "bad" }).terminalInputMode).toBe("auto");
   expect(sanitizeSettings({ terminalInputMode: "line" }).terminalInputMode).toBe("line");
   expect(sanitizeSettings({ shortcutOverrides: { palette: "p", settings: null, voice: "x", unknown: "x", "next-pane": "rm -rf" } }).shortcutOverrides).toEqual({ palette: "p", settings: null });
+});
+
+it("resets Theme to the theme a fresh device starts on, so Reset never shows on a fresh device or turns a light OS dark", () => {
+  const fresh = storedAppearance(readStoredAppearance(() => ({ getItem: () => null })));
+  expect(DEFAULT_SETTINGS.theme).toBe(fresh.theme);
 });
 
 describe("key bar settings", () => {

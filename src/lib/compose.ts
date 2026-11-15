@@ -9,12 +9,13 @@
  * Pure logic, DOM-free, so the policy is unit-testable (see compose.test.ts).
  */
 
+import { withoutTrailingBreaks } from "../../shared/launch-rules.ts";
 import type { AgentStatus, CommandForm, ConversationTurn, SlashCommand } from "../../shared/protocol.ts";
 import { skillSyntax } from "../../shared/skill-syntax.ts";
 import { knownStatus, STATUS_WORD } from "./status.ts";
 import { t, type Vars } from "./i18n.ts";
 import type { ActiveTrigger } from "./mentions.ts";
-import { NO_AGENT_MESSAGE, submitNotTyped } from "../../shared/submit-outcome.ts";
+import { AGENT_INPUT_DRAFT_MESSAGE, CLAUDE_FOLDED_DRAFT_MESSAGE, NO_AGENT_MESSAGE, submitNotTyped } from "../../shared/submit-outcome.ts";
 export { submitNotTyped } from "../../shared/submit-outcome.ts";
 
 /** This cap keeps one composer message inside a single WS frame. */
@@ -36,7 +37,7 @@ export function composerMessage(text: string): string {
     const from = kept.length - PASTE_START.length;
     if (from >= 0 && kept[from] === "\u001b" && (kept.slice(from).join("") === PASTE_START || kept.slice(from).join("") === PASTE_END)) kept.length = from;
   }
-  return kept.join("").replace(/[\r\n]+$/, "").replace(/\r\n?/g, "\n");
+  return withoutTrailingBreaks(kept.join("")).replace(/\r\n?/g, "\n");
 }
 
 /** The text a composer message types, without its submit (HerdrSocket.submit adds the Enter). */
@@ -164,9 +165,15 @@ export function submitNote(code: string, message: string, agent?: string | null)
   if (code === "read_only") return t("Not sent: this view only watches the pane.");
   if (code === "held_input") return t("Not sent: send or discard the held input first.");
   if (code === "input_draft" && agent === "hermes") return t("Not sent: Hermes' input in the terminal is not empty. Send or clear it there, then send this message.");
+  // Claude Code's box holding a paste or image it folded: refused with no Send anyway, and the note says why (#3563)
+  if (code === "input_draft" && message === CLAUDE_FOLDED_DRAFT_MESSAGE) return t("Not sent: Claude Code's input box in the terminal holds a paste or image it folded, whose lines are not shown here, so it cannot be sent over. Send or clear it there, then send this message.");
+  // any other agent's box, refused only over text typed there (server/core/composer.ts freeAgentInput); its message
+  // names it also where the pane is labelled Claude Code (an OmO with its Claude SDK child)
+  if (code === "input_draft" && (message === AGENT_INPUT_DRAFT_MESSAGE || (agent != null && agent !== "claude"))) return t("Not sent: the agent's input box in the terminal holds text typed there. Send or clear it there, then send this message.");
   if (code === "input_draft") return t("Not sent: Claude Code's input box in the terminal is not empty. Send or clear it there, then send this message.");
   if (code === "rewind_dialog_open") return t("Not sent: Claude Code's rewind dialog is open in the terminal. Finish or close it there (Esc), then send this message.");
   if (code === "pending_input_unsupported") return t("Update this PC to send messages in the next turn. Your draft stayed here.");
+  if (code === "pending_hold_unsupported") return t("Update this PC to hold messages. Your draft stayed here.");
   // #511: a message with comments on a reply goes only to an agent
   if (code === "agent_only_unsupported") return t("Update this PC to send comments on a reply. Your message and comments stayed here.");
   // the same code also says an agent's input state is unknown: that keeps the bridge's own words
@@ -177,6 +184,7 @@ export function submitNote(code: string, message: string, agent?: string | null)
   if (code === "first_message_unattended") return t("Not sent: the page that started this agent left before it was ready. Send it now or discard it.");
   if (code === "first_message_launch_ended") return t("Not sent: the agent started for this message has ended. Review the message before sending it.");
   if (code === "pending_target_changed") return t("Not sent: the pane's terminal or agent session changed. Review the message before sending it again.");
+  if (code === "typed_while_waiting") return t("Not sent: something was typed in the terminal while omp was starting. Check its input line there, then send this message.");
   if (code === "disconnected" || code === "timeout") return t("Not confirmed: the pane did not confirm this message. Check the terminal before sending it again.");
   return t("Not sent: {message}", { message });
 }
@@ -226,6 +234,12 @@ export const QUEUE_READY_STATUS: Readonly<Partial<Record<string, true>>> = { don
  */
 export function commandListed(command: SlashCommand): boolean {
   return command.visibility !== "agent-hidden";
+}
+
+/** Whether a typed word is, or starts, a command the menu hides: it is a command all the same, never one "no command matches". */
+export function namesHiddenCommand(commands: readonly SlashCommand[], query: string): boolean {
+  const word = query.toLowerCase();
+  return word !== "" && commands.some((command) => !commandListed(command) && command.name.toLowerCase().startsWith(word));
 }
 
 /**
@@ -458,6 +472,29 @@ export function commandGroup(command: SlashCommand): CommandGroup {
   if (terminalCommand(command)) return "terminal";
   if (command.source === "skill" && command.origin !== undefined) return `skill-${command.origin}`;
   return command.source;
+}
+
+/**
+ * OpenCode's TUI built-ins that take no argument, which its own menu runs when picked: v2.2.7's `slash` entries without
+ * `arguments: true` (packages/tui/src: app.tsx, routes/session, component/prompt, feature-plugins) and v1.19.5's
+ * `slashName` entries, which take none. Not here: `cd`, `rename` and `btw`, which v2 types with a space for an argument,
+ * and the server's commands (`init`, `review`, custom, project and plugin ones), which its menu only types.
+ */
+const OPENCODE_BARE_BUILTINS: ReadonlySet<string> = new Set([
+  "agents", "clear", "compact", "connect", "copy", "debug", "diff", "editor", "exit", "export", "fork", "help",
+  "highlights", "mcps", "models", "move", "new", "open", "org", "pair", "plugins", "redo", "reload", "restart",
+  "sessions", "settings", "skills", "stats", "status", "terminal", "themes", "thinking", "timeline", "timestamps",
+  "undo", "update", "usage", "variants", "warp", "workspaces", "worktrees",
+]);
+
+/**
+ * Whether a command picked from the menu and sent unchanged goes without the space the pick put after it. OpenCode runs
+ * a built-in that takes no argument only from its own menu, and sends `/new ` as a prompt (#3813). Its other commands
+ * only type `/name ` from its menu, and that space is what lets Enter send them, so they keep it, as every other
+ * agent's commands do.
+ */
+export function sendsBarePick(command: SlashCommand, agent: string | null): boolean {
+  return agent === "opencode" && command.source === "builtin" && (command.trigger ?? "/") === "/" && OPENCODE_BARE_BUILTINS.has(command.name);
 }
 
 /** Multi-trigger skills use the typed prefix; others use the command's wire trigger. */

@@ -128,9 +128,16 @@
   text-overflow: ellipsis;
 }
 
-.terminal-input-text:focus {
+/* one line, as .input (styles.css): the ring with the border at rest, the accent border only for a
+   focus that draws no ring */
+.terminal-input-text:focus:not(:focus-visible) {
   outline: none;
   border-color: var(--accent);
+}
+
+.terminal-input-text:focus-visible {
+  outline: var(--ring);
+  outline-offset: var(--ring-offset);
 }
 
 /* the two actions, the last grid column from the label's row down: Insert first, Send last at

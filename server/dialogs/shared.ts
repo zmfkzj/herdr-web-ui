@@ -87,6 +87,8 @@ type Responder =
   | "claude-model"
   | "claude-effort"
   | "codex-model"
+  | "letta-model"
+  | "letta-effort"
   | "omo-question"
   | "omo-review"
   | "omo-typing"
@@ -105,6 +107,8 @@ type Responder =
   | "omp-model"
   | "hermes-question"
   | "hermes-input"
+  | "agy-question"
+  | "hermes-approval"
   | "hermes-help"
   | "hermes-status"
   | "hermes-version"
@@ -157,6 +161,12 @@ export type ParsedPrompt = InteractivePrompt & {
   ompCall?: string;
   /** Claude's /effort: the state its Ultracode switch shows, null without one; checked before `s`, never sent */
   claudeUltracode?: boolean | null;
+  /** Letta's /model: what its search line shows (letta.ts), the search each key of a typed one is checked against */
+  lettaSearch?: string;
+  /** Letta's /model: the tab it shows (letta.ts), part of a row's identity */
+  lettaTab?: string;
+  /** Letta's /model: the tabs its tab bar draws, which a search can empty (letta.ts lettaSearchShown) */
+  lettaTabs?: string[];
   menuLabels: string[];
   selectedIndex: number;
   checkedOptionIndices: number[];
@@ -165,7 +175,7 @@ export type ParsedPrompt = InteractivePrompt & {
   /** each option's own steps, for a card whose options are not rows of a menu */
   optionSteps?: AnswerStep[][];
   /** the steps for a typed answer, for a card whose menu does not take one the usual way */
-  customSteps?: (text: string) => AnswerStep[];
+  customSteps?: (text: string, choices?: number[]) => AnswerStep[];
   /** the steps for a multiple choice, for a card whose menu does not toggle the usual way */
   multiSteps?: (choices: number[]) => AnswerStep[];
   /** the key the menu itself names for the row under the cursor now, for a card whose rows do not all take the same one */
@@ -300,12 +310,13 @@ function ownByIndex(words: readonly (CardWords | null)[]): Record<number, CardTe
   return found.length > 0 ? Object.fromEntries(found) : undefined;
 }
 
+/** Builds a `ParsedPrompt` with localized text metadata and a content hash (`id`). */
 export function finishPrompt(
   agent: string,
   draft: PromptDraft,
   internal: Omit<ParsedPrompt, keyof InteractivePrompt>,
   /** fields as the id reads them, where that is not as the card shows them (a fallback card's ticking working line) */
-  hashed: Partial<Pick<InteractivePrompt, "title" | "question" | "body" | "steps" | "can_step_back" | "can_step_next" | "default_custom_text">> & { call?: string } = {},
+  hashed: Partial<Pick<InteractivePrompt, "title" | "question" | "body" | "steps" | "can_step_back" | "can_step_next" | "default_option_index" | "default_option_indices" | "default_custom_text">> & { call?: string } = {},
 ): ParsedPrompt {
   // the card in English, field for field where the draft had them: the id reads the same words as ever
   const input: Omit<InteractivePrompt, "id" | "agent"> = {

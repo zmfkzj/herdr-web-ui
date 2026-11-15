@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ConversationPart, ConversationTurn } from "../shared/protocol.ts";
+import { ConversationReadPending } from "./conversation-shared.ts";
 import { FileBusyError, fileTask } from "./file-pool.ts";
 import { agyInvokedSkills } from "./skill-invocations/agy.ts";
 import { skillDocument } from "./skill-activity.ts";
@@ -18,7 +19,8 @@ const SCAN_BYTES = 32 * 1024 * 1024;
 // The catalog's database and WAL grow with the session's payloads, not its step count: a long
 // session passes 32 MiB during a turn (#2618). The copy repeats while a turn writes, on a file
 // thread since #2706, but it still holds that thread and the disk for its duration.
-const CATALOG_BYTES = 64 * 1024 * 1024;
+export const AGY_CATALOG_BYTES = 64 * 1024 * 1024;
+const CATALOG_BYTES = AGY_CATALOG_BYTES;
 const hash = (value: string): string => createHash("sha256").update(value).digest("base64url");
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 export class AgyUnavailable extends Error { constructor() { super("Agy history is unavailable"); } }
@@ -256,20 +258,23 @@ const historyReads = new Map<string, Promise<unknown>>();
 /**
  * Keep one fd through projection and page reads, and reject a cut during the read. One read of a
  * ledger at a time: each updates the ledger's shared index, and each now waits for its catalog.
+ * With `authorized`, only that file is read: another one at the path (renamed over it while this
+ * read waited) is pending, for the next read to authorize afresh.
  */
-export function withAgyHistory<T>(path: string, read: (projection: AgyProjection, fd: number) => T): Promise<T> {
-  const run = (historyReads.get(path) ?? Promise.resolve()).then(() => agyHistoryRead(path, read), () => agyHistoryRead(path, read));
+export function withAgyHistory<T>(path: string, read: (projection: AgyProjection, fd: number) => T, authorized?: { dev: number; ino: number }): Promise<T> {
+  const run = (historyReads.get(path) ?? Promise.resolve()).then(() => agyHistoryRead(path, read, authorized), () => agyHistoryRead(path, read, authorized));
   const settled = run.then(() => {}, () => {});
   historyReads.set(path, settled);
   void settled.then(() => { if (historyReads.get(path) === settled) historyReads.delete(path); });
   return run;
 }
 
-async function agyHistoryRead<T>(path: string, read: (projection: AgyProjection, fd: number) => T): Promise<T> {
+async function agyHistoryRead<T>(path: string, read: (projection: AgyProjection, fd: number) => T, authorized?: { dev: number; ino: number }): Promise<T> {
   const fd = openSync(path, "r");
   try {
     if (realpathSync(path) !== path) throw new AgyUnavailable();
     const before = fstatSync(fd);
+    if (authorized !== undefined && (before.dev !== authorized.dev || before.ino !== authorized.ino)) throw new ConversationReadPending();
     const index = agyScan(path, fd);
     const catalog = await agyCatalogOffThread(path);
     // forgotten or evicted while the catalog was read: parsing and output refs look it up by path
@@ -307,9 +312,12 @@ function outputRef(path: string, step: Step): string {
   const index = indexes.get(path)!;
   return `agy:${hash(JSON.stringify([path, index.identity, index.revision, step.start, step.digest]))}`;
 }
+/** Parses an Agy JSONL transcript into user and assistant conversation turns, splitting background-task wakeups after completed replies. */
 export function parseAgyTranscript(text: string, path?: string): ConversationTurn[] {
   const turns: ConversationTurn[] = [];
   const steps = path ? new Map(indexes.get(path)?.visible.map((step) => [step.index, step])) : undefined;
+  let idle = false;
+  let woken = false;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
     const value = entry(line);
@@ -320,6 +328,13 @@ export function parseAgyTranscript(text: string, path?: string): ConversationTur
       const envelope = agyEnvelope(content);
       const skills = envelope === null ? [] : agyInvokedSkills(envelope.request, envelope.metadata).map((skill) => ({ kind: "skill" as const, skill }));
       turns.push({ role: "user", ts, parts: [{ kind: "text", text: envelope?.request ?? content }, ...skills] });
+      idle = false;
+      woken = false;
+      continue;
+    }
+    if (value.type === "SYSTEM_MESSAGE") {
+      // A background task, timer or subagent notification after a tool-free answer resumes the planner in a new turn.
+      if (idle) { woken = true; idle = false; }
       continue;
     }
     if (value.type !== "PLANNER_RESPONSE" && value.type !== "GENERIC") continue;
@@ -336,7 +351,7 @@ export function parseAgyTranscript(text: string, path?: string): ConversationTur
       for (const call of Array.isArray(value.tool_calls) ? value.tool_calls : []) {
         const tool = record(call), input = record(tool.args);
         if (typeof tool.name !== "string") continue;
-        const mapped = { ...input, command: input.CommandLine, file_path: input.AbsolutePath ?? input.TargetFile };
+        const mapped = { ...input, command: input.CommandLine, file_path: input.Path ?? input.AbsolutePath ?? input.TargetFile };
         const part: Extract<ConversationPart, { kind: "tool" }> = { kind: "tool", name: tool.name, summary: toolSummary(tool.name, mapped), input: JSON.stringify(input), output: "" };
         // the ledger ties no output step to its call, so a read stays requested
         const skill = tool.name === "read_file" ? skillDocument(input.Path) : null;
@@ -345,9 +360,20 @@ export function parseAgyTranscript(text: string, path?: string): ConversationTur
       }
     }
     if (!parts.length) continue;
+    if (value.type === "PLANNER_RESPONSE") {
+      idle = (!Array.isArray(value.tool_calls) || value.tool_calls.length === 0) && content.trim().length > 0;
+    }
     const previous = turns.at(-1);
-    if (previous?.role === "assistant") { previous.parts.push(...parts); previous.end_ts = ts ?? undefined; }
-    else turns.push({ role: "assistant", ts, end_ts: ts ?? undefined, parts });
+    // a wake opens its turn with the planner's first step. A tool result that comes before it (or with no planner step
+    // after the notice at all) belongs to the reply that asked for it, and does not move that reply's end
+    const opens = woken && value.type === "PLANNER_RESPONSE";
+    if (previous?.role === "assistant" && !opens) {
+      previous.parts.push(...parts);
+      if (!woken && (!idle || value.type === "PLANNER_RESPONSE")) previous.end_ts = ts ?? undefined;
+    } else {
+      turns.push({ role: "assistant", ts, end_ts: ts ?? undefined, parts });
+      woken = false;
+    }
   }
   return turns;
 }

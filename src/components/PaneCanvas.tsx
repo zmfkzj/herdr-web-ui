@@ -9,6 +9,7 @@ import { moveDestinations } from "../lib/layoutTargets.ts";
 import { useAppLayout, useMachineApi, useMachineId } from "../lib/machineContext.tsx";
 import { PANE_DRAG_TYPE, paneDragData, type SplitSide } from "../lib/split.ts";
 import { PaneSubmitRetention } from "../lib/paneSubmitRetention.ts";
+import { keepPressedButtonClick } from "../lib/pressedButton.ts";
 import { PaneCachedContext, PanePresentedContext, PaneShownContext, PaneSubmitContext, PaneWatchedContext } from "../lib/paneSubmitContext.ts";
 import { cachedPaneCells, visitPaneTab } from "../lib/paneTabCache.ts";
 import { routeMissing } from "../lib/api.ts";
@@ -22,6 +23,7 @@ import { userErrorMessage, type UserError } from "../lib/userError.ts";
 import { useFocusTrap } from "../lib/useFocusTrap.ts";
 import { usePhoneSheetBack } from "../lib/sheetHistory.ts";
 import { useMediaQuery } from "../lib/useMediaQuery.ts";
+import { SHEET_QUERY } from "../lib/sheets.ts";
 import type { RenameRequest } from "../lib/useRenameRequest.ts";
 import { paneLifetimes } from "../lib/paneLifetime.ts";
 import { usePaneLocked } from "../lib/paneLocks.ts";
@@ -58,10 +60,14 @@ interface Props {
   onMoveToWorkspace?: (tabId: string, workspaceId: string) => Promise<void>;
   /** the Rename tab shortcut or palette action for the open pane: where the row is left out, its dialog stands in for the row's field (TabStrip clears it) */
   renameRequest?: RenameRequest | null;
+  /** the Close tab shortcut's press (App): taken here only where the open tab has no row and no header lists it; TabStrip takes it otherwise */
+  closeTabRequest?: RenameRequest | null;
   /** a phone's header title lists the tabs (App): no row is drawn, and its sheet holds New terminal and New tab with agent… */
   tabsInHeader?: boolean;
   /** a watching device sends no settings: it sees a locked pane's Unlock and cannot use it, as in the Agents list */
   watching?: boolean;
+  /** one pane at every width (an inbox mode thread, lib/inboxMode.ts), as a phone already shows a split tab: only what this browser draws */
+  solo?: boolean;
 }
 type Menu = { paneId: string; anchor: HTMLElement; point?: { x: number; y: number }; previousFocus: HTMLElement | null };
 interface Drag {
@@ -84,7 +90,7 @@ interface Drag {
 }
 
 /** The active tab, drawn from herdr's rectangles. No browser-owned layout or PTY state. */
-export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged, renderPane, actionsRef, onOpenInHalf, mirrored = false, onRecoverUnsent, onSearchConversation, onNewTab, onNewTerminal, onMoveToWorkspace, renameRequest = null, tabsInHeader = false, watching = false }: Props) {
+export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged, renderPane, actionsRef, onOpenInHalf, mirrored = false, onRecoverUnsent, onSearchConversation, onNewTab, onNewTerminal, onMoveToWorkspace, renameRequest = null, closeTabRequest = null, tabsInHeader = false, watching = false, solo = false }: Props) {
   const t = useT();
   const { settings, update: updateSettings } = useSettings();
   const narrowScreen = useMediaQuery(MIRROR_WRAP_QUERY);
@@ -96,7 +102,9 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
   const appLayout = useAppLayout();
   const apple = /Mac|iPhone|iPad/.test(navigator.platform);
   const coarse = useMediaQuery("(pointer: coarse)");
-  const narrow = useMediaQuery(SOLO_PANE_QUERY);
+  // at a phone's width the pane's menu is a bottom sheet, a dialog (RowMenu): its ellipsis says so (G-037)
+  const popup = useMediaQuery(SHEET_QUERY) ? "dialog" : "menu";
+  const narrow = useMediaQuery(SOLO_PANE_QUERY) || solo;
   const cramped = useMediaQuery(CRAMPED_QUERY);
   const api = useMachineApi();
   const canvas = useRef<HTMLDivElement>(null);
@@ -112,6 +120,8 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
   const [menu, setMenu] = useState<Menu | null>(null);
   const [renaming, setRenaming] = useState<HerdrPane | null>(null);
   const [renamingTab, setRenamingTab] = useState<HerdrTab | null>(null);
+  // a rename dismissed before Save keeps what was typed, per target, so reopening restores it
+  const renameDrafts = useRef(new Map<string, string>());
   // the row's Move to workspace… and Close tab, where a lone tab's row is left out
   const [movingTab, setMovingTab] = useState<{ tab: HerdrTab; anchor: HTMLElement } | null>(null);
   const [closingTab, setClosingTab] = useState<HerdrTab | null>(null);
@@ -165,13 +175,19 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
     return () => { alive.current = false; cancelDrag(); };
   }, []);
   useEffect(() => { cancelDrag(); }, [topology]);
-  useEffect(() => { setMenu(null); setRenaming(null); setRenamingTab(null); setMovingTab(null); setClosingTab(null); setClosing(null); setError(null); }, [presented?.tab_id]);
+  useEffect(() => { setMenu(null); setRenaming(null); setRenamingTab(null); setMovingTab(null); setClosingTab(null); setClosing(null); setError(null); renameDrafts.current.clear(); }, [presented?.tab_id]);
   // one press each: the request depends on itself alone, as the row's does (TabStrip)
   useLayoutEffect(() => {
     if (renameRequest === null || !loneRowHidden || !appLayout.rename || !presented) return;
     const tab = snapshot?.tabs.find((entry) => entry.tab_id === presented.tab_id);
     if (tab) setRenamingTab(tab);
   }, [renameRequest]);
+  // the Close tab shortcut where the open tab has no row and the header lists no tabs (a lone tab on a cramped screen):
+  // the pane menu's own Close tab runs, its confirmation included, and nothing where that menu has none (a locked tab)
+  useLayoutEffect(() => {
+    if (closeTabRequest === null || !loneRowHidden || tabsInHeader || !presented || watching) return;
+    rowItems(presented)?.tab.find((item) => item.id === "close-tab" && !item.disabled)?.run();
+  }, [closeTabRequest]);
   useEffect(() => { if (menu && !snapshot?.panes.some((item) => item.pane_id === menu.paneId)) setMenu(null); }, [snapshot, menu]);
 
   const run = (operation: () => Promise<unknown>): void => {
@@ -187,6 +203,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
   };
   // a long press on a touch screen is the phone's own: select text, copy (the tab's menu has the pane's actions)
   const touchPress = useRef(false);
+  const pressedButton = useRef<AbortController | null>(null);
   const context = (event: MouseEvent<HTMLElement>, target: HerdrPane): void => {
     const pointer = (event.nativeEvent as Partial<globalThis.PointerEvent>).pointerType;
     // Android Chrome ends a dragged text selection with a second contextmenu typed "mouse" and no
@@ -203,10 +220,25 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
     const made = await api.splitPane(target.pane_id, direction, true);
     if (alive.current && latest.current.tabId === tabId && latest.current.selection === selection) onSelect(made.pane_id);
   };
+  // a close herdr has not yet taken out of the roster, by workspace: until then the roster still counts
+  // the pane, so a second close there (another press of a bound key) would take the workspace's last pane
+  // without asking, or ask herdr for the same pane again; it waits for the roster instead
+  const closingIn = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const [workspace, paneId] of closingIn.current) if (!snapshot?.panes.some((item) => item.pane_id === paneId)) closingIn.current.delete(workspace);
+  }, [snapshot]);
+  const closePane = async (target: HerdrPane): Promise<void> => {
+    closingIn.current.set(target.workspace_id, target.pane_id);
+    try { await api.closePane(target.pane_id); } catch (reason) {
+      if (closingIn.current.get(target.workspace_id) === target.pane_id) closingIn.current.delete(target.workspace_id);
+      throw reason;
+    }
+  };
   const requestClose = (target: HerdrPane): void => {
+    if (closingIn.current.has(target.workspace_id)) return;
     const inWorkspace = snapshot?.panes.filter((item) => item.workspace_id === target.workspace_id).length ?? 1;
     if (inWorkspace === 1 || target.agent_status === "working" || target.agent_status === "blocked") setClosing(target);
-    else run(() => api.closePane(target.pane_id));
+    else run(() => closePane(target));
   };
   // the pane's zoom item and its title's zoom button: the mode the item names, never a toggle (lib/layoutMap.ts)
   const zoom = (target: HerdrPane): void => run(async () => {
@@ -245,7 +277,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         current: item.pane_id === selectedPaneId, run: () => onSelect(item.pane_id),
       })),
       tab: [
-        ...(onNewTerminal && !tabsInHeader ? [{ id: "new-terminal", label: t("New terminal"), icon: Plus, run: () => {
+        ...(onNewTerminal && !tabsInHeader ? [{ id: "new-terminal", label: t("New terminal"), icon: Plus, disabled: watching, run: () => {
           const tabId = latest.current.tabId;
           setError(null);
           void onNewTerminal().catch((reason: unknown) => {
@@ -257,15 +289,15 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         // menu opened from, as the row's menu lists them in place (TabStrip)
         ...(onMoveToWorkspace && appLayout.move && tab && (snapshot?.panes.filter((item) => item.tab_id === target.tab_id).length ?? 0) === 1
           && moveDestinations(snapshot?.workspaces ?? [], target, target.workspace_id).length > 0
-          ? [{ id: "move-workspace", label: t("Move to workspace…"), icon: FolderInput, run: () => {
+          ? [{ id: "move-workspace", label: t("Move to workspace…"), icon: FolderInput, disabled: watching, run: () => {
             const anchor = document.querySelector<HTMLElement>(".header-more-button") ?? canvas.current;
             if (anchor) setMovingTab({ tab, anchor });
           } }] : []),
-        ...(onNewTab && !tabsInHeader ? [{ id: "new-agent-tab", label: t("New tab with agent…"), icon: Bot, run: onNewTab }] : []),
+        ...(onNewTab && !tabsInHeader ? [{ id: "new-agent-tab", label: t("New tab with agent…"), icon: Bot, disabled: watching, run: onNewTab }] : []),
         // the row's inline name field is gone with it: the tab is named in a dialog, as a pane is
-        ...(!appLayout.rename || !tab ? [] : [{ id: "rename-tab", label: t("Rename tab"), icon: Pencil, run: () => setRenamingTab(tab) }]),
+        ...(!appLayout.rename || !tab ? [] : [{ id: "rename-tab", label: t("Rename tab"), icon: Pencil, disabled: watching, run: () => setRenamingTab(tab) }]),
         // the tab's last pane closes it too, but a split tab has no other way to close as one (the row's confirmation: it is the workspace's last tab)
-        ...(tab && !tabLocked(tab.tab_id) ? [{ id: "close-tab", label: t("Close tab"), icon: X, danger: true, run: () => setClosingTab(tab) }] : []),
+        ...(tab && !tabLocked(tab.tab_id) ? [{ id: "close-tab", label: t("Close tab"), icon: X, danger: true, disabled: watching, run: () => setClosingTab(tab) }] : []),
       ],
     };
   };
@@ -349,6 +381,8 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
     flush(current);
   };
   const cells = layout ? layoutCells(layout) : pane ? [{ paneId: pane.pane_id, left: 0, top: 0, width: 100, height: 100, focused: true }] : [];
+  const closingTabPanes = closingTab ? snapshot?.panes.filter((item) => item.tab_id === closingTab.tab_id) ?? [] : [];
+  const closingTabWhat = closingTabPanes.length === 1 && closingTabPanes[0] ? displayPaneTitle(closingTabPanes[0]) : t("{n} panes", { n: closingTabPanes.length });
   const alone = soloPane(layout, cells.map((cell) => cell.paneId), selectedPaneId, narrow);
   const stacked = alone !== null && !layout?.zoomed;
   // a split tab where every pane can be drawn (not a phone's one at a time): each title offers its
@@ -401,6 +435,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
           // A right press must not change focus before the menu's Swap with focused pane.
           if (event.button === 0 && !paneContextPress(event, apple) && !active) {
             onSelect(item.pane_id, false);
+            keepPressedButtonClick(event, pressedButton);
           }
           const element = event.target instanceof Element ? event.target : null;
           const titleOrFrame = element?.closest(".pane-frame-head") || element === event.currentTarget;
@@ -430,22 +465,29 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         }}
         onContextMenuCapture={(event) => context(event, item)}>
         {!(single && !offTab && loneRowHidden) && <div className="pane-frame-head" draggable={onOpenInHalf !== undefined && !coarse}
-          onClick={(event) => {
-            if (!onOpenInHalf || coarse || paneContextPress(event, apple) || (event.target instanceof Element && event.target.closest("button"))) return;
-            paneInput(event.currentTarget.parentElement)?.focus({ preventScroll: true });
-          }}
           onDragStart={(event: DragEvent<HTMLDivElement>) => {
             // dropped on a half of the pane area, the title opens its pane there (App's drop)
             event.dataTransfer.effectAllowed = "move";
             event.dataTransfer.setData(PANE_DRAG_TYPE, paneDragData({ machineId, paneId: item.pane_id }));
           }}>
-          <span className="pane-frame-title">{displayPaneTitle(item)}</span>
-          <button type="button" className="icon-button pane-frame-menu" aria-label={t("Pane actions for {name}", { name: displayPaneTitle(item) })}
+          <span className="pane-frame-title" role={active && !offTab ? "heading" : undefined} aria-level={active && !offTab ? 2 : undefined}><span role="button" tabIndex={0} style={{ display: "block", lineHeight: "var(--pointer-target)", overflow: "hidden", textOverflow: "ellipsis" }} onClick={(event) => {
+            if (!paneContextPress(event, apple)) paneInput(event.currentTarget.closest(".pane-frame"))?.focus({ preventScroll: true });
+          }} onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            paneInput(event.currentTarget.closest(".pane-frame"))?.focus({ preventScroll: true });
+          }}>{displayPaneTitle(item)}</span></span>
+          <button type="button" className="icon-button pane-frame-menu" aria-label={t("Pane actions for {name}", { name: displayPaneTitle(item) })} title={t("Pane actions for {name}", { name: displayPaneTitle(item) })} aria-haspopup={popup} aria-expanded={menu?.paneId === item.pane_id}
             onClick={(event) => showMenu(item, event.currentTarget)}><Ellipsis aria-hidden="true" /></button>
           {zoomable && !offTab && <button type="button" className="icon-button pane-frame-zoom" aria-label={t(zoomedHere ? "Unzoom pane" : "Zoom pane")} title={t(zoomedHere ? "Unzoom pane" : "Zoom pane")}
             // a click selects this pane, so its typing goes there too, as a click on the title does;
             // a key that pressed the button (detail 0) leaves the focus on it
             onClick={(event) => { zoom(item); if (event.detail > 0) paneInput(event.currentTarget.closest(".pane-frame"))?.focus({ preventScroll: true }); }}>{zoomedHere ? <Minimize2 aria-hidden="true" /> : <Maximize2 aria-hidden="true" />}</button>}
+          {/* the corner closes, as a window's does: the menu's Close and its confirmation, offered where the menu offers it */}
+          {zoomable && !offTab && !paneLocked(item.pane_id) && <button type="button" className="icon-button pane-frame-close" aria-label={t("Close pane")} title={t("Close pane")} disabled={watching}
+            // Safari focuses no button a click pressed: focused here, it is the confirmation's opener, which Cancel and Escape hand back to
+            // a double click's second press may land on the neighbour that took this corner: only a first press closes
+            onClick={(event) => { if (event.detail > 1) return; event.currentTarget.focus({ preventScroll: true }); requestClose(item); }}><X aria-hidden="true" /></button>}
         </div>}
         <div className="pane-frame-body"><PaneCachedContext.Provider value={cell.cached && !cell.retained}><PaneWatchedContext.Provider value={cell.cached && !cell.retained && watchedTabs.has(item.tab_id)}><PanePresentedContext.Provider value={!offTab}><PaneShownContext.Provider value={!hidden}>{renderPane(item, active, alone === null && cells.length > 1)}</PaneShownContext.Provider></PanePresentedContext.Provider></PaneWatchedContext.Provider></PaneCachedContext.Provider></div>
       </section>;
@@ -472,10 +514,18 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         }} />;
     })}
     {error && <div className="pane-canvas-error" role="alert">{error.message}{error.detail !== null && <><br /><code>{error.detail}</code></>}<button className="icon-button" aria-label={t("Dismiss")} onClick={() => setError(null)}><X /></button></div>}
-    {menu && target && <RowMenu anchor={menu.anchor} point={menu.point} restoreFocusTo={menu.previousFocus} title={t("Pane actions for {name}", { name: displayPaneTitle(target) })} items={items} onClose={closeMenu} />}
-    {renaming && <RenameDialog title={t("Rename pane")} field={t("Pane name")} initial={renaming.label ?? ""} maxLength={80} onClose={() => setRenaming(null)} onSave={async (label) => { await api.renamePane(renaming.pane_id, label); onChanged(); }} />}
-    {renamingTab && <RenameDialog title={t("Rename tab")} field={t("Tab name")} initial={customTabLabel(renamingTab, 1) ?? ""} maxLength={MAX_LABEL_CHARS} required={t("A tab needs a name.")}
-      onClose={() => setRenamingTab(null)} onSave={async (label) => { await api.renameTab(renamingTab.tab_id, label); onChanged(); }} />}
+    {menu && target && <RowMenu anchor={menu.anchor} point={menu.point} restoreFocusTo={menu.previousFocus} title={t("Pane actions for {name}", { name: displayPaneTitle(target) })}
+        header={<span className="pane-frame-menu-target">{displayPaneTitle(target)}</span>} items={items} onClose={closeMenu} />}
+    {renaming && <RenameDialog title={`${t("Rename pane")} · ${displayPaneTitle(renaming)}`} field={t("Pane name")} initial={renameDrafts.current.get(`pane:${renaming.pane_id}`) ?? renaming.label ?? ""} placeholder={displayPaneTitle(renaming)} maxLength={80}
+      onDraft={(value) => renameDrafts.current.set(`pane:${renaming.pane_id}`, value)}
+      onClose={() => setRenaming(null)}
+      onCancel={() => { renameDrafts.current.delete(`pane:${renaming.pane_id}`); setRenaming(null); }}
+      onSave={async (label) => { await api.renamePane(renaming.pane_id, label); renameDrafts.current.delete(`pane:${renaming.pane_id}`); onChanged(); }} />}
+    {renamingTab && <RenameDialog title={`${t("Rename tab")} · ${tabLabel(renamingTab, t, 1)}`} field={t("Tab name")} initial={renameDrafts.current.get(`tab:${renamingTab.tab_id}`) ?? customTabLabel(renamingTab, 1) ?? ""} placeholder={tabLabel(renamingTab, t, 1)} maxLength={MAX_LABEL_CHARS} required={t("A tab needs a name.")}
+      onDraft={(value) => renameDrafts.current.set(`tab:${renamingTab.tab_id}`, value)}
+      onClose={() => setRenamingTab(null)}
+      onCancel={() => { renameDrafts.current.delete(`tab:${renamingTab.tab_id}`); setRenamingTab(null); }}
+      onSave={async (label) => { await api.renameTab(renamingTab.tab_id, label); renameDrafts.current.delete(`tab:${renamingTab.tab_id}`); onChanged(); }} />}
     {movingTab && <RowMenu anchor={movingTab.anchor} title={t("Move {tab} to", { tab: tabLabel(movingTab.tab, t, 1) })} align="start" onClose={() => setMovingTab(null)}
       items={moveDestinations(snapshot?.workspaces ?? [], snapshot?.panes.find((item) => item.tab_id === movingTab.tab.tab_id), movingTab.tab.workspace_id).map((entry): RowMenuItem => ({
         id: `workspace:${entry.workspace_id}`, label: entry.label, icon: Folder, run: () => {
@@ -487,7 +537,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
         },
       }))} />}
     {closingTab && <ConfirmDialog title={t("Close tab {name}?", { name: tabLabel(closingTab, t, 1) })}
-      body={t("It is the last tab of {workspace}: the workspace closes with it, and the agents and shells in it stop.", { workspace: snapshot?.workspaces.find((entry) => entry.workspace_id === closingTab.workspace_id)?.label ?? "" })}
+      body={`${t("It is the last tab of {workspace}: the workspace closes with it, and the agents and shells in it stop.", { workspace: snapshot?.workspaces.find((entry) => entry.workspace_id === closingTab.workspace_id)?.label ?? "" })} ${closingTabWhat}`}
       confirmLabel={t("Close tab")} onClose={() => setClosingTab(null)}
       onConfirm={async () => {
         await api.closeTab(closingTab.tab_id); setClosingTab(null); onChanged();
@@ -497,7 +547,7 @@ export function PaneCanvas({ snapshot, pane, selectedPaneId, onSelect, onChanged
       }} />}
     {closing && <ConfirmDialog title={t("Close pane {name}?", { name: displayPaneTitle(closing) })}
       body={t("The pane's running processes will stop. Closing its last pane also closes the workspace.")}
-      confirmLabel={t("Close pane")} onClose={() => setClosing(null)} onConfirm={async () => { await api.closePane(closing.pane_id); setClosing(null); onChanged(); }} />}
+      confirmLabel={t("Close pane")} onClose={() => setClosing(null)} onConfirm={async () => { await closePane(closing); setClosing(null); onChanged(); }} />}
   </div></PaneSubmitContext.Provider>;
 }
 
@@ -512,7 +562,7 @@ function paneInput(frame: Pick<Element, "querySelector"> | null): HTMLElement | 
 }
 
 /** A pane's or a lone tab's name; `required` is the error an empty name gets, where one is not allowed (a tab's). */
-function RenameDialog({ title, field, initial, maxLength, required, onClose, onSave }: { title: string; field: string; initial: string; maxLength: number; required?: string; onClose: () => void; onSave: (label: string) => Promise<void> }) {
+function RenameDialog({ title, field, initial, placeholder, maxLength, required, onDraft, onClose, onCancel, onSave }: { title: string; field: string; initial: string; placeholder?: string; maxLength: number; required?: string; onDraft?: (value: string) => void; onClose: () => void; onCancel?: () => void; onSave: (label: string) => Promise<void> }) {
   const t = useT();
   const input = useRef<HTMLInputElement>(null);
   const surface = useFocusTrap<HTMLDivElement>(true, { initialFocus: input });
@@ -537,8 +587,8 @@ function RenameDialog({ title, field, initial, maxLength, required, onClose, onS
         if (required !== undefined && value.trim() === "") { setError({ message: required, detail: null }); return; }
         setBusy(true); void onSave(value.trim()).then(onClose, (reason) => { setError(userErrorMessage(reason)); setBusy(false); }); }}>
         <header className="modal-header"><h2 className="modal-title">{title}</h2></header>
-        <div className="modal-body"><label>{field}<input ref={input} className="input" value={value} disabled={busy} maxLength={maxLength} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setValue(event.target.value)} /></label>{error && <p role="alert">{error.message}{error.detail !== null && <><br /><code>{error.detail}</code></>}</p>}</div>
-        <footer className="modal-footer"><button type="button" className="btn" disabled={busy} onClick={onClose}>{t("Cancel")}</button><button className="btn btn-primary" disabled={busy}>{t("Save")}</button></footer>
+        <div className="modal-body"><label className="field"><span className="field-label">{field}</span><input ref={input} className="input" value={value} placeholder={placeholder} disabled={busy} maxLength={maxLength} onFocus={(event) => event.currentTarget.select()} onChange={(event) => { setValue(event.target.value); onDraft?.(event.target.value); }} /></label>{error && <p role="alert">{error.message}{error.detail !== null && <><br /><code>{error.detail}</code></>}</p>}</div>
+        <footer className="modal-footer"><button type="button" className="btn" disabled={busy} onClick={onCancel ?? onClose}>{t("Cancel")}</button><button className="btn btn-primary" disabled={busy}>{t("Save")}</button></footer>
       </form>
     </div>
   </div>, document.body);

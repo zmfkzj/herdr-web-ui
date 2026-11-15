@@ -164,6 +164,8 @@ describe("herdr socket", () => {
   const NET_CONNECT_ALLOWED: Record<string, string> = {
     "server/ssh-askpass.ts": "the SSH askpass helper's own private socket, not herdr's",
     "server/herdr-core/adapter.ts": "a liveness probe of the core adapter's own socket before startup: sends no request",
+    "server/herdr-core/runtime.ts": "a liveness probe of herdr-core's socket, not herdr's: connects and closes, sends nothing",
+    "server/runtime-move-lock.ts": "the herdr-core move's own lock socket, not herdr's: asks which Ovis server holds it",
   };
 
   it("opens herdr's socket only in server/herdr/client.ts", () => {
@@ -228,6 +230,60 @@ describe("herdr socket", () => {
   });
 });
 
+describe("runtime gates", () => {
+  /**
+   * A gate on the runtime's name: a comparison with `"herdr-core"` or a `case` on it, any read of the
+   * served runtime's name (`capabilities().runtime`), or a comparison of the chosen one (`runtime()`).
+   * `"herdr"` alone names other things too (a turn's source, a query parameter), so it counts only
+   * beside one of those reads.
+   */
+  const NAMED = /[!=]== ?"herdr-core"|\bcase "herdr-core"\s*:|\bcapabilities\(\)\.runtime\b|\bruntime\(\)\s*[!=]==/;
+
+  // which runtime is served or named, not what it can do
+  const RUNTIME_NAMED: Record<string, string> = {
+    "server/runtime-move.ts": "the move goes from herdr to herdr-core",
+    "server/runtime-move-run.ts": "the move goes from herdr to herdr-core",
+    "server/runtime-move-service.ts": "the move goes from herdr to herdr-core",
+    "server/index.ts": "a saved choice of herdr-core falls back to herdr when no hc is found",
+    "server/machines.ts": "a remote PC's own Ovis is taken by the runtime its identity names",
+    "server/conversation.ts": "the name of hc's program in an attach client's argv",
+    "server/agents-routes.ts": "herdr itself starts two agent kinds without a manifest",
+    "server/herdr-update.ts": "`herdr update` updates herdr, no other runtime",
+  };
+
+  it("asks the runtime for an ability, never for its name", () => {
+    const named = matches([...serverCode(), ...files("shared/**/*.ts")].filter((file) => !file.startsWith("server/herdr-core/") && file !== "server/runtime/capabilities.ts"), NAMED);
+    fail(named.filter((use) => !(use.file in RUNTIME_NAMED)).map((use) => use.at),
+      "Do not branch on the runtime's name: read the ability the code needs from capabilities() (server/runtime/capabilities.ts), adding a field to RuntimeCapabilities and to each runtime's record when none fits.");
+    const users = new Set(named.map((use) => use.file));
+    fail(Object.keys(RUNTIME_NAMED).filter((file) => !users.has(file)),
+      "These files no longer compare the runtime's name: remove them from RUNTIME_NAMED in server/conventions.test.ts.");
+  });
+
+  it("knows a gate on the runtime's name from another use of the word", () => {
+    for (const gate of [
+      'if (identity.runtime !== "herdr-core") return;',
+      'if (capabilities().runtime === "herdr") kinds.add("omp");',
+      'const other = capabilities().runtime !== "herdr";',
+      'if (runtime() !== "herdr") return null;',
+      'if (runtime() === "herdr-core") start();',
+      'switch (served) { case "herdr": return 1; case "herdr-core": return 2; }',
+      'switch (capabilities().runtime) { case "herdr": return 1; default: return 2; }',
+    ]) expect(NAMED.test(gate)).toBe(true);
+    for (const other of [
+      // the runtime told, not asked: /api/health's answer
+      "return jsonResponse({ ok: true, runtime: runtime() });",
+      // another herdr: a query parameter, a turn's source, a program started
+      'const discover = url.searchParams.get("discover") === "herdr";',
+      'if (source === "herdr" && tracked) return;',
+      'switch (signal.source) { case "herdr": return turns.chat; default: return turns.herdr; }',
+      'const command = process.env["OVIS_HERDR_BIN"] || "herdr";',
+      // an ability read, which is what a gate should do
+      'if (capabilities().attach === "pty-cli") watch();',
+    ]) expect(NAMED.test(other)).toBe(false);
+  });
+});
+
 describe("remote PC bundle boundary", () => {
   // scripts/build-remote-bundle.ts ships server/, shared/ and integrations/ but not src/ or relay/: code
   // there that imports either loads from a checkout, where every check runs, and not on a remote PC (#2220)
@@ -250,5 +306,33 @@ describe("remote PC bundle boundary", () => {
     expect(SRC_IMPORT.test("import { a } from \"./src-files.ts\";")).toBe(false);
     expect(leavesBundle("server/relay/pair-code.ts", "../../relay/pair-room.ts")).toBe(true);
     expect(leavesBundle("server/account/mailbox.ts", "../relay/identity.ts")).toBe(false);
+  });
+});
+
+describe("server entries", () => {
+  // The compiled binary (scripts/build-server.ts) has no .ts files: a child started by a source file's
+  // path works only from a checkout. server/entries.ts starts each entry, by file from source and by
+  // name in the binary (entryCommand).
+  const START_BY_PATH = /\bprocess\.execPath\s*,\s*\[?\s*(?:join\s*\(|resolve\s*\(|["'`][^"'`\n]*\.(?:ts|tsx|js|mjs)["'`])/;
+  const ALLOWED: Record<string, string> = {
+    "server/supervisor.ts": "installs the Rust PTY host with the script of a release checked out from source, which only the source updater makes",
+    "server/updater.ts": "builds a release checked out from source with that release's own scripts",
+  };
+
+  it("starts the server's own entries only through entryCommand", () => {
+    const starts = matches([...serverCode(), "scripts/plugin.ts"].filter((file) => file !== "server/entries.ts"), START_BY_PATH);
+    fail(starts.filter((start) => !(start.file in ALLOWED)).map((start) => start.at),
+      "Start the server's own code with entryCommand(name) from server/entries.ts (add the entry to ENTRIES), never with process.execPath and a .ts path: the compiled binary has no such file.");
+    const users = new Set(starts.map((start) => start.file));
+    fail(Object.keys(ALLOWED).filter((file) => !users.has(file)), "These files no longer start a file by path: remove them from ALLOWED in server/conventions.test.ts.");
+  });
+
+  it("knows a start by path from other uses of process.execPath", () => {
+    expect(START_BY_PATH.test("Bun.spawn([process.execPath, join(import.meta.dir, \"machine-entry.ts\")], {")).toBe(true);
+    expect(START_BY_PATH.test("Bun.spawn([process.execPath, \"server/index.ts\"], {")).toBe(true);
+    expect(START_BY_PATH.test("spawn(process.execPath, [join(ROOT, \"server\", \"managed.ts\")], {")).toBe(true);
+    expect(START_BY_PATH.test("run([process.execPath, \"install\", \"--frozen-lockfile\"])")).toBe(false);
+    expect(START_BY_PATH.test("[process.execPath, \"-e\", SCRIPT, String(pid)]")).toBe(false);
+    expect(START_BY_PATH.test("Bun.spawn(entryCommand(\"machine\"), {")).toBe(false);
   });
 });

@@ -106,7 +106,11 @@ describe("the folds Settings → Chat starts a turn with", () => {
 
 describe("Compaction and failed requests (#901)", () => {
   const failed = (error: string): ConversationPart => ({ kind: "text", text: `Error: ${error}`, failed: true });
-  const rows = (html: string) => [...html.matchAll(/class="chat-skill is-error chat-failed-requests"><summary>.*?<span class="chat-skill-name">([^<]*)</g)].map((match) => match[1]);
+  const rows = (html: string) => [...html.matchAll(/class="chat-skill(?: is-error)? chat-failed-requests"(?: open="")?><summary>.*?<span class="chat-skill-name">([^<]*)</g)].map((match) => match[1]);
+  /** the rows drawn open: the error itself in view without a click */
+  const opened = (html: string) => [...html.matchAll(/class="chat-skill(?: is-error)? chat-failed-requests"( open="")?>/g)].map((match) => match[1] !== undefined);
+  /** the rows drawn in the alert colour (is-error): a run nothing followed, never one the turn went on from */
+  const alerting = (html: string) => [...html.matchAll(/class="chat-skill( is-error)? chat-failed-requests"/g)].map((match) => match[1] !== undefined);
 
   it("draws each failed request as its error line while off, as before", () => {
     const html = render([failed("503 overloaded"), failed("Connection error."), text("hello")], { live: false });
@@ -119,13 +123,24 @@ describe("Compaction and failed requests (#901)", () => {
     const on = { requestDetails: true };
     const retried = render([failed("503 overloaded"), failed("Connection error."), text("hello")], { live: false }, "assistant", on);
     expect(rows(retried)).toEqual(["2 requests failed, then tried again"]);
+    expect(alerting(retried)).toEqual([false]);
     // the errors are inside the row, without the prefix the line needed; the answer stays outside it
     expect(retried).toContain("<li>503 overloaded</li><li>Connection error.</li>");
     expect(retried).not.toContain("Error: 503");
     expect(retried).toContain("hello");
-    expect(rows(render([failed("401 unauthorized")], { live: false }, "assistant", on))).toEqual(["Request failed"]);
-    // two runs apart stay two rows
-    expect(rows(render([failed("a"), text("partial"), failed("b")], { live: false }, "assistant", on))).toEqual(["Request failed, then tried again", "Request failed"]);
+    const alone = render([failed("401 unauthorized")], { live: false }, "assistant", on);
+    expect(rows(alone)).toEqual(["Request failed"]);
+    expect(alerting(alone)).toEqual([true]);
+    // two runs apart stay two rows; only the one nothing followed keeps the alert colour
+    const apart = render([failed("a"), text("partial"), failed("b")], { live: false }, "assistant", on);
+    expect(rows(apart)).toEqual(["Request failed, then tried again", "Request failed"]);
+    expect(alerting(apart)).toEqual([false, true]);
+    // a turn that ended on its failure shows the error at once (a Codex usage limit); one it went on from stays folded
+    expect(opened(alone)).toEqual([true]);
+    expect(opened(retried)).toEqual([false]);
+    expect(opened(apart)).toEqual([false, true]);
+    // folded while the turn goes on: a retry arriving under it does not fold it away under the reader
+    expect(opened(render([failed("401 unauthorized")], { live: true }, "assistant", on))).toEqual([false]);
   });
 
   it("names the token counts a compaction recorded only while on", () => {

@@ -101,7 +101,7 @@ it("reads session identity from bounded headers and rejects foreign cwd and esca
     session(join(home, "outside.jsonl"), "/project");
     symlinkSync(join(home, "outside.jsonl"), join(dir, "escaped.jsonl"));
     writeFileSync(join(dir, "broken.jsonl"), "{");
-    expect(omoCandidates("/project", home)).toEqual([{ path: join(dir, "valid.jsonl"), id: "session-1", createdAt: Date.parse("2026-09-27T00:00:00Z"), store: join(home, ".omo", "agent", "sessions") }]);
+    expect(omoCandidates("/project", home)).toEqual([{ path: join(dir, "valid.jsonl"), id: "session-1", createdAt: Date.parse("2026-09-27T00:00:00Z"), store: join(home, ".omo", "agent", "sessions"), identity: expect.any(String) }]);
     expect(omoCandidates("/missing", home)).toEqual([]);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
@@ -521,7 +521,9 @@ it("names the OmO process holding a session, not the bundled SDK child beside it
   const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-omo-held-pid-")));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
-  const pid = 41001;
+  // above any pid_max (Linux allows none over 2 ** 22): the pane's directory places these two only while
+  // /proc/<pid>/cwd answers for neither, and a live process of this host at a small pid would answer
+  const pid = 2 ** 22 + 41001;
   const start = spyOn(processStart, "processStartedAtAsync").mockResolvedValue(1_792_000_000_000);
   const environ = spyOn(omoModule, "processEnviron").mockReturnValue([`OMO_CODING_AGENT_DIR=${agentDir}`]);
   try {
