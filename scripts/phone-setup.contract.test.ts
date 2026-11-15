@@ -1,16 +1,19 @@
 import { expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { herdrRpc, paneRead, sessionSnapshot, workspaceClose, workspaceCreate } from "../server/herdr/client.ts";
+import { SOCKET_PATH_MAX } from "./check.ts";
 import { testShellEnv } from "./test-shell.ts";
 
 /** Its own XDG config isolates the global plugin registry as well as the owned herdr panes. */
 it("herdr loads the Phone setup entrypoint and keeps its QR and code visible in a pane", async () => {
-  // the session socket lives under root: macOS's temp dir is too deep for a socket path (104 bytes)
-  const root = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "herdr-phone-pane-"));
+  // the fixture under the run's temp dir; herdr's config, which holds the session socket, in a short folder of its own:
+  // under a long TMPDIR (the dedicated ones AGENTS.md asks for, macOS's own) its path passes a unix socket's limit
+  const root = mkdtempSync(join(tmpdir(), "herdr-phone-pane-"));
+  const short = mkdtempSync(join(existsSync("/tmp") ? "/tmp" : tmpdir(), "hps-"));
   const source = join(import.meta.dir, "..");
-  const config = join(root, "config");
+  const config = join(short, "config");
   const plugin = join(root, "plugin");
   mkdirSync(plugin);
   const manifest = Bun.TOML.parse(readFileSync(join(source, "herdr-plugin.toml"), "utf8")) as any;
@@ -25,6 +28,11 @@ it("herdr loads the Phone setup entrypoint and keeps its QR and code visible in 
   const binary = process.env["OVIS_HERDR_BIN"] || Bun.which("herdr")!;
   const session = "phone-setup-qa";
   const socket = join(config, "herdr", "sessions", session, "herdr.sock");
+  if (socket.length > SOCKET_PATH_MAX) {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(short, { recursive: true, force: true });
+    throw new Error(`${socket} is too long for a unix socket (${socket.length} > ${SOCKET_PATH_MAX} bytes)`);
+  }
   // OVIS_FROM_SOURCE: the pane runs this checkout's scripts/plugin.ts. Without it the launcher would ask GitHub whether
   // package.json's version has a compiled server (this plugin never ran the build step that remembers the answer):
   // a network call in a contract test, and once that release exists, a download of it instead of these sources
@@ -48,11 +56,19 @@ it("herdr loads the Phone setup entrypoint and keeps its QR and code visible in 
     await cli("plugin", "link", plugin);
     const pluginConfig = await cli("plugin", "config-dir", manifest.id);
     writeFileSync(join(pluginConfig, ".env"), `PORT=${app.port}\nHOST=127.0.0.1\nOVIS_TOKEN=\nOVIS_STATE_DIR=${join(root, "app-state")}\n`);
-    daemon = Bun.spawn([binary, "--session", session, "server"], { env, stdout: "ignore", stderr: "ignore" });
-    const deadline = Date.now() + 10_000;
+    // its output kept, to tell a start that fails (a socket path refused, a broken config) from a slow one
+    const daemonLog = join(root, "herdr-server.log");
+    daemon = Bun.spawn([binary, "--session", session, "server"], { env, stdout: Bun.file(daemonLog), stderr: Bun.file(daemonLog) });
+    const started = Date.now() + 10_000;
     for (;;) {
       try { await herdrRpc("session.snapshot", {}, socket); break; }
-      catch { if (Date.now() >= deadline) throw new Error("Phone QA server did not start"); await Bun.sleep(50); }
+      catch (error) {
+        if (daemon.exitCode !== null || Date.now() >= started) {
+          const log = existsSync(daemonLog) ? readFileSync(daemonLog, "utf8").trim() : "";
+          throw new Error(`Phone QA server did not start (${daemon.exitCode !== null ? `exited ${daemon.exitCode}` : "no answer within 10s"}; last: ${(error as Error).message}): ${log || "no output"}`);
+        }
+        await Bun.sleep(50);
+      }
     }
     const created = await workspaceCreate({ cwd: root, label: "ovis-test-phone-setup" }, socket);
     workspace = created.workspace.workspace_id;
@@ -60,7 +76,9 @@ it("herdr loads the Phone setup entrypoint and keeps its QR and code visible in 
     const paneId = (await sessionSnapshot(socket)).panes.find((pane) => pane.workspace_id === workspace && pane.pane_id !== created.root_pane.pane_id)?.pane_id;
     expect(typeof paneId).toBe("string");
     let text = "";
-    while (Date.now() < deadline) {
+    // the pane's own start (bun, the plugin's sources) has a deadline of its own, not what the server's start left
+    const shown = Date.now() + 10_000;
+    while (Date.now() < shown) {
       text = (await paneRead({ paneId: paneId!, source: "visible", format: "text" }, socket)).text;
       if (text.includes("Press Enter to finish")) break;
       await Bun.sleep(50);
@@ -75,5 +93,6 @@ it("herdr loads the Phone setup entrypoint and keeps its QR and code visible in 
     if (daemon) { daemon.kill(); await daemon.exited; }
     app.stop(true);
     rmSync(root, { recursive: true, force: true });
+    rmSync(short, { recursive: true, force: true });
   }
-}, 15_000);
+}, 30_000);
