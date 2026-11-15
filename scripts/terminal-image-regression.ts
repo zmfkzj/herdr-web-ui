@@ -36,6 +36,7 @@ import { agentGet, herdrRpc, paneProcessInfo, paneSendKeys, paneSendText, sessio
 import { socketPath } from "../server/bridge.ts";
 import { SshConnection } from "../server/ssh.ts";
 import { chromePath } from "./chrome-path.ts";
+import { shownRow } from "./shown-rows.ts";
 
 if (process.env["HERDR_TEST_LIVE"] === "1") throw new Error("This regression refuses HERDR_TEST_LIVE=1");
 const extension = process.env["PI_IMAGES_EXTENSION"];
@@ -195,6 +196,8 @@ try {
   // and every terminal byte herdr sends is tallied: it should only place the cursor and write cells
   const moves: Record<string, number> = {};
   let ptyFrames = 0;
+  // the terminal frames the newest socket has brought: a re-attach after a drop sends its first frame again
+  let liveFrames = 0;
   // a message, input or request from the page that carries image feedback: there must never be one
   let sentFeedback = 0;
   page.on("request", (request) => { if ((request.postData() ?? "").includes("Please revise")) sentFeedback++; });
@@ -206,6 +209,7 @@ try {
         const frame = JSON.parse(message) as { type?: string; data?: string };
         if (frame.type === "pty-data" && typeof frame.data === "string") {
           ptyFrames++;
+          if (socket === liveSocket) liveFrames++;
           // a line feed, index, reverse index, scroll, inserted/deleted lines or characters, a scroll region
           for (const match of frame.data.matchAll(/\n|\x1b[DEM]|\x1b\[\d*[STLM@P]|\x1b\[\d*;?\d*r/g)) moves[JSON.stringify(match[0])] = (moves[JSON.stringify(match[0])] ?? 0) + 1;
         }
@@ -213,14 +217,16 @@ try {
       socket.send(message);
     });
     liveSocket = socket;
+    liveFrames = 0;
   });
   /** the terminal's text rows, as the browser shows them */
-  const screenRows = () => page.evaluate(() => [...document.querySelectorAll(".pane-terminal .xterm-rows > div")].map((row) => [...(row.textContent ?? "")]));
+  const screenRows = () => page.evaluate((selector) => [...document.querySelectorAll(selector)].map((row) => [...(row.textContent ?? "")]), shownRow());
 
   /** what the image layer draws, read against the terminal's own text rows */
-  const drawn = () => page.evaluate(() => {
+  const drawn = () => page.evaluate((selector) => {
     const screen = document.querySelector(".pane-terminal .xterm-screen") as HTMLElement | null;
-    const rows = [...document.querySelectorAll(".pane-terminal .xterm-rows > div")].map((row) => row.textContent ?? "");
+    // the rows the pane shows: libghostty's while it draws the pane, where xterm's are hidden and left blank
+    const rows = [...document.querySelectorAll(selector)].map((row) => row.textContent ?? "");
     return [...document.querySelectorAll<HTMLElement>(".pane-terminal .terminal-image")].map((box) => {
       const [left, top, cols, height, firstRow, lastRow] = box.dataset["cells"]!.split(",").map(Number) as [number, number, number, number, number, number];
       const img = box.querySelector("img")!;
@@ -237,12 +243,14 @@ try {
         marked: Array.from({ length: lastRow - firstRow + 1 }, (_, i) => firstRow + i).some((row) => chars(row)[left + cols] === "\u2800"),
         // the cells under the image hold no text
         blank: Array.from({ length: lastRow - firstRow + 1 }, (_, i) => chars(firstRow + i).slice(left, left + cols).join("").trim() === ""),
+        // what the rows hold from the image's left to past its right edge, shown when a check fails
+        around: Array.from({ length: lastRow - firstRow + 1 }, (_, i) => chars(firstRow + i).slice(Math.max(0, left - 2), left + cols + 3).join("")),
         cell: screen ? { width: screen.clientWidth / Math.max(1, chars(0).length), height: screen.clientHeight / Math.max(1, rows.length) } : null,
         box: { x: boxRect.x, y: boxRect.y, width: boxRect.width, height: boxRect.height },
         picture: { x: rect.x, y: rect.y, width: img.naturalWidth * scale, height: img.naturalHeight * scale },
       };
     });
-  });
+  }, shownRow());
   type Drawn = Awaited<ReturnType<typeof drawn>>;
   const colourAt = async (x: number, y: number): Promise<number[]> => {
     const shot = await page.screenshot({ clip: { x: Math.round(x), y: Math.round(y), width: 1, height: 1 } });
@@ -273,7 +281,7 @@ try {
   };
   const checkGeometry = (images: Drawn, label: string) => {
     for (const image of images) {
-      assert.ok(image.marked && image.markers.every(Boolean), `${label}: ${image.ref} sits left of its marker cells`);
+      assert.ok(image.marked && image.markers.every(Boolean), `${label}: ${image.ref} sits left of its marker cells (cells ${image.left},${image.top} ${image.cols}x${image.rows}, rows ${image.firstRow}-${image.lastRow}: ${JSON.stringify(image.around)})`);
       assert.ok(image.blank.every(Boolean), `${label}: ${image.ref} covers no text`);
       assert.ok(image.cell && Math.abs(image.box.height - (image.lastRow - image.firstRow + 1) * image.cell.height) < 1, `${label}: ${image.ref} spans its visible rows`);
     }
@@ -443,8 +451,11 @@ try {
   record("reloaded", images);
   // the socket drops (no reload): the page reconnects, re-attaches, and the images come back
   assert.ok(liveSocket, "the page's socket is routed");
-  await (liveSocket as WebSocketRoute).close();
-  await page.waitForFunction(() => document.querySelector(".conn-live") === null);
+  const dropped = liveSocket as WebSocketRoute;
+  await dropped.close();
+  // a drop this short is not said (src/lib/reconnectGrace.ts): a new socket that brings the pane's frames again
+  // is the reconnect and the re-attach
+  await until(() => liveSocket !== dropped && liveFrames > 0, "the page reconnects and re-attaches the pane");
   await page.locator(".conn-live").first().waitFor();
   images = await settled((list) => list.length === visible, "every image again after the socket reconnects");
   checkGeometry(images, "reconnect");
@@ -741,6 +752,9 @@ try {
   console.log(`terminal image regression passed (${mode}); evidence in ${evidence}`);
 } catch (error) {
   await failurePage?.screenshot({ path: join(evidence, "failure.png") }).catch(() => {});
+  // the terminal's text rows as the page had them, beside the screenshot: what the geometry checks read
+  const failureRows = await failurePage?.evaluate((selector) => [...document.querySelectorAll(selector)].map((row) => row.textContent ?? ""), shownRow()).catch(() => null);
+  if (failureRows) writeFileSync(join(evidence, "failure-rows.json"), JSON.stringify(failureRows, null, 2));
   result["status"] = `failed: ${error instanceof Error ? error.message : String(error)}`;
   writeFileSync(join(evidence, "result.json"), JSON.stringify(result, null, 2));
   throw error;

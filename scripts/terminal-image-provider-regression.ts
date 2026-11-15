@@ -42,6 +42,7 @@ import { agentGet, paneSendKeys, paneSendText, sessionSnapshot, workspaceClose, 
 import { socketPath } from "../server/bridge.ts";
 import { SshConnection } from "../server/ssh.ts";
 import { chromePath } from "./chrome-path.ts";
+import { shownRow } from "./shown-rows.ts";
 import { responsesProvider, type ScriptedCall } from "./fixtures/responses-provider.ts";
 
 if (process.env["HERDR_TEST_LIVE"] === "1") throw new Error("This regression refuses HERDR_TEST_LIVE=1");
@@ -193,8 +194,9 @@ try {
   }, pane);
 
   /** what the image layer draws, read against the terminal's own text rows */
-  const drawn = () => page.evaluate(() => {
-    const rows = [...document.querySelectorAll(".pane-terminal .xterm-rows > div")].map((row) => [...(row.textContent ?? "")]);
+  const drawn = () => page.evaluate((selector) => {
+    // the rows the pane shows: libghostty's while it draws the pane, where xterm's are hidden and left blank
+    const rows = [...document.querySelectorAll(selector)].map((row) => [...(row.textContent ?? "")]);
     return [...document.querySelectorAll<HTMLElement>(".pane-terminal .terminal-image")].map((box) => {
       const [left, top, cols, height, firstRow, lastRow] = box.dataset["cells"]!.split(",").map(Number) as [number, number, number, number, number, number];
       const img = box.querySelector("img")!;
@@ -213,7 +215,7 @@ try {
         picture: { x: rect.x, y: rect.y, width: img.naturalWidth * scale, height: img.naturalHeight * scale },
       };
     });
-  });
+  }, shownRow());
   type Drawn = Awaited<ReturnType<typeof drawn>>[number];
   const colourAt = async (x: number, y: number): Promise<number[]> => {
     const shot = await page.screenshot({ clip: { x: Math.round(x), y: Math.round(y), width: 1, height: 1 } });
@@ -309,7 +311,7 @@ try {
     assert.ok(answers.some((answer) => answer.status === 200 && answer.session === SESSION && answer.url.includes(`session=${SESSION}`)), `${refOf(call)} is asked of this PC by its own ref, with the marker's session`);
   }
   assert.ok(imageAnswers.some((answer) => answer.url.includes("ref=pi%3Acall_E2E%7Cfc_0123abcd%3A0")), "the pipe travels percent-encoded");
-  if (!punctuation) assert.equal(askedFor(CALLS.punctuated, "/").length, 0, "no marker, no request, for an id this extension cannot escape");
+  if (!punctuation) assert.equal(askedFor(CALLS.punctuated, "/").length, 0, "no marker, no request, for an id this extension cannot escape (an extension that escapes `!'()*` runs with PI_IMAGES_PUNCTUATION=1)");
 
   // 3. the chat: the page's refs and the whole-output link answer for the composite ids, here and through the PC
   const digests = new Map<string, string>();
