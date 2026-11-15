@@ -72,9 +72,23 @@ it.skipIf(process.platform !== "linux").each([
     env: { ...env, ...(explicit ? { CODEX_HOME: named } : {}) },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
+  // one reply per line, matched by its text: a read may return less or more than a line, and a reply
+  // read for the previous request would let the next check run before the helper acted
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+  const reply = async (expected: string) => {
+    while (!pending.includes("\n")) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`lock helper ended before "${expected}": ${await new Response(child.stderr).text()}`);
+      pending += decoder.decode(value, { stream: true });
+    }
+    const line = pending.slice(0, pending.indexOf("\n"));
+    pending = pending.slice(line.length + 1);
+    expect(line).toBe(expected);
+  };
   try {
-    const reader = child.stdout.getReader();
-    await reader.read();
+    await reply("ready");
     if (replace) {
       renameSync(files[0]!.lock, `${files[0]!.lock}.old`);
       writeFileSync(files[0]!.lock, "replacement");
@@ -85,11 +99,11 @@ it.skipIf(process.platform !== "linux").each([
       // from the pathname or cached from the previous successful lookup.
       child.stdin.write("unlock\n");
       await child.stdin.flush();
-      await reader.read();
+      await reply("done");
       expect(await processCodexHome(child.pid)).toBeNull();
       child.stdin.write("lock\n");
       await child.stdin.flush();
-      await reader.read();
+      await reply("done");
       expect(await processCodexHome(child.pid)).toBe(homes[0]!);
     }
   } finally {
