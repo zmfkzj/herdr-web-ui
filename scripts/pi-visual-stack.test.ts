@@ -25,6 +25,12 @@ let host = process.env.HOST ?? "127.0.0.1", port = Number(process.env.PORT);
 if (role === "guacd") { host = args[args.indexOf("-b") + 1]; port = Number(args[args.indexOf("-l") + 1]); }
 console.log(role + " mock: " + args.join(" ") + " gateway=" + (process.env.HERDR_PI_GUACD_ENABLED ?? "unset"));
 if (mode === "exit") { console.error(role + " mock failing on purpose"); process.exit(3); }
+// fails only once the launcher has recorded it (read its start time), so it exits during startup, never "immediately"
+if (mode === "exit-recorded") {
+  const record = process.env.HERDR_STACK_DIR + "/" + role + ".pid", deadline = Date.now() + 20_000;
+  while (!(await Bun.file(record).exists()) && Date.now() < deadline) await Bun.sleep(10);
+  console.error(role + " mock failing on purpose"); process.exit(3);
+}
 process.on("SIGTERM", () => { if (mode === "ignore-term") console.log("ignoring TERM"); else process.exit(0); });
 if (mode !== "nolisten") Bun.listen({ hostname: host, port, socket: { data() {} } });
 setInterval(() => {}, 1 << 30);
@@ -388,7 +394,7 @@ for (const backend of backends) describe.skipIf(!backend.available)(`pi-visual-s
   }, 30_000);
 
   it("rolls back guacd when the server exits during startup, and shows why", async () => {
-    const result = await launch("start", { MOCK_WEB_UI: "exit" });
+    const result = await launch("start", { MOCK_WEB_UI: "exit-recorded" });
     expect(result.code).toBe(1);
     expect(result.err).toContain("web UI exited during startup");
     expect(result.err).toContain("web-ui mock failing on purpose");
